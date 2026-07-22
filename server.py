@@ -35,6 +35,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+import gguf
 
 # --------------------------------------------------------------------------
 # Logging
@@ -62,6 +63,17 @@ def _safe_float(val: str, default: float = 0.0) -> float:
     except Exception:
         return default
 
+def _read_gguf_name(gguf_path) -> Optional[str]:
+    """Read general.name from GGUF file metadata. Returns None on failure."""
+    try:
+        reader = gguf.GGUFReader(str(gguf_path))
+        field = reader.get_field('general.name')
+        if field is None:
+            return None
+        return field.contents()
+    except Exception:
+        return None
+
 # --------------------------------------------------------------------------
 # Data models
 # --------------------------------------------------------------------------
@@ -81,6 +93,7 @@ class ModelConfig:
     mmproj_file: str = ""           # path or filename of associated mmproj file
     estimated_vram_mb: int = 0      # hint; 0 = unknown
     tags: List[str] = field(default_factory=list)
+    gguf_name: str = ""             # embedded name from GGUF metadata
 
     @classmethod
     def default_for(cls, gguf_path: Path) -> "ModelConfig":
@@ -98,6 +111,7 @@ class ModelConfig:
             mmproj_file="",
             estimated_vram_mb=0,
             tags=[],
+            gguf_name="",
         )
 
     @classmethod
@@ -300,6 +314,9 @@ class ModelManager:
         for p in model_paths:
             mid = p.name  # use filename as id
             cfg = ModelConfig.load(p)
+            gguf_n = _read_gguf_name(p)
+            if gguf_n:
+                cfg.gguf_name = gguf_n
             found[mid] = cfg
             self.gguf_paths[mid] = p
             if mid in self.loaded:
@@ -363,6 +380,8 @@ class ModelManager:
                 return mid
             if cfg.name and target_lower == cfg.name.lower():
                 return mid
+            if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
+                return mid
         return None
 
     def list_models(self) -> List[Dict[str, Any]]:
@@ -391,6 +410,7 @@ class ModelManager:
                 "n_gpu_layers": cfg.n_gpu_layers,
                 "estimated_vram_mb": cfg.estimated_vram_mb,
                 "args": cfg.args,
+                "gguf_name": cfg.gguf_name,
                 "size_mb": round(size_mb, 1),
                 "loaded": loaded is not None,
                 "ready": loaded.ready if loaded else False,
@@ -956,6 +976,7 @@ class ModelConfigUpdate(BaseModel):
     mmproj_file: Optional[str] = None
     estimated_vram_mb: Optional[int] = None
     tags: Optional[List[str]] = None
+    gguf_name: Optional[str] = None
 
 class SelectBackendPayload(BaseModel):
     backend: str = ""
