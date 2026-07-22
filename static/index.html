@@ -642,13 +642,29 @@ async function refreshAll() {
       apiJSON('/v1/models'),
       apiJSON('/v1/status'),
     ]);
-    modelsCache = await Promise.all((models.data||[]).map(d =>
-      apiJSON(`/v1/models/${encodeURIComponent(d.id)}`).then(r => ({
-        ...r.config,
-        id: d.id, name: r.config?.name || d.id, tags: d.tags, size_mb: d.size_mb||0,
-        loaded: d.loaded, ready: d.ready, port: d.port, default: d.default,
-      }))
-    ));
+    // Use data from list_models directly — no need for individual /v1/models/{id} calls
+    modelsCache = (models.data||[]).map(d => ({
+      id: d.id,
+      name: d.name || d.id,
+      description: d.description || '',
+      tags: d.tags || [],
+      size_mb: d.size_mb || 0,
+      loaded: d.loaded,
+      ready: d.ready,
+      port: d.port,
+      default: d.default,
+      pinned: d.pinned,
+      auto_save_state: d.auto_save_state,
+      backend: d.backend,
+      use_mmproj: d.use_mmproj,
+      mmproj_file: d.mmproj_file,
+      has_mmproj: d.has_mmproj,
+      ctx_size: d.ctx_size,
+      n_gpu_layers: d.n_gpu_layers,
+      estimated_vram_mb: d.estimated_vram_mb,
+      args: d.args,
+      gguf_name: d.gguf_name,
+    }));
     statusCache = st;
     renderBackendSelectors(st);
     renderGPUs(st.gpus);

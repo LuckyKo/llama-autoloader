@@ -314,9 +314,6 @@ class ModelManager:
         for p in model_paths:
             mid = p.name  # use filename as id
             cfg = ModelConfig.load(p)
-            gguf_n = _read_gguf_name(p)
-            if gguf_n:
-                cfg.gguf_name = gguf_n
             found[mid] = cfg
             self.gguf_paths[mid] = p
             if mid in self.loaded:
@@ -380,6 +377,9 @@ class ModelManager:
                 return mid
             if cfg.name and target_lower == cfg.name.lower():
                 return mid
+            # Lazy-read gguf_name on first resolution attempt
+            if not cfg.gguf_name:
+                self._ensure_gguf_name(mid)
             if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
                 return mid
         return None
@@ -423,7 +423,17 @@ class ModelManager:
 
     def get_config(self, model_id_or_alias: str) -> Optional[ModelConfig]:
         mid = self.resolve_model_id(model_id_or_alias)
+        if mid:
+            self._ensure_gguf_name(mid)
         return self.models.get(mid) if mid else None
+
+    def _ensure_gguf_name(self, mid: str):
+        """Read gguf_name from GGUF file lazily, caching the result in config."""
+        cfg = self.models.get(mid)
+        if cfg and not cfg.gguf_name:
+            path = self.gguf_paths.get(mid)
+            if path:
+                cfg.gguf_name = _read_gguf_name(path) or ""
 
     def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
         mid = self.resolve_model_id(model_id_or_alias)
@@ -1027,12 +1037,25 @@ async def list_models():
             "object": "model",
             "created": int(time.time()),
             "owned_by": "llama-autoloader",
+            "name": m["name"],
+            "description": m["description"],
+            "tags": m["tags"],
+            "size_mb": m["size_mb"],
             "loaded": m["loaded"],
             "ready": m["ready"],
             "port": m["port"],
-            "tags": m["tags"],
-            "size_mb": m["size_mb"],
             "default": m["default"],
+            "pinned": m["pinned"],
+            "auto_save_state": m["auto_save_state"],
+            "backend": m["backend"],
+            "use_mmproj": m["use_mmproj"],
+            "mmproj_file": m["mmproj_file"],
+            "has_mmproj": m["has_mmproj"],
+            "ctx_size": m["ctx_size"],
+            "n_gpu_layers": m["n_gpu_layers"],
+            "estimated_vram_mb": m["estimated_vram_mb"],
+            "args": m["args"],
+            "gguf_name": m["gguf_name"],
         })
     return {"object": "list", "data": data}
 
