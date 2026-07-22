@@ -20,6 +20,7 @@ import socket
 import subprocess
 import time
 import logging
+import platform
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, AsyncIterator
@@ -30,9 +31,7 @@ import yaml
 from fastapi import (
     FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
 )
-from fastapi.responses import (
-    JSONResponse, StreamingResponse, HTMLResponse, FileResponse,
-)
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -193,6 +192,46 @@ class ModelManager:
         self._bg_task: Optional[asyncio.Task] = None
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+        self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
+        self._status_cache: Optional[Dict[str, Any]] = None
+        self._status_cache_time: float = 0.0
+
+    # ---------------- config validation ----------------
+    @staticmethod
+    def validate_config(cfg: Dict[str, Any]) -> None:
+        """Validate config at startup to catch issues early."""
+        # launcher section
+        launcher = cfg.get("launcher", {})
+        if not launcher:
+            raise ValueError("Config missing 'launcher' section")
+        host = launcher.get("host")
+        port = launcher.get("port")
+        if not host or not isinstance(port, int) or port < 1 or port > 65535:
+            raise ValueError(f"Config 'launcher' requires valid host and port (1-65535), got host={host!r} port={port!r}")
+        base_port = launcher.get("base_port", 9001)
+        if not isinstance(base_port, int) or base_port < 1:
+            raise ValueError(f"Config 'launcher.base_port' must be a positive int, got {base_port!r}")
+
+        # models section
+        models = cfg.get("models", {})
+        if not models:
+            raise ValueError("Config missing 'models' section")
+        root_dir = models.get("root_dir")
+        if not root_dir:
+            raise ValueError("Config 'models.root_dir' is required")
+        idle_timeout = models.get("idle_timeout_seconds", 300)
+        if not isinstance(idle_timeout, (int, float)) or idle_timeout <= 0:
+            raise ValueError(f"Config 'models.idle_timeout_seconds' must be positive, got {idle_timeout!r}")
+        max_loaded = models.get("max_loaded_models", 1)
+        if not isinstance(max_loaded, int) or max_loaded < 1:
+            raise ValueError(f"Config 'models.max_loaded_models' must be >= 1, got {max_loaded!r}")
+
+        # llama_server section
+        ls = cfg.get("llama_server", {})
+        if not ls:
+            raise ValueError("Config missing 'llama_server' section")
+        if not ls.get("binary"):
+            raise ValueError("Config 'llama_server.binary' is required")
 
     # ---------------- backend discovery & resolution ----------------
     def list_backends(self) -> List[Dict[str, Any]]:
@@ -374,6 +413,23 @@ class ModelManager:
             self.loaded[mid].config = new_cfg
         return new_cfg
 
+    # ---------------- model ID sanitization ----------------
+    @staticmethod
+    def _sanitize_model_id(model_id: str) -> str:
+        """Strip path separators and parent references from model IDs."""
+        if not model_id:
+            return model_id
+        # Remove path separators and parent refs
+        mid = model_id.replace("\\", "").replace("/", "").replace("..", "")
+        return mid.strip()
+
+    @staticmethod
+    def _sanitize_label(label: str) -> str:
+        """Strip path traversal chars from state labels."""
+        if not label:
+            return label
+        return label.replace("\\", "").replace("/", "").replace("..", "").strip()
+
     # ---------------- process lifecycle & port allocation ----------------
     def _is_port_available(self, port: int) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -435,6 +491,7 @@ class ModelManager:
             return self.loaded[model_id]
 
         async with self._lock:
+            # Double-check under lock
             if model_id in self.loaded and self.loaded[model_id].ready and not force:
                 self.loaded[model_id].touch()
                 return self.loaded[model_id]
@@ -468,12 +525,21 @@ class ModelManager:
             log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
             log.info("argv: " + " ".join(argv))
 
-            proc = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            # Fix #4: Use process groups on both Windows and Unix
+            if platform.system() == "Windows":
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+            else:
+                proc = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
 
             lm = LoadedModel(
                 model_id=model_id,
@@ -501,7 +567,8 @@ class ModelManager:
 
         # Auto-restore session state if enabled and cached auto state exists
         if cfg.auto_save_state or self.default_auto_save_state:
-            state_path = self.save_state_dir / f"{model_id}.auto.bin"
+            mid_clean = self._sanitize_model_id(model_id)
+            state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
             if state_path.exists():
                 try:
                     log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
@@ -539,7 +606,8 @@ class ModelManager:
         # Auto-save session state if enabled
         if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state):
             try:
-                state_path = self.save_state_dir / f"{model_id}.auto.bin"
+                mid_clean = self._sanitize_model_id(model_id)
+                state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 log.info(f"Auto-saving session state for {model_id} to {state_path}...")
                 url = f"http://127.0.0.1:{lm.port}/slots"
                 payload = {"action": "save", "id_slot": 0, "filename": str(state_path)}
@@ -551,9 +619,11 @@ class ModelManager:
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
 
+        # Kill entire process group reliably across platforms
         try:
             parent = psutil.Process(lm.pid)
             children = parent.children(recursive=True)
+            # Terminate children first, then parent
             for child in children:
                 try:
                     child.terminate()
@@ -570,7 +640,14 @@ class ModelManager:
             pass
         except Exception as e:
             log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {e}")
+            # Fallback: kill the process group directly
             try:
+                if platform.system() == "Windows":
+                    # Send CTRL+C to the process group on Windows
+                    os.kill(lm.pid, os.CTRL_C_EVENT)
+                else:
+                    # Kill the entire process group on Unix
+                    os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
                 lm.process.kill()
             except Exception:
                 pass
@@ -717,7 +794,9 @@ class ModelManager:
         if not model_id or model_id not in self.loaded:
             raise HTTPException(400, "Model not loaded")
         lm = self.loaded[model_id]
-        state_path = self.save_state_dir / f"{model_id}.{label}.bin"
+        mid_clean = self._sanitize_model_id(model_id)
+        label_clean = self._sanitize_label(label)
+        state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
         url = f"http://127.0.0.1:{lm.port}/slots"
         payload = {"action": "save", "id_slot": 0, "filename": str(state_path)}
         try:
@@ -734,7 +813,9 @@ class ModelManager:
         if not model_id or model_id not in self.loaded:
             raise HTTPException(400, "Model not loaded")
         lm = self.loaded[model_id]
-        state_path = self.save_state_dir / f"{model_id}.{label}.bin"
+        mid_clean = self._sanitize_model_id(model_id)
+        label_clean = self._sanitize_label(label)
+        state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
         if not state_path.exists():
             raise HTTPException(404, f"No state file: {state_path}")
         url = f"http://127.0.0.1:{lm.port}/slots"
@@ -756,32 +837,90 @@ class ModelManager:
             out.append(label)
         return out
 
-    # ---------------- background idle reaper ----------------
-    async def idle_reaper(self):
+    # ---------------- status cache ----------------
+    def _build_status(self) -> Dict[str, Any]:
+        """Build a full status snapshot (cached to avoid redundant nvidia-smi calls)."""
+        gpus = [asdict(g) for g in self.gpus()]
+        per = self.per_model_ram_vram()
+        backends = self.list_backends()
+        return {
+            "launcher": {
+                "host": self.cfg["launcher"]["host"],
+                "port": self.cfg["launcher"]["port"],
+                "binary": self.resolve_binary(None),
+                "selected_backend": self.selected_backend,
+                "backends": backends,
+            },
+            "gpus": gpus,
+            "ram": self.system_ram(),
+            "models_loaded": len(self.loaded),
+            "models_total": len(self.models),
+            "idle_timeout": self.idle_timeout,
+            "max_loaded_models": self.max_loaded_models,
+            "per_model": per,
+            "uptime_models": [
+                {
+                    "id": mid,
+                    "port": lm.port,
+                    "pid": lm.pid,
+                    "uptime_s": round(time.time() - lm.starting_at, 1),
+                    "last_used_s_ago": round(time.time() - lm.last_used, 1),
+                    "ready": lm.ready,
+                } for mid, lm in self.loaded.items()
+            ],
+        }
+
+    async def _status_cache_updater(self) -> None:
+        """Background task that refreshes status cache at poll_interval intervals."""
         while not self._stop:
             try:
-                now = time.time()
-                to_unload = []
-                for mid, lm in list(self.loaded.items()):
-                    if lm.config.pinned or not lm.ready:
-                        continue
-                    if now - lm.last_used > self.idle_timeout:
-                        to_unload.append(mid)
-                for mid in to_unload:
-                    log.info(f"Idle-unloading {mid}")
-                    await self._unload(mid)
+                async with self._lock:
+                    self._status_cache_time = time.time()
+                    self._status_cache = self._build_status()
+            except Exception as e:
+                log.warning(f"status_cache_updater error: {e}")
+            await asyncio.sleep(self._poll_interval)
+
+    def get_cached_status(self) -> Dict[str, Any]:
+        """Return cached status, refreshing if stale."""
+        if self._status_cache is None or (time.time() - self._status_cache_time) > self._poll_interval:
+            self._status_cache_time = time.time()
+            self._status_cache = self._build_status()
+        return self._status_cache.copy()
+
+    # ---------------- background idle reaper ----------------
+    async def idle_reaper(self) -> None:
+        while not self._stop:
+            try:
+                async with self._lock:
+                    now = time.time()
+                    to_unload = []
+                    for mid, lm in list(self.loaded.items()):
+                        if lm.config.pinned or not lm.ready:
+                            continue
+                        if now - lm.last_used > self.idle_timeout:
+                            to_unload.append(mid)
+                    for mid in to_unload:
+                        log.info(f"Idle-unloading {mid}")
+                        await self._unload(mid)
+                        # Also clear loading task if any
+                        self._loading_tasks.pop(mid, None)
             except Exception as e:
                 log.warning(f"idle_reaper error: {e}")
             await asyncio.sleep(10)
 
     async def start(self):
-        self.scan()
+        async with self._lock:
+            self.scan()
         self._bg_task = asyncio.create_task(self.idle_reaper())
+        self._status_task: Optional[asyncio.Task] = asyncio.create_task(self._status_cache_updater())
 
     async def stop(self):
         self._stop = True
         if self._bg_task:
             self._bg_task.cancel()
+        if getattr(self, "_status_task", None):
+            self._status_task.cancel()
         await self.unload_all()
         await self.client.aclose()
 
@@ -793,6 +932,7 @@ CONFIG_PATH = os.environ.get("AUTOLOADER_CONFIG", "config.yaml")
 with open(CONFIG_PATH) as f:
     CFG = yaml.safe_load(f)
 
+ModelManager.validate_config(CFG)
 manager = ModelManager(CFG)
 
 app = FastAPI(title="llama-autoloader", version="0.1.0")
@@ -851,35 +991,7 @@ async def select_backend(body: SelectBackendPayload):
 
 @app.get("/v1/status")
 async def status():
-    gpus = [asdict(g) for g in manager.gpus()]
-    per = manager.per_model_ram_vram()
-    backends = manager.list_backends()
-    return {
-        "launcher": {
-            "host": CFG["launcher"]["host"],
-            "port": CFG["launcher"]["port"],
-            "binary": manager.resolve_binary(None),
-            "selected_backend": manager.selected_backend,
-            "backends": backends,
-        },
-        "gpus": gpus,
-        "ram": manager.system_ram(),
-        "models_loaded": len(manager.loaded),
-        "models_total": len(manager.models),
-        "idle_timeout": manager.idle_timeout,
-        "max_loaded_models": manager.max_loaded_models,
-        "per_model": per,
-        "uptime_models": [
-            {
-                "id": mid,
-                "port": lm.port,
-                "pid": lm.pid,
-                "uptime_s": round(time.time() - lm.starting_at, 1),
-                "last_used_s_ago": round(time.time() - lm.last_used, 1),
-                "ready": lm.ready,
-            } for mid, lm in manager.loaded.items()
-        ],
-    }
+    return manager.get_cached_status()
 
 # ---------- model list / config (LM Studio compatible) ----------
 @app.get("/v1/models")
@@ -936,7 +1048,8 @@ async def toggle_vision_ep(model_id: str):
 
 @app.post("/v1/scan")
 async def rescan():
-    ids = manager.scan()
+    async with manager._lock:
+        ids = manager.scan()
     return {"models": ids}
 
 # ---------- load / unload ----------
@@ -976,46 +1089,38 @@ async def list_states_ep(model_id: str):
     return {"id": model_id, "labels": manager.list_states(model_id)}
 
 # ---------- OpenAI-compatible proxy endpoints ----------
-@app.api_route("/v1/chat/completions", methods=["POST"])
-async def proxy_chat(request: Request):
-    body = await request.body()
+async def _resolve_proxy_model(body: bytes, default_if_missing: bool = False) -> str:
+    """Extract model ID from request body, with optional default fallback."""
     try:
         data = json.loads(body)
     except Exception:
         raise HTTPException(400, "Invalid JSON")
     model_id = data.get("model")
-    if not model_id:
-        # Use default model if any.
+    if not model_id and default_if_missing:
         for mid, cfg in manager.models.items():
             if cfg.default:
                 model_id = mid
                 break
     if not model_id:
         raise HTTPException(400, "No model specified and no default set")
+    return model_id
+
+@app.api_route("/v1/chat/completions", methods=["POST"])
+async def proxy_chat(request: Request):
+    body = await request.body()
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
     return await manager.proxy(model_id, "/v1/chat/completions", request)
 
 @app.api_route("/v1/completions", methods=["POST"])
 async def proxy_completions(request: Request):
     body = await request.body()
-    try:
-        data = json.loads(body)
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-    model_id = data.get("model")
-    if not model_id:
-        raise HTTPException(400, "No model specified")
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/completions", request)
 
 @app.api_route("/v1/embeddings", methods=["POST"])
 async def proxy_embeddings(request: Request):
     body = await request.body()
-    try:
-        data = json.loads(body)
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-    model_id = data.get("model")
-    if not model_id:
-        raise HTTPException(400, "No model specified")
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/embeddings", request)
 
 # Pass-through other llama-server endpoints (e.g. /slots, /tokenize, /detokenize)
@@ -1030,10 +1135,11 @@ async def ws(websocket: WebSocket):
     try:
         while True:
             await asyncio.sleep(1.0)
-            await websocket.send_json(await status())
+            await websocket.send_json(manager.get_cached_status())
     except WebSocketDisconnect:
         return
-    except Exception:
+    except Exception as e:
+        log.warning(f"WebSocket error: {e}")
         return
 
 # ---------- lifecycle ----------

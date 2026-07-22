@@ -328,6 +328,12 @@ let modelsCache = [];
 let statusCache = null;
 let editingId = null;
 
+function esc(str) {
+  const div = document.createElement('div');
+  div.textContent = str || '';
+  return div.innerHTML;
+}
+
 function showToast(msg, type = 'info') {
   const container = $('toast-container');
   const toast = document.createElement('div');
@@ -424,22 +430,24 @@ function renderModels() {
 
   grid.innerHTML = list.map(m => {
     const pm = perModel[m.id] || {};
-    const tags = (m.tags||[]).map(t => `<span class="tag">${t}</span>`).join('');
+    const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
     const argsDisplay = `--ctx-size ${m.ctx_size} --n-gpu-layers ${m.n_gpu_layers} ${m.args||''}`.trim();
     const visionTag = m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '';
     const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
+    const name = esc(m.name || m.id);
+    const id = esc(m.id);
     return `
     <div class="model-card" data-id="${m.id}">
       <div class="model-head">
         <div>
-          <div class="model-name">${m.name || m.id}</div>
-          <div class="model-meta">${m.id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+m.port : ''}${m.pid ? ' · pid '+m.pid : ''}</div>
+          <div class="model-name">${name}</div>
+          <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+m.port : ''}${m.pid ? ' · pid '+m.pid : ''}</div>
           <div style="margin-top:6px;">${tags}${m.default?'<span class="tag">default</span>':''}${m.pinned?'<span class="tag">pinned</span>':''}${m.auto_save_state?'<span class="tag">autosave</span>':''}${visionTag}</div>
         </div>
         ${statusBadge(m.loaded, m.ready)}
       </div>
 
-      <div class="args-box">${argsDisplay || '(no extra args)'}</div>
+      <div class="args-box">${esc(argsDisplay) || '(no extra args)'}</div>
 
       <div class="model-stats">
         <div>VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
@@ -634,20 +642,13 @@ async function refreshAll() {
       apiJSON('/v1/models'),
       apiJSON('/v1/status'),
     ]);
-    modelsCache = (models.data||[]).map(d => {
-      return {
-        id: d.id, name: d.id, tags: d.tags, size_mb: d.size_mb||0,
+    modelsCache = await Promise.all((models.data||[]).map(d =>
+      apiJSON(`/v1/models/${encodeURIComponent(d.id)}`).then(r => ({
+        ...r.config,
+        id: d.id, name: r.config?.name || d.id, tags: d.tags, size_mb: d.size_mb||0,
         loaded: d.loaded, ready: d.ready, port: d.port, default: d.default,
-        ...(modelsCache.find(x=>x.id===d.id) || {})
-      };
-    });
-    if (modelsCache.length && !modelsCache[0].ctx_size) {
-      modelsCache = await Promise.all(modelsCache.map(m =>
-        apiJSON(`/v1/models/${encodeURIComponent(m.id)}`).then(r => ({
-          ...m, ...r.config, id: m.id, loaded: m.loaded, ready: m.ready, port: m.port,
-        }))
-      ));
-    }
+      }))
+    ));
     statusCache = st;
     renderBackendSelectors(st);
     renderGPUs(st.gpus);
@@ -688,13 +689,17 @@ function wsLoop() {
         renderRAM(st.ram);
         $('loaded-count').textContent = `${st.models_loaded}/${st.models_total}`;
         const models = await apiJSON('/v1/models');
-        const merged = (models.data||[]).map(d => ({
-          ...(modelsCache.find(x=>x.id===d.id) || {}),
-          ...d
-        }));
-        modelsCache = merged;
+        // Merge live status fields (loaded/ready/port) into existing cached config
+        modelsCache = (models.data||[]).map(d => {
+          const cached = modelsCache.find(x => x.id === d.id) || {};
+          return {
+            ...cached,
+            id: d.id, name: cached.name || d.id, tags: d.tags, size_mb: d.size_mb||0,
+            loaded: d.loaded, ready: d.ready, port: d.port, default: d.default,
+          };
+        });
         renderModels();
-      } catch (e) {}
+      } catch (e) { console.error('WS update error:', e); }
     };
     ws.onclose = () => { setTimeout(connect, 2000); };
     ws.onerror = () => ws.close();
