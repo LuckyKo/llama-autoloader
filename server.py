@@ -21,6 +21,7 @@ import subprocess
 import time
 import logging
 import platform
+import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, AsyncIterator
@@ -45,8 +46,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
-# Silence uvicorn's per-request INFO spam
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# Enable uvicorn access logging so all requests are visible in the console
+logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 log = logging.getLogger("autoloader")
 
 def _safe_int(val: str, default: int = 0) -> int:
@@ -196,6 +197,8 @@ class ModelManager:
         self.backends_dir = Path(cfg["llama_server"].get("backends_dir", "./backends")).resolve()
         self.selected_backend = cfg["llama_server"].get("selected_backend", "")
         self.default_args = cfg["llama_server"].get("default_args", "")
+        self.host = cfg["launcher"].get("host", "127.0.0.1")
+        self.port = cfg["launcher"].get("port", 9123)
         self.base_port = cfg["launcher"].get("base_port", 9001)
         self.next_port = self.base_port
 
@@ -365,23 +368,31 @@ class ModelManager:
         return list(self.models.keys())
 
     def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
-        if not model_id_or_alias:
-            return None
-        if model_id_or_alias in self.models:
-            return model_id_or_alias
-        # Match without .gguf suffix, stem, or lowercased name
-        target_lower = model_id_or_alias.lower()
+        if model_id_or_alias:
+            if model_id_or_alias in self.models:
+                return model_id_or_alias
+            # Match without .gguf suffix, stem, or lowercased name
+            target_lower = model_id_or_alias.lower()
+            for mid, cfg in self.models.items():
+                stem = Path(mid).stem.lower()
+                if target_lower == stem or target_lower == mid.lower():
+                    return mid
+                if cfg.name and target_lower == cfg.name.lower():
+                    return mid
+                if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
+                    return mid
+
+        # Fallback resolution (for generic model names, missing model param, or unmatched aliases)
+        if self.loaded:
+            ready_loaded = [m for m, lm in self.loaded.items() if lm.ready]
+            if ready_loaded:
+                return ready_loaded[0]
+            return next(iter(self.loaded.keys()))
         for mid, cfg in self.models.items():
-            stem = Path(mid).stem.lower()
-            if target_lower == stem or target_lower == mid.lower():
+            if cfg.default:
                 return mid
-            if cfg.name and target_lower == cfg.name.lower():
-                return mid
-            # Lazy-read gguf_name on first resolution attempt
-            if not cfg.gguf_name:
-                self._ensure_gguf_name(mid)
-            if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
-                return mid
+        if len(self.models) == 1:
+            return next(iter(self.models.keys()))
         return None
 
     def list_models(self) -> List[Dict[str, Any]]:
@@ -483,18 +494,24 @@ class ModelManager:
             port += 1
         raise RuntimeError("No available ports found for llama-server")
 
-    async def _wait_until_ready(self, port: int, timeout: float = 120.0) -> bool:
+    async def _wait_until_ready(self, port: int, proc: Optional[subprocess.Popen] = None, timeout: float = 120.0) -> bool:
         url = f"http://127.0.0.1:{port}/health"
+        log.info(f"Waiting for llama-server on port {port} at {url}...")
         start = time.time()
         async with httpx.AsyncClient() as c:
             while time.time() - start < timeout:
+                if proc and proc.poll() is not None:
+                    log.error(f"llama-server process exited prematurely with code {proc.poll()}")
+                    return False
                 try:
                     r = await c.get(url, timeout=2.0)
                     if r.status_code == 200:
+                        log.info(f"llama-server on port {port} is READY! (took {round(time.time() - start, 2)}s)")
                         return True
                 except Exception:
                     pass
                 await asyncio.sleep(0.5)
+        log.error(f"Timed out waiting for llama-server on port {port} after {timeout}s")
         return False
 
     async def _evict_lru_if_needed(self, target_model_id: str):
@@ -547,7 +564,6 @@ class ModelManager:
             if model_id in self.loaded and force:
                 await self._unload(model_id)
             await self._evict_lru_if_needed(model_id)
-
             cfg = self.models[model_id]
             path = self.gguf_paths[model_id]
             port = self._allocate_port()
@@ -558,7 +574,7 @@ class ModelManager:
             log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
             log.info("argv: " + " ".join(argv))
 
-            # Fix #4: Use process groups on both Windows and Unix
+            # Spawn process
             if platform.system() == "Windows":
                 proc = subprocess.Popen(
                     argv,
@@ -584,10 +600,10 @@ class ModelManager:
                 starting_at=time.time(),
             )
             self.loaded[model_id] = lm
-            asyncio.create_task(self._log_stream(model_id, proc))
+            self._start_log_thread(model_id, proc)
 
         # Wait until ready OUTSIDE the lock!
-        ready = await self._wait_until_ready(port)
+        ready = await self._wait_until_ready(port, proc=proc)
         lm.ready = ready
         if not ready:
             log.error(f"Model {model_id} failed to become ready")
@@ -605,30 +621,29 @@ class ModelManager:
             if state_path.exists():
                 try:
                     log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
-                    url = f"http://127.0.0.1:{port}/slots"
-                    payload = {"action": "restore", "id_slot": 0, "filename": str(state_path)}
-                    r = await self.client.post(url, json=payload, timeout=30.0)
-                    if r.status_code == 200:
-                        log.info(f"Auto-restored session state for {model_id}")
-                        lm.state_path = state_path
-                    else:
-                        log.warning(f"Auto-restore returned HTTP {r.status_code}: {r.text}")
+                    await self._perform_slot_restore(port, state_path, timeout=30.0)
+                    lm.state_path = state_path
                 except Exception as e:
                     log.warning(f"Auto-restore failed for {model_id}: {e}")
 
         return lm
 
-    async def _log_stream(self, model_id: str, proc: subprocess.Popen):
-        try:
-            assert proc.stdout is not None
-            for line in iter(proc.stdout.readline, b""):
-                try:
-                    txt = line.decode("utf-8", errors="replace").rstrip()
-                    log.info(f"[{model_id}] {txt}")
-                except Exception:
-                    pass
-        except Exception as e:
-            log.warning(f"log stream for {model_id} ended: {e}")
+    def _start_log_thread(self, model_id: str, proc: subprocess.Popen):
+        def _worker():
+            try:
+                assert proc.stdout is not None
+                for line in iter(proc.stdout.readline, b""):
+                    try:
+                        txt = line.decode("utf-8", errors="replace").rstrip()
+                        if txt:
+                            log.info(f"[{model_id}] {txt}")
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning(f"log stream for {model_id} ended: {e}")
+
+        t = threading.Thread(target=_worker, daemon=True, name=f"log-{model_id}")
+        t.start()
 
     async def _unload(self, model_id: str):
         lm = self.loaded.pop(model_id, None)
@@ -642,48 +657,45 @@ class ModelManager:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 log.info(f"Auto-saving session state for {model_id} to {state_path}...")
-                url = f"http://127.0.0.1:{lm.port}/slots"
-                payload = {"action": "save", "id_slot": 0, "filename": str(state_path)}
-                r = await self.client.post(url, json=payload, timeout=8.0)
-                if r.status_code == 200:
-                    log.info(f"Auto-saved session state for {model_id}")
-                else:
-                    log.warning(f"Auto-save returned HTTP {r.status_code}: {r.text}")
+                await self._perform_slot_save(lm.port, state_path, timeout=8.0)
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
 
         # Kill entire process group reliably across platforms
-        try:
-            parent = psutil.Process(lm.pid)
-            children = parent.children(recursive=True)
-            # Terminate children first, then parent
-            for child in children:
-                try:
-                    child.terminate()
-                except psutil.NoSuchProcess:
-                    pass
-            parent.terminate()
-            gone, alive = psutil.wait_procs(children + [parent], timeout=3)
-            for p in alive:
-                try:
-                    p.kill()
-                except psutil.NoSuchProcess:
-                    pass
-        except psutil.NoSuchProcess:
-            pass
-        except Exception as e:
-            log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {e}")
-            # Fallback: kill the process group directly
+        def _kill_proc():
             try:
-                if platform.system() == "Windows":
-                    # Send CTRL+C to the process group on Windows
-                    os.kill(lm.pid, os.CTRL_C_EVENT)
-                else:
-                    # Kill the entire process group on Unix
-                    os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
-                lm.process.kill()
-            except Exception:
+                parent = psutil.Process(lm.pid)
+                children = parent.children(recursive=True)
+                # Terminate children first, then parent
+                for child in children:
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                parent.terminate()
+                gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+                for p in alive:
+                    try:
+                        p.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+            except psutil.NoSuchProcess:
                 pass
+            except Exception as e:
+                log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {e}")
+                # Fallback: kill the process group directly
+                try:
+                    if platform.system() == "Windows":
+                        # Send CTRL+C to the process group on Windows
+                        os.kill(lm.pid, os.CTRL_C_EVENT)
+                    else:
+                        # Kill the entire process group on Unix
+                        os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
+                    lm.process.kill()
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_kill_proc)
 
     async def unload_model(self, model_id_input: str):
         mid = self.resolve_model_id(model_id_input)
@@ -765,23 +777,29 @@ class ModelManager:
     # ---------------- proxy ----------------
     async def proxy(self, model_id_input: str, path: str, request: Request) -> Response:
         """Proxy a request to the loaded model's llama-server."""
+        log.info(f"--> Incoming {request.method} request to '{request.url.path}' (model param input: {model_id_input!r})")
         model_id = self.resolve_model_id(model_id_input)
         if not model_id:
+            log.error(f"Could not resolve model for input {model_id_input!r}")
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id_input}")
 
+        log.info(f"Resolved model ID: '{model_id}'")
         if model_id not in self.loaded or not self.loaded[model_id].ready:
+            log.info(f"Model '{model_id}' not loaded or not ready. Loading model JIT...")
             try:
                 await self.load_model(model_id)
             except Exception as e:
+                log.error(f"Failed to load model '{model_id}': {e}")
                 raise HTTPException(status_code=503, detail=f"Failed to load model: {e}")
 
         lm = self.loaded[model_id]
         lm.touch()
+        log.info(f"Forwarding {request.method} {request.url.path} -> llama-server on port {lm.port}")
 
         url = f"http://127.0.0.1:{lm.port}{path}"
         body = await request.body()
         headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in ("host", "content-length")}
+                   if k.lower() not in ("host", "content-length", "accept-encoding")}
         req_method = request.method
 
         # Streaming?
@@ -791,6 +809,12 @@ class ModelManager:
             parsed = {}
         stream = parsed.get("stream", False) if isinstance(parsed, dict) else False
 
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+
         if stream and req_method in ("POST", "PUT"):
             try:
                 req = self.client.build_request(req_method, url, content=body, headers=headers)
@@ -799,16 +823,17 @@ class ModelManager:
                     err_bytes = await r.aread()
                     await r.aclose()
                     return Response(content=err_bytes, status_code=r.status_code,
-                                    media_type=r.headers.get("content-type", "application/json"))
+                                    media_type=r.headers.get("content-type", "application/json"),
+                                    headers=cors_headers)
 
                 async def gen() -> AsyncIterator[bytes]:
                     try:
-                        async for chunk in r.aiter_raw():
+                        async for chunk in r.aiter_bytes():
                             yield chunk
                     finally:
                         await r.aclose()
 
-                return StreamingResponse(gen(), status_code=r.status_code, media_type="text/event-stream")
+                return StreamingResponse(gen(), status_code=r.status_code, media_type="text/event-stream", headers=cors_headers)
             except httpx.ConnectError:
                 raise HTTPException(status_code=502, detail="Model server unreachable")
             except Exception as e:
@@ -817,11 +842,65 @@ class ModelManager:
         try:
             r = await self.client.request(req_method, url, content=body, headers=headers)
             return Response(content=r.content, status_code=r.status_code,
-                            media_type=r.headers.get("content-type", "application/json"))
+                            media_type=r.headers.get("content-type", "application/json"),
+                            headers=cors_headers)
         except httpx.ConnectError:
             raise HTTPException(status_code=502, detail="Model server unreachable")
 
     # ---------------- state save/load ----------------
+    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+        """Attempt to save slot state trying supported endpoint formats and POSIX paths."""
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        filepath_str = state_path.resolve().as_posix()
+        log.info(f"Saving slot 0 state to file: {filepath_str}")
+
+        endpoints = [
+            (f"http://127.0.0.1:{port}/slots/0?action=save", {"filename": filepath_str}),
+            (f"http://127.0.0.1:{port}/slots?action=save", {"id_slot": 0, "filename": filepath_str}),
+            (f"http://127.0.0.1:{port}/slots", {"action": "save", "id_slot": 0, "filename": filepath_str}),
+        ]
+
+        last_err = None
+        for url, payload in endpoints:
+            try:
+                r = await self.client.post(url, json=payload, timeout=timeout)
+                if r.status_code == 200:
+                    log.info(f"Slot state saved via {url}")
+                    return True
+                else:
+                    last_err = f"HTTP {r.status_code}: {r.text}"
+            except Exception as e:
+                last_err = str(e)
+
+        raise RuntimeError(last_err or "Save failed across all slot endpoints")
+
+    async def _perform_slot_restore(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+        """Attempt to restore slot state trying supported endpoint formats and POSIX paths."""
+        if not state_path.exists():
+            raise FileNotFoundError(f"State file not found: {state_path}")
+        filepath_str = state_path.resolve().as_posix()
+        log.info(f"Restoring slot 0 state from file: {filepath_str}")
+
+        endpoints = [
+            (f"http://127.0.0.1:{port}/slots/0?action=restore", {"filename": filepath_str}),
+            (f"http://127.0.0.1:{port}/slots?action=restore", {"id_slot": 0, "filename": filepath_str}),
+            (f"http://127.0.0.1:{port}/slots", {"action": "restore", "id_slot": 0, "filename": filepath_str}),
+        ]
+
+        last_err = None
+        for url, payload in endpoints:
+            try:
+                r = await self.client.post(url, json=payload, timeout=timeout)
+                if r.status_code == 200:
+                    log.info(f"Slot state restored via {url}")
+                    return True
+                else:
+                    last_err = f"HTTP {r.status_code}: {r.text}"
+            except Exception as e:
+                last_err = str(e)
+
+        raise RuntimeError(last_err or "Restore failed across all slot endpoints")
+
     async def save_state(self, model_id_input: str, label: str = "default") -> Path:
         model_id = self.resolve_model_id(model_id_input)
         if not model_id or model_id not in self.loaded:
@@ -830,14 +909,12 @@ class ModelManager:
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
-        url = f"http://127.0.0.1:{lm.port}/slots"
-        payload = {"action": "save", "id_slot": 0, "filename": str(state_path)}
+
         try:
-            r = await self.client.post(url, json=payload, timeout=120.0)
-            if r.status_code >= 400:
-                raise HTTPException(500, f"save failed: {r.text}")
-        except httpx.HTTPError as e:
+            await self._perform_slot_save(lm.port, state_path, timeout=120.0)
+        except Exception as e:
             raise HTTPException(500, f"save failed: {e}")
+
         lm.state_path = state_path
         return state_path
 
@@ -849,16 +926,12 @@ class ModelManager:
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
-        if not state_path.exists():
-            raise HTTPException(404, f"No state file: {state_path}")
-        url = f"http://127.0.0.1:{lm.port}/slots"
-        payload = {"action": "restore", "id_slot": 0, "filename": str(state_path)}
+
         try:
-            r = await self.client.post(url, json=payload, timeout=120.0)
-            if r.status_code >= 400:
-                raise HTTPException(500, f"restore failed: {r.text}")
-        except httpx.HTTPError as e:
+            await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+        except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
+
         lm.state_path = state_path
         return state_path
 
@@ -878,8 +951,8 @@ class ModelManager:
         backends = self.list_backends()
         return {
             "launcher": {
-                "host": self.cfg["launcher"]["host"],
-                "port": self.cfg["launcher"]["port"],
+                "host": self.host,
+                "port": self.port,
                 "binary": self.resolve_binary(None),
                 "selected_backend": self.selected_backend,
                 "backends": backends,
@@ -907,9 +980,10 @@ class ModelManager:
         """Background task that refreshes status cache at poll_interval intervals."""
         while not self._stop:
             try:
+                status = await asyncio.to_thread(self._build_status)
                 async with self._lock:
                     self._status_cache_time = time.time()
-                    self._status_cache = self._build_status()
+                    self._status_cache = status
             except Exception as e:
                 log.warning(f"status_cache_updater error: {e}")
             await asyncio.sleep(self._poll_interval)
@@ -933,10 +1007,10 @@ class ModelManager:
                             continue
                         if now - lm.last_used > self.idle_timeout:
                             to_unload.append(mid)
-                    for mid in to_unload:
-                        log.info(f"Idle-unloading {mid}")
-                        await self._unload(mid)
-                        # Also clear loading task if any
+                for mid in to_unload:
+                    log.info(f"Idle-unloading {mid}")
+                    await self._unload(mid)
+                    async with self._lock:
                         self._loading_tasks.pop(mid, None)
             except Exception as e:
                 log.warning(f"idle_reaper error: {e}")
@@ -969,6 +1043,16 @@ ModelManager.validate_config(CFG)
 manager = ModelManager(CFG)
 
 app = FastAPI(title="llama-autoloader", version="0.1.0")
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 # ---------- models payloads ----------
@@ -1096,7 +1180,7 @@ async def toggle_vision_ep(model_id: str):
 @app.post("/v1/scan")
 async def rescan():
     async with manager._lock:
-        ids = manager.scan()
+        ids = await asyncio.to_thread(manager.scan)
     return {"models": ids}
 
 # ---------- load / unload ----------
@@ -1136,21 +1220,23 @@ async def list_states_ep(model_id: str):
     return {"id": model_id, "labels": manager.list_states(model_id)}
 
 # ---------- OpenAI-compatible proxy endpoints ----------
-async def _resolve_proxy_model(body: bytes, default_if_missing: bool = False) -> str:
-    """Extract model ID from request body, with optional default fallback."""
-    try:
-        data = json.loads(body)
-    except Exception:
-        raise HTTPException(400, "Invalid JSON")
-    model_id = data.get("model")
-    if not model_id and default_if_missing:
-        for mid, cfg in manager.models.items():
-            if cfg.default:
-                model_id = mid
-                break
-    if not model_id:
-        raise HTTPException(400, "No model specified and no default set")
-    return model_id
+async def _resolve_proxy_model(body: bytes, default_if_missing: bool = True) -> str:
+    """Extract model ID from request body, with fallback to loaded/default/single model."""
+    model_id = None
+    if body:
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                model_id = data.get("model")
+        except Exception:
+            pass
+
+    resolved = manager.resolve_model_id(model_id)
+    if not resolved and default_if_missing:
+        resolved = manager.resolve_model_id(None)
+    if not resolved:
+        raise HTTPException(404, "No matching model found and no loaded/default model available")
+    return resolved
 
 @app.api_route("/v1/chat/completions", methods=["POST"])
 async def proxy_chat(request: Request):
@@ -1161,19 +1247,44 @@ async def proxy_chat(request: Request):
 @app.api_route("/v1/completions", methods=["POST"])
 async def proxy_completions(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body)
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
     return await manager.proxy(model_id, "/v1/completions", request)
 
 @app.api_route("/v1/embeddings", methods=["POST"])
 async def proxy_embeddings(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body)
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    return await manager.proxy(model_id, "/v1/embeddings", request)
+
+# Top-level non-/v1 routes (for clients connecting without /v1 prefix)
+@app.api_route("/chat/completions", methods=["POST"])
+async def proxy_chat_top(request: Request):
+    body = await request.body()
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    return await manager.proxy(model_id, "/v1/chat/completions", request)
+
+@app.api_route("/completions", methods=["POST"])
+async def proxy_completions_top(request: Request):
+    body = await request.body()
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    return await manager.proxy(model_id, "/v1/completions", request)
+
+@app.api_route("/embeddings", methods=["POST"])
+async def proxy_embeddings_top(request: Request):
+    body = await request.body()
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
     return await manager.proxy(model_id, "/v1/embeddings", request)
 
 # Pass-through other llama-server endpoints (e.g. /slots, /tokenize, /detokenize)
 @app.api_route("/v1/raw/{model_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy_raw(model_id: str, path: str, request: Request):
     return await manager.proxy(model_id, "/" + path, request)
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy_catchall(path: str, request: Request):
+    body = await request.body()
+    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    return await manager.proxy(model_id, "/v1/" + path, request)
 
 # ---------- WebSocket for live updates ----------
 @app.websocket("/ws")
@@ -1208,4 +1319,6 @@ if __name__ == "__main__":
     ap.add_argument("--host", default=CFG["launcher"]["host"])
     ap.add_argument("--port", type=int, default=CFG["launcher"]["port"])
     args = ap.parse_args()
+    manager.host = args.host
+    manager.port = args.port
     uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
