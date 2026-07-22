@@ -1104,6 +1104,11 @@ async def get_backends():
 @app.post("/v1/backend/select")
 async def select_backend(body: SelectBackendPayload):
     manager.selected_backend = body.backend
+    # Persist to config.yaml
+    cfg_yaml = manager.cfg
+    cfg_yaml["llama_server"]["selected_backend"] = body.backend
+    with open(CONFIG_PATH, "w") as f:
+        yaml.dump(cfg_yaml, f, default_flow_style=False)
     log.info(f"Global backend selected: '{body.backend}' -> resolved binary: '{manager.resolve_binary(None)}'")
     return {
         "selected_backend": manager.selected_backend,
