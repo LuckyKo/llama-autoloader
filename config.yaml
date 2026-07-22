@@ -1,21 +1,17 @@
-# Global launcher config
-launcher:
-  host: 127.0.0.1
-  port: 9123
-  base_port: 9001          # first port to assign to spawned llama-servers
-
-llama_server:
-  binary: llama-server     # fallback binary name or path
-  default_args: "--no-webui --parallel 1 --jinja"
-  backends_dir: ./backends
-  selected_backend: ""     # global selected backend folder (empty = use first scanned or system binary)
-
-models:
-  root_dir: "n:/work/stuff/Beta"       # where to scan for .gguf
-  idle_timeout_seconds: 300
-  max_loaded_models: 1                 # maximum concurrent loaded models (auto-evicts LRU unpinned model)
-  auto_save_state: false               # default setting: auto save/reload session state on model unload/load
-  save_state_dir: ./states
-
 gpu:
   poll_interval_seconds: 2
+launcher:
+  base_port: 9001
+  host: 127.0.0.1
+  port: 9123
+llama_server:
+  backends_dir: ./backends
+  binary: llama-server
+  default_args: --no-webui --parallel 1 --jinja
+  selected_backend: llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.26.0
+models:
+  auto_save_state: false
+  idle_timeout_seconds: 3600
+  max_loaded_models: 1
+  root_dir: n:/work/stuff/Beta
+  save_state_dir: ./states

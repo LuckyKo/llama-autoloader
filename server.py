@@ -659,7 +659,7 @@ class ModelManager:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 log.info(f"Auto-saving session state for {model_id} to {state_path}...")
-                await self._perform_slot_save(lm.port, state_path, timeout=8.0)
+                await self._perform_slot_save(lm.port, state_path, timeout=60.0)
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
 
