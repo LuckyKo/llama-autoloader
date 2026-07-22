@@ -135,7 +135,7 @@ class ModelConfig:
         sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
         sidecar.write_text(json.dumps(asdict(self), indent=2))
 
-    def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None) -> List[str]:
+    def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None, slot_save_dir: Optional[Path] = None) -> List[str]:
         """Build argv for llama-server."""
         argv = [
             "--model", str(model_path),
@@ -146,6 +146,8 @@ class ModelConfig:
         ]
         if self.use_mmproj and mmproj_full_path and mmproj_full_path.exists():
             argv += ["--mmproj", str(mmproj_full_path)]
+        if slot_save_dir:
+            argv += ["--slot-save-path", str(slot_save_dir)]
         if extra_default_args:
             argv += extra_default_args.split()
         if self.args:
@@ -569,7 +571,7 @@ class ModelManager:
             port = self._allocate_port()
             binary_path = self.resolve_binary(cfg)
             mmproj_p = self.mmproj_paths.get(model_id)
-            argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p)
+            argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p, slot_save_dir=self.save_state_dir)
 
             log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
             log.info("argv: " + " ".join(argv))
@@ -849,15 +851,16 @@ class ModelManager:
 
     # ---------------- state save/load ----------------
     async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
-        """Attempt to save slot state trying supported endpoint formats and POSIX paths."""
+        """Attempt to save slot state trying supported endpoint formats."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        filepath_str = state_path.resolve().as_posix()
-        log.info(f"Saving slot 0 state to file: {filepath_str}")
+        # With --slot-save-path, filename must be relative to that dir (just the basename)
+        filename = state_path.name
+        log.info(f"Saving slot 0 state to file: {state_path}")
 
         endpoints = [
-            (f"http://127.0.0.1:{port}/slots/0?action=save", {"filename": filepath_str}),
-            (f"http://127.0.0.1:{port}/slots?action=save", {"id_slot": 0, "filename": filepath_str}),
-            (f"http://127.0.0.1:{port}/slots", {"action": "save", "id_slot": 0, "filename": filepath_str}),
+            (f"http://127.0.0.1:{port}/slots/0?action=save", {"filename": filename}),
+            (f"http://127.0.0.1:{port}/slots?action=save", {"id_slot": 0, "filename": filename}),
+            (f"http://127.0.0.1:{port}/slots", {"action": "save", "id_slot": 0, "filename": filename}),
         ]
 
         last_err = None
@@ -875,16 +878,16 @@ class ModelManager:
         raise RuntimeError(last_err or "Save failed across all slot endpoints")
 
     async def _perform_slot_restore(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
-        """Attempt to restore slot state trying supported endpoint formats and POSIX paths."""
+        """Attempt to restore slot state trying supported endpoint formats."""
         if not state_path.exists():
             raise FileNotFoundError(f"State file not found: {state_path}")
-        filepath_str = state_path.resolve().as_posix()
-        log.info(f"Restoring slot 0 state from file: {filepath_str}")
+        filename = state_path.name
+        log.info(f"Restoring slot 0 state from file: {state_path}")
 
         endpoints = [
-            (f"http://127.0.0.1:{port}/slots/0?action=restore", {"filename": filepath_str}),
-            (f"http://127.0.0.1:{port}/slots?action=restore", {"id_slot": 0, "filename": filepath_str}),
-            (f"http://127.0.0.1:{port}/slots", {"action": "restore", "id_slot": 0, "filename": filepath_str}),
+            (f"http://127.0.0.1:{port}/slots/0?action=restore", {"filename": filename}),
+            (f"http://127.0.0.1:{port}/slots?action=restore", {"id_slot": 0, "filename": filename}),
+            (f"http://127.0.0.1:{port}/slots", {"action": "restore", "id_slot": 0, "filename": filename}),
         ]
 
         last_err = None
