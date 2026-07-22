@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+src/
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# llama.cpp backend binaries (compiled artifacts)
+backends/**/*.dll
+backends/**/*.exe
+backends/**/*.node
+backends/**/*.bin
+backends/**/ggml-*.dll
+backends/**/llama-server.exe
+backends/**/llama.dll
+backends/**/llm_engine*.dll
+backends/**/lib*.so
+backends/**/lib*.dylib
+
+# Dependencies (if not using requirements.txt)
+# requirements.txt should be committed, but if you have a virtualenv:
+# venv/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.log
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS-specific
+.Darwin/
+WindowsPowerShell/
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*

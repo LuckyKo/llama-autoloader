@@ -1,0 +1,1058 @@
+"""
+llama-autoloader: a JIT model loader + OpenAI-compatible proxy for llama.cpp.
+
+- Scans a root directory for *.gguf models.
+- Each model may have a sidecar *.gguf.json with config (args, ctx, etc.).
+- Spawns llama-server subprocesses on demand (JIT) and unloads when idle.
+- Proxies OpenAI-style requests to the right subprocess based on `model`.
+- Exposes LM-Studio-like API plus extensions (load/unload/save-state/load-state).
+- Sleek WebUI dashboard at /.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import time
+import logging
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, AsyncIterator
+
+import httpx
+import psutil
+import yaml
+from fastapi import (
+    FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
+)
+from fastapi.responses import (
+    JSONResponse, StreamingResponse, HTMLResponse, FileResponse,
+)
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+import uvicorn
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("autoloader")
+
+def _safe_int(val: str, default: int = 0) -> int:
+    try:
+        cleaned = val.strip().split()[0] if val else ""
+        return int(cleaned)
+    except Exception:
+        return default
+
+def _safe_float(val: str, default: float = 0.0) -> float:
+    try:
+        cleaned = val.strip().split()[0] if val else ""
+        return float(cleaned)
+    except Exception:
+        return default
+
+# --------------------------------------------------------------------------
+# Data models
+# --------------------------------------------------------------------------
+@dataclass
+class ModelConfig:
+    """Sidecar JSON config stored next to each .gguf file."""
+    name: str = ""                  # human-readable name
+    description: str = ""
+    args: str = ""                  # extra args appended to llama-server
+    ctx_size: int = 8192
+    n_gpu_layers: int = 999
+    default: bool = False
+    pinned: bool = False            # never auto-unload
+    auto_save_state: bool = False   # auto save/restore slot 0 session state
+    backend: str = ""               # backend build override folder name (empty = use global default)
+    use_mmproj: bool = True         # enable --mmproj vision projector if present
+    mmproj_file: str = ""           # path or filename of associated mmproj file
+    estimated_vram_mb: int = 0      # hint; 0 = unknown
+    tags: List[str] = field(default_factory=list)
+
+    @classmethod
+    def default_for(cls, gguf_path: Path) -> "ModelConfig":
+        return cls(
+            name=gguf_path.stem,
+            description="",
+            args="",
+            ctx_size=8192,
+            n_gpu_layers=999,
+            default=False,
+            pinned=False,
+            auto_save_state=False,
+            backend="",
+            use_mmproj=True,
+            mmproj_file="",
+            estimated_vram_mb=0,
+            tags=[],
+        )
+
+    @classmethod
+    def load(cls, gguf_path: Path) -> "ModelConfig":
+        sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
+        if sidecar.exists():
+            try:
+                data = json.loads(sidecar.read_text())
+                # Merge with defaults so missing fields don't break things.
+                base = cls.default_for(gguf_path)
+                for k, v in data.items():
+                    if hasattr(base, k):
+                        setattr(base, k, v)
+                return base
+            except Exception as e:
+                log.warning(f"Failed to read sidecar {sidecar}: {e}")
+        return cls.default_for(gguf_path)
+
+    def save(self, gguf_path: Path) -> None:
+        sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
+        sidecar.write_text(json.dumps(asdict(self), indent=2))
+
+    def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None) -> List[str]:
+        """Build argv for llama-server."""
+        argv = [
+            "--model", str(model_path),
+            "--host", "127.0.0.1",
+            "--port", str(port),
+            "--ctx-size", str(self.ctx_size),
+            "--n-gpu-layers", str(self.n_gpu_layers),
+        ]
+        if self.use_mmproj and mmproj_full_path and mmproj_full_path.exists():
+            argv += ["--mmproj", str(mmproj_full_path)]
+        if extra_default_args:
+            argv += extra_default_args.split()
+        if self.args:
+            argv += self.args.split()
+        return argv
+
+
+@dataclass
+class LoadedModel:
+    model_id: str
+    gguf_path: Path
+    config: ModelConfig
+    port: int
+    process: subprocess.Popen
+    last_used: float = field(default_factory=time.time)
+    starting_at: float = field(default_factory=time.time)
+    ready: bool = False
+    pid: int = 0
+    state_path: Optional[Path] = None
+
+    def touch(self):
+        self.last_used = time.time()
+
+
+@dataclass
+class GPUInfo:
+    index: int
+    name: str
+    total_mb: int
+    used_mb: int
+    free_mb: int
+    utilization_pct: float
+
+
+# --------------------------------------------------------------------------
+# Manager
+# --------------------------------------------------------------------------
+class ModelManager:
+    def __init__(self, cfg: Dict[str, Any]):
+        self.cfg = cfg
+        self.root_dir = Path(cfg["models"]["root_dir"]).resolve()
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.save_state_dir = Path(cfg["models"].get("save_state_dir", "./states")).resolve()
+        self.save_state_dir.mkdir(parents=True, exist_ok=True)
+        self.idle_timeout = cfg["models"].get("idle_timeout_seconds", 300)
+        self.max_loaded_models = cfg["models"].get("max_loaded_models", 1)
+        self.default_auto_save_state = cfg["models"].get("auto_save_state", False)
+        self.binary = cfg["llama_server"]["binary"]
+        self.backends_dir = Path(cfg["llama_server"].get("backends_dir", "./backends")).resolve()
+        self.selected_backend = cfg["llama_server"].get("selected_backend", "")
+        self.default_args = cfg["llama_server"].get("default_args", "")
+        self.base_port = cfg["launcher"].get("base_port", 9001)
+        self.next_port = self.base_port
+
+        self.models: Dict[str, ModelConfig] = {}      # id -> config
+        self.gguf_paths: Dict[str, Path] = {}         # id -> path
+        self.mmproj_paths: Dict[str, Path] = {}       # id -> mmproj path
+        self.loaded: Dict[str, LoadedModel] = {}      # id -> loaded instance
+        self._lock = asyncio.Lock()
+        self._loading_tasks: Dict[str, asyncio.Task] = {}
+        self._stop = False
+        self._bg_task: Optional[asyncio.Task] = None
+
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+
+    # ---------------- backend discovery & resolution ----------------
+    def list_backends(self) -> List[Dict[str, Any]]:
+        out = []
+        if self.backends_dir.exists() and self.backends_dir.is_dir():
+            for p in sorted(self.backends_dir.iterdir()):
+                if p.is_dir():
+                    exe = p / "llama-server.exe"
+                    if not exe.exists():
+                        exe = p / "llama-server"
+                    if exe.exists():
+                        out.append({
+                            "id": p.name,
+                            "name": p.name,
+                            "path": str(exe),
+                        })
+        return out
+
+    def resolve_binary(self, model_cfg: Optional[ModelConfig] = None) -> str:
+        # Priority 1: Per-model backend override
+        if model_cfg and model_cfg.backend:
+            b_dir = self.backends_dir / model_cfg.backend
+            exe = b_dir / "llama-server.exe"
+            if not exe.exists():
+                exe = b_dir / "llama-server"
+            if exe.exists():
+                return str(exe)
+
+        # Priority 2: Global selected backend
+        if self.selected_backend:
+            b_dir = self.backends_dir / self.selected_backend
+            exe = b_dir / "llama-server.exe"
+            if not exe.exists():
+                exe = b_dir / "llama-server"
+            if exe.exists():
+                return str(exe)
+
+        # Priority 3: First available scanned backend
+        scanned = self.list_backends()
+        if scanned:
+            return scanned[0]["path"]
+
+        # Priority 4: Fallback binary setting
+        return self.binary
+
+    # ---------------- model discovery & resolution ----------------
+    def scan(self):
+        """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
+        all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
+        model_paths = []
+        mmproj_paths = []
+
+        for p in all_ggufs:
+            if "mmproj" in p.name.lower():
+                mmproj_paths.append(p)
+            else:
+                model_paths.append(p)
+
+        found = {}
+        self.gguf_paths = {}
+        self.mmproj_paths = {}
+
+        for p in model_paths:
+            mid = p.name  # use filename as id
+            cfg = ModelConfig.load(p)
+            found[mid] = cfg
+            self.gguf_paths[mid] = p
+            if mid in self.loaded:
+                self.loaded[mid].config = cfg
+
+        # Auto-pair mmproj files with sibling models
+        for mid, p in self.gguf_paths.items():
+            cfg = found[mid]
+            paired_mmproj = None
+
+            # 1. Check explicit mmproj_file setting
+            if cfg.mmproj_file:
+                target_p = p.parent / cfg.mmproj_file
+                if target_p.exists():
+                    paired_mmproj = target_p
+                else:
+                    target_p2 = self.root_dir / cfg.mmproj_file
+                    if target_p2.exists():
+                        paired_mmproj = target_p2
+
+            # 2. Look for sibling mmproj files in the same directory
+            if not paired_mmproj:
+                sibling_mmprojs = [mp for mp in mmproj_paths if mp.parent == p.parent]
+                if len(sibling_mmprojs) == 1:
+                    paired_mmproj = sibling_mmprojs[0]
+                elif len(sibling_mmprojs) > 1:
+                    p_stem = p.stem.lower()
+                    best_match = None
+                    best_score = -1
+                    for mp in sibling_mmprojs:
+                        mp_stem = mp.stem.lower()
+                        common_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
+                        if common_len > best_score:
+                            best_score = common_len
+                            best_match = mp
+                    paired_mmproj = best_match
+
+            # 3. Fallback: single mmproj in root_dir
+            if not paired_mmproj and len(mmproj_paths) == 1:
+                paired_mmproj = mmproj_paths[0]
+
+            if paired_mmproj:
+                self.mmproj_paths[mid] = paired_mmproj
+                if not cfg.mmproj_file:
+                    cfg.mmproj_file = paired_mmproj.name
+
+        self.models = found
+        log.info(f"Scan complete: {len(self.models)} models found (filtered {len(mmproj_paths)} mmproj vision modules)")
+        return list(self.models.keys())
+
+    def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+        if not model_id_or_alias:
+            return None
+        if model_id_or_alias in self.models:
+            return model_id_or_alias
+        # Match without .gguf suffix, stem, or lowercased name
+        target_lower = model_id_or_alias.lower()
+        for mid, cfg in self.models.items():
+            stem = Path(mid).stem.lower()
+            if target_lower == stem or target_lower == mid.lower():
+                return mid
+            if cfg.name and target_lower == cfg.name.lower():
+                return mid
+        return None
+
+    def list_models(self) -> List[Dict[str, Any]]:
+        out = []
+        for mid, cfg in self.models.items():
+            loaded = self.loaded.get(mid)
+            path = self.gguf_paths.get(mid)
+            size_mb = (path.stat().st_size / 1024 / 1024) if path and path.exists() else 0
+            resolved_bin = self.resolve_binary(cfg)
+            mmproj_p = self.mmproj_paths.get(mid)
+            has_mmproj = mmproj_p is not None and mmproj_p.exists()
+            out.append({
+                "id": mid,
+                "name": cfg.name or mid,
+                "description": cfg.description,
+                "tags": cfg.tags,
+                "default": cfg.default,
+                "pinned": cfg.pinned,
+                "auto_save_state": cfg.auto_save_state or self.default_auto_save_state,
+                "backend": cfg.backend,
+                "resolved_binary": resolved_bin,
+                "has_mmproj": has_mmproj,
+                "use_mmproj": cfg.use_mmproj,
+                "mmproj_file": cfg.mmproj_file,
+                "ctx_size": cfg.ctx_size,
+                "n_gpu_layers": cfg.n_gpu_layers,
+                "estimated_vram_mb": cfg.estimated_vram_mb,
+                "args": cfg.args,
+                "size_mb": round(size_mb, 1),
+                "loaded": loaded is not None,
+                "ready": loaded.ready if loaded else False,
+                "port": loaded.port if loaded else None,
+                "pid": loaded.pid if loaded else None,
+                "last_used": loaded.last_used if loaded else None,
+                "state_path": str(loaded.state_path) if loaded and loaded.state_path else None,
+            })
+        return out
+
+    def get_config(self, model_id_or_alias: str) -> Optional[ModelConfig]:
+        mid = self.resolve_model_id(model_id_or_alias)
+        return self.models.get(mid) if mid else None
+
+    def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
+        mid = self.resolve_model_id(model_id_or_alias)
+        if not mid or mid not in self.models:
+            raise KeyError(model_id_or_alias)
+        path = self.gguf_paths[mid]
+        new_cfg.save(path)
+        self.models[mid] = new_cfg
+        if mid in self.loaded:
+            self.loaded[mid].config = new_cfg
+        return new_cfg
+
+    # ---------------- process lifecycle & port allocation ----------------
+    def _is_port_available(self, port: int) -> bool:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", port))
+                return True
+            except OSError:
+                return False
+
+    def _allocate_port(self) -> int:
+        used_ports = {lm.port for lm in self.loaded.values()}
+        port = self.next_port
+        for _ in range(500):
+            if port not in used_ports and self._is_port_available(port):
+                self.next_port = port + 1
+                return port
+            port += 1
+        raise RuntimeError("No available ports found for llama-server")
+
+    async def _wait_until_ready(self, port: int, timeout: float = 120.0) -> bool:
+        url = f"http://127.0.0.1:{port}/health"
+        start = time.time()
+        async with httpx.AsyncClient() as c:
+            while time.time() - start < timeout:
+                try:
+                    r = await c.get(url, timeout=2.0)
+                    if r.status_code == 200:
+                        return True
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+        return False
+
+    async def _evict_lru_if_needed(self, target_model_id: str):
+        """If loaded models count >= max_loaded_models, unload LRU unpinned model."""
+        if len(self.loaded) < self.max_loaded_models:
+            return
+        candidates = [
+            (mid, lm) for mid, lm in self.loaded.items()
+            if mid != target_model_id and not lm.config.pinned
+        ]
+        if not candidates:
+            log.warning("Max loaded models limit reached, but all loaded models are pinned or target!")
+            return
+        candidates.sort(key=lambda item: item[1].last_used)
+        lru_id, lru_lm = candidates[0]
+        log.info(f"Auto-evicting LRU model {lru_id} (last used {round(time.time() - lru_lm.last_used, 1)}s ago) to free slot")
+        await self._unload(lru_id)
+
+    async def load_model(self, model_id_input: str, force: bool = False) -> LoadedModel:
+        """Load (JIT) a model with non-blocking concurrency for other requests."""
+        model_id = self.resolve_model_id(model_id_input)
+        if not model_id:
+            raise KeyError(f"Unknown model: {model_id_input}")
+
+        if model_id in self.loaded and self.loaded[model_id].ready and not force:
+            self.loaded[model_id].touch()
+            return self.loaded[model_id]
+
+        async with self._lock:
+            if model_id in self.loaded and self.loaded[model_id].ready and not force:
+                self.loaded[model_id].touch()
+                return self.loaded[model_id]
+
+            if model_id in self._loading_tasks and not force:
+                task = self._loading_tasks[model_id]
+            else:
+                task = asyncio.create_task(self._do_load_model(model_id, force=force))
+                self._loading_tasks[model_id] = task
+
+        try:
+            return await task
+        finally:
+            async with self._lock:
+                if self._loading_tasks.get(model_id) == task:
+                    self._loading_tasks.pop(model_id, None)
+
+    async def _do_load_model(self, model_id: str, force: bool = False) -> LoadedModel:
+        async with self._lock:
+            if model_id in self.loaded and force:
+                await self._unload(model_id)
+            await self._evict_lru_if_needed(model_id)
+
+            cfg = self.models[model_id]
+            path = self.gguf_paths[model_id]
+            port = self._allocate_port()
+            binary_path = self.resolve_binary(cfg)
+            mmproj_p = self.mmproj_paths.get(model_id)
+            argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p)
+
+            log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
+            log.info("argv: " + " ".join(argv))
+
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+
+            lm = LoadedModel(
+                model_id=model_id,
+                gguf_path=path,
+                config=cfg,
+                port=port,
+                process=proc,
+                pid=proc.pid,
+                starting_at=time.time(),
+            )
+            self.loaded[model_id] = lm
+            asyncio.create_task(self._log_stream(model_id, proc))
+
+        # Wait until ready OUTSIDE the lock!
+        ready = await self._wait_until_ready(port)
+        lm.ready = ready
+        if not ready:
+            log.error(f"Model {model_id} failed to become ready")
+            async with self._lock:
+                await self._unload(model_id)
+            raise RuntimeError(f"Model {model_id} failed to start")
+
+        log.info(f"Model {model_id} ready on port {port}")
+        lm.touch()
+
+        # Auto-restore session state if enabled and cached auto state exists
+        if cfg.auto_save_state or self.default_auto_save_state:
+            state_path = self.save_state_dir / f"{model_id}.auto.bin"
+            if state_path.exists():
+                try:
+                    log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
+                    url = f"http://127.0.0.1:{port}/slots"
+                    payload = {"action": "restore", "id_slot": 0, "filename": str(state_path)}
+                    r = await self.client.post(url, json=payload, timeout=30.0)
+                    if r.status_code == 200:
+                        log.info(f"Auto-restored session state for {model_id}")
+                        lm.state_path = state_path
+                    else:
+                        log.warning(f"Auto-restore returned HTTP {r.status_code}: {r.text}")
+                except Exception as e:
+                    log.warning(f"Auto-restore failed for {model_id}: {e}")
+
+        return lm
+
+    async def _log_stream(self, model_id: str, proc: subprocess.Popen):
+        try:
+            assert proc.stdout is not None
+            for line in iter(proc.stdout.readline, b""):
+                try:
+                    txt = line.decode("utf-8", errors="replace").rstrip()
+                    log.info(f"[{model_id}] {txt}")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"log stream for {model_id} ended: {e}")
+
+    async def _unload(self, model_id: str):
+        lm = self.loaded.pop(model_id, None)
+        if lm is None:
+            return
+        log.info(f"Unloading {model_id} (port {lm.port})")
+
+        # Auto-save session state if enabled
+        if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state):
+            try:
+                state_path = self.save_state_dir / f"{model_id}.auto.bin"
+                log.info(f"Auto-saving session state for {model_id} to {state_path}...")
+                url = f"http://127.0.0.1:{lm.port}/slots"
+                payload = {"action": "save", "id_slot": 0, "filename": str(state_path)}
+                r = await self.client.post(url, json=payload, timeout=8.0)
+                if r.status_code == 200:
+                    log.info(f"Auto-saved session state for {model_id}")
+                else:
+                    log.warning(f"Auto-save returned HTTP {r.status_code}: {r.text}")
+            except Exception as e:
+                log.warning(f"Auto-save failed for {model_id}: {e}")
+
+        try:
+            parent = psutil.Process(lm.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            parent.terminate()
+            gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:
+            log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {e}")
+            try:
+                lm.process.kill()
+            except Exception:
+                pass
+
+    async def unload_model(self, model_id_input: str):
+        mid = self.resolve_model_id(model_id_input)
+        if not mid:
+            return
+        async with self._lock:
+            await self._unload(mid)
+
+    async def unload_all(self):
+        async with self._lock:
+            ids = list(self.loaded.keys())
+            for mid in ids:
+                await self._unload(mid)
+
+    # ---------------- GPU info ----------------
+    def gpus(self) -> List[GPUInfo]:
+        out: List[GPUInfo] = []
+        if not shutil.which("nvidia-smi"):
+            return out
+        try:
+            r = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in r.stdout.strip().splitlines():
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) < 6:
+                    continue
+                out.append(GPUInfo(
+                    index=_safe_int(parts[0], 0),
+                    name=parts[1],
+                    total_mb=_safe_int(parts[2], 0),
+                    used_mb=_safe_int(parts[3], 0),
+                    free_mb=_safe_int(parts[4], 0),
+                    utilization_pct=_safe_float(parts[5], 0.0),
+                ))
+        except Exception as e:
+            log.warning(f"nvidia-smi failed: {e}")
+        return out
+
+    def system_ram(self) -> Dict[str, float]:
+        m = psutil.virtual_memory()
+        return {
+            "total_mb": m.total / 1024 / 1024,
+            "used_mb": m.used / 1024 / 1024,
+            "free_mb": m.available / 1024 / 1024,
+            "pct": m.percent,
+        }
+
+    def per_model_ram_vram(self) -> Dict[str, Dict[str, int]]:
+        """Best-effort per-model RAM/VRAM accounting via process info."""
+        out: Dict[str, Dict[str, int]] = {}
+        try:
+            apps = subprocess.run(
+                ["nvidia-smi",
+                 "--query-compute-apps=pid,used_memory",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            pid_to_vram: Dict[int, int] = {}
+            for line in apps.stdout.strip().splitlines():
+                parts = [x.strip() for x in line.split(",")]
+                if len(parts) >= 2 and parts[0].isdigit():
+                    pid_to_vram[int(parts[0])] = _safe_int(parts[1], 0)
+            for mid, lm in self.loaded.items():
+                try:
+                    p = psutil.Process(lm.pid)
+                    ram = p.memory_info().rss / 1024 / 1024
+                except Exception:
+                    ram = 0
+                vram = pid_to_vram.get(lm.pid, 0)
+                out[mid] = {"ram_mb": int(ram), "vram_mb": int(vram)}
+        except Exception as e:
+            log.warning(f"per_model_ram_vram failed: {e}")
+        return out
+
+    # ---------------- proxy ----------------
+    async def proxy(self, model_id_input: str, path: str, request: Request) -> Response:
+        """Proxy a request to the loaded model's llama-server."""
+        model_id = self.resolve_model_id(model_id_input)
+        if not model_id:
+            raise HTTPException(status_code=404, detail=f"Unknown model: {model_id_input}")
+
+        if model_id not in self.loaded or not self.loaded[model_id].ready:
+            try:
+                await self.load_model(model_id)
+            except Exception as e:
+                raise HTTPException(status_code=503, detail=f"Failed to load model: {e}")
+
+        lm = self.loaded[model_id]
+        lm.touch()
+
+        url = f"http://127.0.0.1:{lm.port}{path}"
+        body = await request.body()
+        headers = {k: v for k, v in request.headers.items()
+                   if k.lower() not in ("host", "content-length")}
+        req_method = request.method
+
+        # Streaming?
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {}
+        stream = parsed.get("stream", False) if isinstance(parsed, dict) else False
+
+        if stream and req_method in ("POST", "PUT"):
+            try:
+                req = self.client.build_request(req_method, url, content=body, headers=headers)
+                r = await self.client.send(req, stream=True)
+                if r.status_code >= 400:
+                    err_bytes = await r.aread()
+                    await r.aclose()
+                    return Response(content=err_bytes, status_code=r.status_code,
+                                    media_type=r.headers.get("content-type", "application/json"))
+
+                async def gen() -> AsyncIterator[bytes]:
+                    try:
+                        async for chunk in r.aiter_raw():
+                            yield chunk
+                    finally:
+                        await r.aclose()
+
+                return StreamingResponse(gen(), status_code=r.status_code, media_type="text/event-stream")
+            except httpx.ConnectError:
+                raise HTTPException(status_code=502, detail="Model server unreachable")
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Proxy error: {e}")
+
+        try:
+            r = await self.client.request(req_method, url, content=body, headers=headers)
+            return Response(content=r.content, status_code=r.status_code,
+                            media_type=r.headers.get("content-type", "application/json"))
+        except httpx.ConnectError:
+            raise HTTPException(status_code=502, detail="Model server unreachable")
+
+    # ---------------- state save/load ----------------
+    async def save_state(self, model_id_input: str, label: str = "default") -> Path:
+        model_id = self.resolve_model_id(model_id_input)
+        if not model_id or model_id not in self.loaded:
+            raise HTTPException(400, "Model not loaded")
+        lm = self.loaded[model_id]
+        state_path = self.save_state_dir / f"{model_id}.{label}.bin"
+        url = f"http://127.0.0.1:{lm.port}/slots"
+        payload = {"action": "save", "id_slot": 0, "filename": str(state_path)}
+        try:
+            r = await self.client.post(url, json=payload, timeout=120.0)
+            if r.status_code >= 400:
+                raise HTTPException(500, f"save failed: {r.text}")
+        except httpx.HTTPError as e:
+            raise HTTPException(500, f"save failed: {e}")
+        lm.state_path = state_path
+        return state_path
+
+    async def load_state(self, model_id_input: str, label: str = "default") -> Path:
+        model_id = self.resolve_model_id(model_id_input)
+        if not model_id or model_id not in self.loaded:
+            raise HTTPException(400, "Model not loaded")
+        lm = self.loaded[model_id]
+        state_path = self.save_state_dir / f"{model_id}.{label}.bin"
+        if not state_path.exists():
+            raise HTTPException(404, f"No state file: {state_path}")
+        url = f"http://127.0.0.1:{lm.port}/slots"
+        payload = {"action": "restore", "id_slot": 0, "filename": str(state_path)}
+        try:
+            r = await self.client.post(url, json=payload, timeout=120.0)
+            if r.status_code >= 400:
+                raise HTTPException(500, f"restore failed: {r.text}")
+        except httpx.HTTPError as e:
+            raise HTTPException(500, f"restore failed: {e}")
+        lm.state_path = state_path
+        return state_path
+
+    def list_states(self, model_id_input: str) -> List[str]:
+        model_id = self.resolve_model_id(model_id_input) or model_id_input
+        out = []
+        for p in self.save_state_dir.glob(f"{model_id}.*.bin"):
+            label = p.stem.split(".", 1)[1]
+            out.append(label)
+        return out
+
+    # ---------------- background idle reaper ----------------
+    async def idle_reaper(self):
+        while not self._stop:
+            try:
+                now = time.time()
+                to_unload = []
+                for mid, lm in list(self.loaded.items()):
+                    if lm.config.pinned or not lm.ready:
+                        continue
+                    if now - lm.last_used > self.idle_timeout:
+                        to_unload.append(mid)
+                for mid in to_unload:
+                    log.info(f"Idle-unloading {mid}")
+                    await self._unload(mid)
+            except Exception as e:
+                log.warning(f"idle_reaper error: {e}")
+            await asyncio.sleep(10)
+
+    async def start(self):
+        self.scan()
+        self._bg_task = asyncio.create_task(self.idle_reaper())
+
+    async def stop(self):
+        self._stop = True
+        if self._bg_task:
+            self._bg_task.cancel()
+        await self.unload_all()
+        await self.client.aclose()
+
+
+# --------------------------------------------------------------------------
+# FastAPI app
+# --------------------------------------------------------------------------
+CONFIG_PATH = os.environ.get("AUTOLOADER_CONFIG", "config.yaml")
+with open(CONFIG_PATH) as f:
+    CFG = yaml.safe_load(f)
+
+manager = ModelManager(CFG)
+
+app = FastAPI(title="llama-autoloader", version="0.1.0")
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
+# ---------- models payloads ----------
+class ModelConfigUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    args: Optional[str] = None
+    ctx_size: Optional[int] = None
+    n_gpu_layers: Optional[int] = None
+    default: Optional[bool] = None
+    pinned: Optional[bool] = None
+    auto_save_state: Optional[bool] = None
+    backend: Optional[str] = None
+    use_mmproj: Optional[bool] = None
+    mmproj_file: Optional[str] = None
+    estimated_vram_mb: Optional[int] = None
+    tags: Optional[List[str]] = None
+
+class SelectBackendPayload(BaseModel):
+    backend: str = ""
+
+class StateLabel(BaseModel):
+    label: str = "default"
+
+# ---------- status / dashboard / health ----------
+@app.get("/")
+async def index():
+    p = Path(__file__).parent / "static" / "index.html"
+    return HTMLResponse(p.read_text(encoding="utf-8"))
+
+@app.get("/health")
+@app.get("/v1/health")
+async def health():
+    return {"status": "ok", "models_loaded": len(manager.loaded)}
+
+@app.get("/v1/backends")
+async def get_backends():
+    return {
+        "backends": manager.list_backends(),
+        "selected_backend": manager.selected_backend,
+        "default_binary": manager.binary,
+        "resolved_global_binary": manager.resolve_binary(None),
+    }
+
+@app.post("/v1/backend/select")
+async def select_backend(body: SelectBackendPayload):
+    manager.selected_backend = body.backend
+    log.info(f"Global backend selected: '{body.backend}' -> resolved binary: '{manager.resolve_binary(None)}'")
+    return {
+        "selected_backend": manager.selected_backend,
+        "resolved_binary": manager.resolve_binary(None),
+    }
+
+@app.get("/v1/status")
+async def status():
+    gpus = [asdict(g) for g in manager.gpus()]
+    per = manager.per_model_ram_vram()
+    backends = manager.list_backends()
+    return {
+        "launcher": {
+            "host": CFG["launcher"]["host"],
+            "port": CFG["launcher"]["port"],
+            "binary": manager.resolve_binary(None),
+            "selected_backend": manager.selected_backend,
+            "backends": backends,
+        },
+        "gpus": gpus,
+        "ram": manager.system_ram(),
+        "models_loaded": len(manager.loaded),
+        "models_total": len(manager.models),
+        "idle_timeout": manager.idle_timeout,
+        "max_loaded_models": manager.max_loaded_models,
+        "per_model": per,
+        "uptime_models": [
+            {
+                "id": mid,
+                "port": lm.port,
+                "pid": lm.pid,
+                "uptime_s": round(time.time() - lm.starting_at, 1),
+                "last_used_s_ago": round(time.time() - lm.last_used, 1),
+                "ready": lm.ready,
+            } for mid, lm in manager.loaded.items()
+        ],
+    }
+
+# ---------- model list / config (LM Studio compatible) ----------
+@app.get("/v1/models")
+async def list_models():
+    data = []
+    for m in manager.list_models():
+        data.append({
+            "id": m["id"],
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "llama-autoloader",
+            "loaded": m["loaded"],
+            "ready": m["ready"],
+            "port": m["port"],
+            "tags": m["tags"],
+            "size_mb": m["size_mb"],
+            "default": m["default"],
+        })
+    return {"object": "list", "data": data}
+
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str):
+    mid = manager.resolve_model_id(model_id)
+    if not mid:
+        raise HTTPException(404, "Model not found")
+    cfg = manager.get_config(mid)
+    return {
+        "id": mid,
+        "object": "model",
+        "config": asdict(cfg) if cfg else {},
+        "loaded": mid in manager.loaded,
+    }
+
+@app.put("/v1/models/{model_id}/config")
+async def update_model_config(model_id: str, body: ModelConfigUpdate):
+    mid = manager.resolve_model_id(model_id)
+    if not mid or mid not in manager.models:
+        raise HTTPException(404, "Unknown model")
+    cfg = manager.models[mid]
+    for k, v in body.model_dump(exclude_none=True).items():
+        setattr(cfg, k, v)
+    manager.update_config(mid, cfg)
+    return asdict(cfg)
+
+@app.post("/v1/models/{model_id}/vision/toggle")
+async def toggle_vision_ep(model_id: str):
+    mid = manager.resolve_model_id(model_id)
+    if not mid or mid not in manager.models:
+        raise HTTPException(404, "Unknown model")
+    cfg = manager.models[mid]
+    cfg.use_mmproj = not cfg.use_mmproj
+    manager.update_config(mid, cfg)
+    return {"id": mid, "use_mmproj": cfg.use_mmproj, "mmproj_file": cfg.mmproj_file}
+
+@app.post("/v1/scan")
+async def rescan():
+    ids = manager.scan()
+    return {"models": ids}
+
+# ---------- load / unload ----------
+@app.post("/v1/models/{model_id}/load")
+async def load_model_ep(model_id: str):
+    try:
+        lm = await manager.load_model(model_id, force=False)
+        return {"id": model_id, "port": lm.port, "pid": lm.pid, "ready": lm.ready}
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(503, str(e))
+
+@app.post("/v1/models/{model_id}/unload")
+async def unload_model_ep(model_id: str):
+    await manager.unload_model(model_id)
+    return {"id": model_id, "unloaded": True}
+
+@app.post("/v1/unload_all")
+async def unload_all_ep():
+    await manager.unload_all()
+    return {"unloaded_all": True}
+
+# ---------- state save / load ----------
+@app.post("/v1/models/{model_id}/state/save")
+async def save_state_ep(model_id: str, body: StateLabel):
+    p = await manager.save_state(model_id, body.label)
+    return {"id": model_id, "label": body.label, "path": str(p)}
+
+@app.post("/v1/models/{model_id}/state/load")
+async def load_state_ep(model_id: str, body: StateLabel):
+    p = await manager.load_state(model_id, body.label)
+    return {"id": model_id, "label": body.label, "path": str(p)}
+
+@app.get("/v1/models/{model_id}/state")
+async def list_states_ep(model_id: str):
+    return {"id": model_id, "labels": manager.list_states(model_id)}
+
+# ---------- OpenAI-compatible proxy endpoints ----------
+@app.api_route("/v1/chat/completions", methods=["POST"])
+async def proxy_chat(request: Request):
+    body = await request.body()
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    model_id = data.get("model")
+    if not model_id:
+        # Use default model if any.
+        for mid, cfg in manager.models.items():
+            if cfg.default:
+                model_id = mid
+                break
+    if not model_id:
+        raise HTTPException(400, "No model specified and no default set")
+    return await manager.proxy(model_id, "/v1/chat/completions", request)
+
+@app.api_route("/v1/completions", methods=["POST"])
+async def proxy_completions(request: Request):
+    body = await request.body()
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    model_id = data.get("model")
+    if not model_id:
+        raise HTTPException(400, "No model specified")
+    return await manager.proxy(model_id, "/v1/completions", request)
+
+@app.api_route("/v1/embeddings", methods=["POST"])
+async def proxy_embeddings(request: Request):
+    body = await request.body()
+    try:
+        data = json.loads(body)
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    model_id = data.get("model")
+    if not model_id:
+        raise HTTPException(400, "No model specified")
+    return await manager.proxy(model_id, "/v1/embeddings", request)
+
+# Pass-through other llama-server endpoints (e.g. /slots, /tokenize, /detokenize)
+@app.api_route("/v1/raw/{model_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def proxy_raw(model_id: str, path: str, request: Request):
+    return await manager.proxy(model_id, "/" + path, request)
+
+# ---------- WebSocket for live updates ----------
+@app.websocket("/ws")
+async def ws(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            await websocket.send_json(await status())
+    except WebSocketDisconnect:
+        return
+    except Exception:
+        return
+
+# ---------- lifecycle ----------
+@app.on_event("startup")
+async def _startup():
+    await manager.start()
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await manager.stop()
+
+
+# --------------------------------------------------------------------------
+# Entry
+# --------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default=CFG["launcher"]["host"])
+    ap.add_argument("--port", type=int, default=CFG["launcher"]["port"])
+    args = ap.parse_args()
+    uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
