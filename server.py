@@ -43,6 +43,9 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+# Silence uvicorn's per-request INFO spam
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 log = logging.getLogger("autoloader")
 
 def _safe_int(val: str, default: int = 0) -> int:
@@ -1134,7 +1137,7 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     try:
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(2.0)
             await websocket.send_json(manager.get_cached_status())
     except WebSocketDisconnect:
         return

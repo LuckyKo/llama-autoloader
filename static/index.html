@@ -688,16 +688,17 @@ function wsLoop() {
         renderGPUs(st.gpus);
         renderRAM(st.ram);
         $('loaded-count').textContent = `${st.models_loaded}/${st.models_total}`;
-        const models = await apiJSON('/v1/models');
-        // Merge live status fields (loaded/ready/port) into existing cached config
-        modelsCache = (models.data||[]).map(d => {
-          const cached = modelsCache.find(x => x.id === d.id) || {};
-          return {
-            ...cached,
-            id: d.id, name: cached.name || d.id, tags: d.tags, size_mb: d.size_mb||0,
-            loaded: d.loaded, ready: d.ready, port: d.port, default: d.default,
-          };
-        });
+        // Update live status fields from uptime_models without extra HTTP call
+        if (st.uptime_models) {
+          for (const um of st.uptime_models) {
+            const cached = modelsCache.find(x => x.id === um.id);
+            if (cached) {
+              cached.loaded = true;
+              cached.ready = um.ready;
+              cached.port = um.port;
+            }
+          }
+        }
         renderModels();
       } catch (e) { console.error('WS update error:', e); }
     };
