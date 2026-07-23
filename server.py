@@ -1342,4 +1342,4 @@ if __name__ == "__main__":
     args = ap.parse_args()
     manager.host = args.host
     manager.port = args.port
-    uvicorn.run("server:app", host=args.host, port=args.port, reload=False)
+    uvicorn.run(app, host=args.host, port=args.port, reload=False)
