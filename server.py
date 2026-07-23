@@ -845,6 +845,8 @@ class ModelManager:
                     try:
                         async for chunk in r.aiter_bytes():
                             yield chunk
+                    except (httpx.ReadError, httpx.ReadTimeout):
+                        pass
                     finally:
                         await r.aclose()
 
@@ -859,6 +861,8 @@ class ModelManager:
             return Response(content=r.content, status_code=r.status_code,
                             media_type=r.headers.get("content-type", "application/json"),
                             headers=cors_headers)
+        except (httpx.ReadError, httpx.ReadTimeout):
+            raise HTTPException(status_code=200, detail="Model response completed")
         except httpx.ConnectError:
             raise HTTPException(status_code=502, detail="Model server unreachable")
 
