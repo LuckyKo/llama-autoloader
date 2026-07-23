@@ -331,11 +331,12 @@ class ModelManager:
 
             # 1. Check explicit mmproj_file setting
             if cfg.mmproj_file:
-                target_p = p.parent / cfg.mmproj_file
+                mmproj_name = Path(cfg.mmproj_file).resolve().name
+                target_p = p.parent / mmproj_name
                 if target_p.exists():
                     paired_mmproj = target_p
                 else:
-                    target_p2 = self.root_dir / cfg.mmproj_file
+                    target_p2 = self.root_dir / mmproj_name
                     if target_p2.exists():
                         paired_mmproj = target_p2
 
@@ -850,17 +851,12 @@ class ModelManager:
             raise HTTPException(status_code=502, detail="Model server unreachable")
 
     # ---------------- state save/load ----------------
-    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
-        """Attempt to save slot state trying supported endpoint formats."""
-        state_path.parent.mkdir(parents=True, exist_ok=True)
-        # With --slot-save-path, filename must be relative to that dir (just the basename)
-        filename = state_path.name
-        log.info(f"Saving slot 0 state to file: {state_path}")
-
+    async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+        """Attempt a slot action (save/restore) trying supported endpoint formats."""
         endpoints = [
-            (f"http://127.0.0.1:{port}/slots/0?action=save", {"filename": filename}),
-            (f"http://127.0.0.1:{port}/slots?action=save", {"id_slot": 0, "filename": filename}),
-            (f"http://127.0.0.1:{port}/slots", {"action": "save", "id_slot": 0, "filename": filename}),
+            (f"http://127.0.0.1:{port}/slots/0?action={action}", {"filename": state_path.name}),
+            (f"http://127.0.0.1:{port}/slots?action={action}", {"id_slot": 0, "filename": state_path.name}),
+            (f"http://127.0.0.1:{port}/slots", {"action": action, "id_slot": 0, "filename": state_path.name}),
         ]
 
         last_err = None
@@ -868,41 +864,26 @@ class ModelManager:
             try:
                 r = await self.client.post(url, json=payload, timeout=timeout)
                 if r.status_code == 200:
-                    log.info(f"Slot state saved via {url}")
                     return True
                 else:
                     last_err = f"HTTP {r.status_code}: {r.text}"
             except Exception as e:
                 last_err = str(e)
 
-        raise RuntimeError(last_err or "Save failed across all slot endpoints")
+        raise RuntimeError(last_err or f"{action} failed across all slot endpoints")
+
+    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+        """Attempt to save slot state trying supported endpoint formats."""
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        log.info(f"Saving slot 0 state to file: {state_path}")
+        return await self._perform_slot_action("save", port, state_path, timeout)
 
     async def _perform_slot_restore(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
         """Attempt to restore slot state trying supported endpoint formats."""
         if not state_path.exists():
             raise FileNotFoundError(f"State file not found: {state_path}")
-        filename = state_path.name
         log.info(f"Restoring slot 0 state from file: {state_path}")
-
-        endpoints = [
-            (f"http://127.0.0.1:{port}/slots/0?action=restore", {"filename": filename}),
-            (f"http://127.0.0.1:{port}/slots?action=restore", {"id_slot": 0, "filename": filename}),
-            (f"http://127.0.0.1:{port}/slots", {"action": "restore", "id_slot": 0, "filename": filename}),
-        ]
-
-        last_err = None
-        for url, payload in endpoints:
-            try:
-                r = await self.client.post(url, json=payload, timeout=timeout)
-                if r.status_code == 200:
-                    log.info(f"Slot state restored via {url}")
-                    return True
-                else:
-                    last_err = f"HTTP {r.status_code}: {r.text}"
-            except Exception as e:
-                last_err = str(e)
-
-        raise RuntimeError(last_err or "Restore failed across all slot endpoints")
+        return await self._perform_slot_action("restore", port, state_path, timeout)
 
     async def save_state(self, model_id_input: str, label: str = "default") -> Path:
         model_id = self.resolve_model_id(model_id_input)
@@ -991,12 +972,13 @@ class ModelManager:
                 log.warning(f"status_cache_updater error: {e}")
             await asyncio.sleep(self._poll_interval)
 
-    def get_cached_status(self) -> Dict[str, Any]:
+    async def get_cached_status(self) -> Dict[str, Any]:
         """Return cached status, refreshing if stale."""
-        if self._status_cache is None or (time.time() - self._status_cache_time) > self._poll_interval:
-            self._status_cache_time = time.time()
-            self._status_cache = self._build_status()
-        return self._status_cache.copy()
+        async with self._lock:
+            if self._status_cache is None or (time.time() - self._status_cache_time) > self._poll_interval:
+                self._status_cache_time = time.time()
+                self._status_cache = await asyncio.to_thread(self._build_status)
+            return self._status_cache.copy()
 
     # ---------------- background idle reaper ----------------
     async def idle_reaper(self) -> None:
@@ -1021,7 +1003,7 @@ class ModelManager:
 
     async def start(self):
         async with self._lock:
-            self.scan()
+            await asyncio.to_thread(self.scan)
         self._bg_task = asyncio.create_task(self.idle_reaper())
         self._status_task: Optional[asyncio.Task] = asyncio.create_task(self._status_cache_updater())
 
@@ -1103,6 +1085,11 @@ async def get_backends():
 
 @app.post("/v1/backend/select")
 async def select_backend(body: SelectBackendPayload):
+    if body.backend:
+        backends = manager.list_backends()
+        backend_ids = [b.id for b in backends]
+        if body.backend not in backend_ids:
+            raise HTTPException(400, f"Unknown backend: '{body.backend}'. Available: {backend_ids}")
     manager.selected_backend = body.backend
     # Persist to config.yaml
     cfg_yaml = manager.cfg
@@ -1117,7 +1104,7 @@ async def select_backend(body: SelectBackendPayload):
 
 @app.get("/v1/status")
 async def status():
-    return manager.get_cached_status()
+    return await manager.get_cached_status()
 
 # ---------- model list / config (LM Studio compatible) ----------
 @app.get("/v1/models")
@@ -1301,7 +1288,7 @@ async def ws(websocket: WebSocket):
     try:
         while True:
             await asyncio.sleep(2.0)
-            await websocket.send_json(manager.get_cached_status())
+            await websocket.send_json(await manager.get_cached_status())
     except WebSocketDisconnect:
         return
     except Exception as e:

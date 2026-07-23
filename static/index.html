@@ -437,11 +437,11 @@ function renderModels() {
     const name = esc(m.name || m.id);
     const id = esc(m.id);
     return `
-    <div class="model-card" data-id="${m.id}">
+    <div class="model-card" data-id="${id}">
       <div class="model-head">
         <div>
           <div class="model-name">${name}</div>
-          <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+m.port : ''}${m.pid ? ' · pid '+m.pid : ''}</div>
+          <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
           <div style="margin-top:6px;">${tags}${m.default?'<span class="tag">default</span>':''}${m.pinned?'<span class="tag">pinned</span>':''}${m.auto_save_state?'<span class="tag">autosave</span>':''}${visionTag}</div>
         </div>
         ${statusBadge(m.loaded, m.ready)}
@@ -560,8 +560,8 @@ function renderBackendSelectors(st) {
   let fHtml = '<option value="">(Use Global Default)</option>';
 
   backends.forEach(b => {
-    gHtml += `<option value="${b.id}">${b.name}</option>`;
-    fHtml += `<option value="${b.id}">${b.name}</option>`;
+    gHtml += `<option value="${esc(b.id)}">${esc(b.name)}</option>`;
+    fHtml += `<option value="${esc(b.id)}">${esc(b.name)}</option>`;
   });
 
   gSel.innerHTML = gHtml;
