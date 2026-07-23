@@ -1115,7 +1115,7 @@ async def get_backends():
 async def select_backend(body: SelectBackendPayload):
     if body.backend:
         backends = manager.list_backends()
-        backend_ids = [b.id for b in backends]
+        backend_ids = [b["id"] for b in backends]
         if body.backend not in backend_ids:
             raise HTTPException(400, f"Unknown backend: '{body.backend}'. Available: {backend_ids}")
     manager.selected_backend = body.backend
