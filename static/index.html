@@ -436,9 +436,22 @@ function renderModels() {
     if (!idsNeeded.has(id)) card.remove();
   });
 
+  // Snapshot config fields to detect when a card needs full rebuild
+  function configKey(m) {
+    const tags = (m.tags||[]).join(',');
+    return `${m.name||''}|${tags}|${m.ctx_size}|${m.n_gpu_layers}|${m.args||''}|${m.default}|${m.pinned}|${m.auto_save_state}|${m.backend||''}|${m.use_mmproj}|${m.has_mmproj}|${m.estimated_vram_mb}|${m.size_mb}`;
+  }
+
   list.forEach(m => {
     const pm = perModel[m.id] || {};
     let card = existingCards.get(m.id);
+    const mKey = configKey(m);
+    const configChanged = card && card._configKey !== mKey;
+
+    if (configChanged) {
+      card.remove();
+      card = null;
+    }
 
     if (!card) {
       // Build a new card
@@ -483,7 +496,7 @@ function renderModels() {
         </div>`;
       grid.appendChild(card);
     } else {
-      // Update dynamic fields in-place (the parts that change every tick)
+      // Config unchanged — update only dynamic stats fields in-place
       const statsDiv = card.querySelector('.model-stats');
       if (statsDiv && statsDiv.children.length >= 4) {
         statsDiv.children[0].innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
@@ -491,18 +504,15 @@ function renderModels() {
         statsDiv.children[2].innerHTML = `est:  <b>${m.estimated_vram_mb ? fmtBytes(m.estimated_vram_mb) : '—'}</b>`;
         statsDiv.children[3].innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
       }
-      // Update meta line (port/pid may change)
       const metaEl = card.querySelector('.model-meta');
       if (metaEl) {
         const id = esc(m.id);
         metaEl.innerHTML = `${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
       }
-      // Update status badge
       const badge = card.querySelector('.status-badge');
       if (badge) {
         badge.outerHTML = statusBadge(m.loaded, m.ready);
       }
-      // Update button row (load/unload, state buttons appear/disappear based on loaded state)
       const btnRow = card.querySelector('.btn-row');
       if (btnRow) {
         const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
@@ -519,6 +529,8 @@ function renderModels() {
         `;
       }
     }
+
+    card._configKey = mKey;
 
     // Wire buttons (works for both new and existing cards)
     card.querySelectorAll('button[data-act]').forEach(btn => {
