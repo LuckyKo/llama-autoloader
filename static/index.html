@@ -427,53 +427,102 @@ function renderModels() {
   }
 
   const perModel = (statusCache && statusCache.per_model) || {};
+  const idsNeeded = new Set(list.map(m => m.id));
+  const existingCards = new Map();
+  grid.querySelectorAll('.model-card').forEach(c => existingCards.set(c.dataset.id, c));
 
-  grid.innerHTML = list.map(m => {
+  // Remove cards no longer needed
+  existingCards.forEach((card, id) => {
+    if (!idsNeeded.has(id)) card.remove();
+  });
+
+  list.forEach(m => {
     const pm = perModel[m.id] || {};
-    const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
-    const argsDisplay = `--ctx-size ${m.ctx_size} --n-gpu-layers ${m.n_gpu_layers} ${m.args||''}`.trim();
-    const visionTag = m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '';
-    const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
-    const name = esc(m.name || m.id);
-    const id = esc(m.id);
-    return `
-    <div class="model-card" data-id="${id}">
-      <div class="model-head">
-        <div>
-          <div class="model-name">${name}</div>
-          <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
-          <div style="margin-top:6px;">${tags}${m.default?'<span class="tag">default</span>':''}${m.pinned?'<span class="tag">pinned</span>':''}${m.auto_save_state?'<span class="tag">autosave</span>':''}${visionTag}</div>
+    let card = existingCards.get(m.id);
+
+    if (!card) {
+      // Build a new card
+      const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+      const argsDisplay = `--ctx-size ${m.ctx_size} --n-gpu-layers ${m.n_gpu_layers} ${m.args||''}`.trim();
+      const visionTag = m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '';
+      const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
+      const name = esc(m.name || m.id);
+      const id = esc(m.id);
+      card = document.createElement('div');
+      card.className = 'model-card';
+      card.dataset.id = m.id;
+      card.innerHTML = `
+        <div class="model-head">
+          <div>
+            <div class="model-name">${name}</div>
+            <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
+            <div style="margin-top:6px;">${tags}${m.default?'<span class="tag">default</span>':''}${m.pinned?'<span class="tag">pinned</span>':''}${m.auto_save_state?'<span class="tag">autosave</span>':''}${visionTag}</div>
+          </div>
+          ${statusBadge(m.loaded, m.ready)}
         </div>
-        ${statusBadge(m.loaded, m.ready)}
-      </div>
 
-      <div class="args-box">${esc(argsDisplay) || '(no extra args)'}</div>
+        <div class="args-box">${esc(argsDisplay) || '(no extra args)'}</div>
 
-      <div class="model-stats">
-        <div>VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
-        <div>RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
-        <div>est:  <b>${m.estimated_vram_mb ? fmtBytes(m.estimated_vram_mb) : '—'}</b></div>
-        <div>uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
-      </div>
+        <div class="model-stats">
+          <div>VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
+          <div>RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
+          <div>est:  <b>${m.estimated_vram_mb ? fmtBytes(m.estimated_vram_mb) : '—'}</b></div>
+          <div>uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
+        </div>
 
-      <div class="btn-row">
-        ${m.loaded ? `<button class="danger" data-act="unload">Unload</button>`
-                   : `<button class="primary" data-act="load">Load</button>`}
-        <button data-act="edit">Edit</button>
-        ${visionBtn}
-        <button data-act="copy-curl">cURL</button>
-        ${m.loaded ? `
-          <button data-act="save-state">Save State</button>
-          <button data-act="load-state">Load State</button>
-        ` : ''}
-      </div>
-    </div>`;
-  }).join('');
+        <div class="btn-row">
+          ${m.loaded ? `<button class="danger" data-act="unload">Unload</button>`
+                     : `<button class="primary" data-act="load">Load</button>`}
+          <button data-act="edit">Edit</button>
+          ${visionBtn}
+          <button data-act="copy-curl">cURL</button>
+          ${m.loaded ? `
+            <button data-act="save-state">Save State</button>
+            <button data-act="load-state">Load State</button>
+          ` : ''}
+        </div>`;
+      grid.appendChild(card);
+    } else {
+      // Update dynamic fields in-place (the parts that change every tick)
+      const statsDiv = card.querySelector('.model-stats');
+      if (statsDiv && statsDiv.children.length >= 4) {
+        statsDiv.children[0].innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
+        statsDiv.children[1].innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
+        statsDiv.children[2].innerHTML = `est:  <b>${m.estimated_vram_mb ? fmtBytes(m.estimated_vram_mb) : '—'}</b>`;
+        statsDiv.children[3].innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
+      }
+      // Update meta line (port/pid may change)
+      const metaEl = card.querySelector('.model-meta');
+      if (metaEl) {
+        const id = esc(m.id);
+        metaEl.innerHTML = `${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
+      }
+      // Update status badge
+      const badge = card.querySelector('.status-badge');
+      if (badge) {
+        badge.outerHTML = statusBadge(m.loaded, m.ready);
+      }
+      // Update button row (load/unload, state buttons appear/disappear based on loaded state)
+      const btnRow = card.querySelector('.btn-row');
+      if (btnRow) {
+        const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
+        btnRow.innerHTML = `
+          ${m.loaded ? `<button class="danger" data-act="unload">Unload</button>`
+                     : `<button class="primary" data-act="load">Load</button>`}
+          <button data-act="edit">Edit</button>
+          ${visionBtn}
+          <button data-act="copy-curl">cURL</button>
+          ${m.loaded ? `
+            <button data-act="save-state">Save State</button>
+            <button data-act="load-state">Load State</button>
+          ` : ''}
+        `;
+      }
+    }
 
-  grid.querySelectorAll('.model-card').forEach(card => {
-    const id = card.dataset.id;
+    // Wire buttons (works for both new and existing cards)
     card.querySelectorAll('button[data-act]').forEach(btn => {
-      btn.onclick = () => handleAction(id, btn.dataset.act, btn);
+      btn.onclick = () => handleAction(m.id, btn.dataset.act, btn);
     });
   });
 }
