@@ -389,13 +389,20 @@ class ModelManager:
         if self.loaded:
             ready_loaded = [m for m, lm in self.loaded.items() if lm.ready]
             if ready_loaded:
-                return ready_loaded[0]
-            return next(iter(self.loaded.keys()))
+                model_id = ready_loaded[0]
+                log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to '{model_id}'")
+                return model_id
+            model_id = next(iter(self.loaded.keys()))
+            log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to '{model_id}'")
+            return model_id
         for mid, cfg in self.models.items():
             if cfg.default:
+                log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to default '{mid}'")
                 return mid
         if len(self.models) == 1:
-            return next(iter(self.models.keys()))
+            model_id = next(iter(self.models.keys()))
+            log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to single model '{model_id}'")
+            return model_id
         return None
 
     def list_models(self) -> List[Dict[str, Any]]:
@@ -787,6 +794,8 @@ class ModelManager:
             log.error(f"Could not resolve model for input {model_id_input!r}")
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id_input}")
 
+        if model_id_input and model_id != model_id_input:
+            log.warning(f"Model '{model_id_input}' not found; falling back to '{model_id}'")
         log.info(f"Resolved model ID: '{model_id}'")
         if model_id not in self.loaded or not self.loaded[model_id].ready:
             log.info(f"Model '{model_id}' not loaded or not ready. Loading model JIT...")
@@ -1234,7 +1243,7 @@ async def list_states_ep(model_id: str):
     return {"id": model_id, "labels": manager.list_states(model_id)}
 
 # ---------- OpenAI-compatible proxy endpoints ----------
-async def _resolve_proxy_model(body: bytes, default_if_missing: bool = True) -> str:
+async def _resolve_proxy_model(body: bytes) -> str:
     """Extract model ID from request body, with fallback to loaded/default/single model."""
     model_id = None
     if body:
@@ -1246,8 +1255,6 @@ async def _resolve_proxy_model(body: bytes, default_if_missing: bool = True) -> 
             pass
 
     resolved = manager.resolve_model_id(model_id)
-    if not resolved and default_if_missing:
-        resolved = manager.resolve_model_id(None)
     if not resolved:
         raise HTTPException(404, "No matching model found and no loaded/default model available")
     return resolved
@@ -1255,38 +1262,38 @@ async def _resolve_proxy_model(body: bytes, default_if_missing: bool = True) -> 
 @app.api_route("/v1/chat/completions", methods=["POST"])
 async def proxy_chat(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/chat/completions", request)
 
 @app.api_route("/v1/completions", methods=["POST"])
 async def proxy_completions(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/completions", request)
 
 @app.api_route("/v1/embeddings", methods=["POST"])
 async def proxy_embeddings(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/embeddings", request)
 
 # Top-level non-/v1 routes (for clients connecting without /v1 prefix)
 @app.api_route("/chat/completions", methods=["POST"])
 async def proxy_chat_top(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/chat/completions", request)
 
 @app.api_route("/completions", methods=["POST"])
 async def proxy_completions_top(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/completions", request)
 
 @app.api_route("/embeddings", methods=["POST"])
 async def proxy_embeddings_top(request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/embeddings", request)
 
 # Pass-through other llama-server endpoints (e.g. /slots, /tokenize, /detokenize)
@@ -1297,7 +1304,7 @@ async def proxy_raw(model_id: str, path: str, request: Request):
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy_catchall(path: str, request: Request):
     body = await request.body()
-    model_id = await _resolve_proxy_model(body, default_if_missing=True)
+    model_id = await _resolve_proxy_model(body)
     return await manager.proxy(model_id, "/v1/" + path, request)
 
 # ---------- WebSocket for live updates ----------
