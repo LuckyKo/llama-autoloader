@@ -611,6 +611,7 @@ class ModelManager:
             )
             self.loaded[model_id] = lm
             self._start_log_thread(model_id, proc)
+            self._status_cache = None  # Force status cache rebuild after load
 
         # Wait until ready OUTSIDE the lock!
         ready = await self._wait_until_ready(port, proc=proc)
@@ -660,6 +661,7 @@ class ModelManager:
         lm = self.loaded.pop(model_id, None)
         if lm is None:
             return
+        self._status_cache = None  # Force status cache rebuild on next request
         log.info(f"Unloading {model_id} (port {lm.port})")
 
         # Auto-save session state if enabled
@@ -1020,10 +1022,9 @@ class ModelManager:
                             continue
                         if now - lm.last_used > self.idle_timeout:
                             to_unload.append(mid)
-                for mid in to_unload:
-                    log.info(f"Idle-unloading {mid}")
-                    await self._unload(mid)
-                    async with self._lock:
+                    for mid in to_unload:
+                        log.info(f"Idle-unloading {mid}")
+                        await self._unload(mid)
                         self._loading_tasks.pop(mid, None)
             except Exception as e:
                 log.warning(f"idle_reaper error: {e}")
