@@ -625,6 +625,7 @@ class ModelManager:
                 try:
                     log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
                     await self._perform_slot_restore(port, state_path, timeout=30.0)
+                    await self._warm_slot_cache(port)
                     lm.state_path = state_path
                 except Exception as e:
                     log.warning(f"Auto-restore failed for {model_id}: {e}")
@@ -885,6 +886,23 @@ class ModelManager:
         log.info(f"Restoring slot 0 state from file: {state_path}")
         return await self._perform_slot_action("restore", port, state_path, timeout)
 
+    async def _warm_slot_cache(self, port: int, timeout: float = 10.0) -> bool:
+        """Send a minimal request to warm checkpoint cache after slot restore (llama.cpp v2.26.0 workaround)."""
+        payload = {
+            "model": "default",
+            "messages": [{"role": "user", "content": "."}],
+            "max_tokens": 1,
+        }
+        try:
+            r = await self.client.post(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                json=payload,
+                timeout=timeout,
+            )
+            return r.status_code == 200
+        except Exception:
+            return False
+
     async def save_state(self, model_id_input: str, label: str = "default") -> Path:
         model_id = self.resolve_model_id(model_id_input)
         if not model_id or model_id not in self.loaded:
@@ -913,6 +931,7 @@ class ModelManager:
 
         try:
             await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+            await self._warm_slot_cache(lm.port)
         except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
 

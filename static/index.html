@@ -704,16 +704,23 @@ function wsLoop() {
         renderGPUs(st.gpus);
         renderRAM(st.ram);
         $('loaded-count').textContent = `${st.models_loaded}/${st.models_total}`;
-        // Update live status fields from uptime_models without extra HTTP call
-        if (st.uptime_models) {
-          for (const um of st.uptime_models) {
-            const cached = modelsCache.find(x => x.id === um.id);
-            if (cached) {
-              cached.loaded = true;
-              cached.ready = um.ready;
-              cached.port = um.port;
+        // Update live status fields from uptime_models (single-pass, O(n) via Map)
+        if (Array.isArray(st.uptime_models)) {
+          const umMap = new Map(st.uptime_models.map(um => [um.id, um]));
+          modelsCache.forEach(m => {
+            const um = umMap.get(m.id);
+            if (um) {
+              m.loaded = true;
+              m.ready = um.ready;
+              m.port = um.port;
+              m.pid = um.pid;
+            } else {
+              m.loaded = false;
+              m.ready = false;
+              m.port = null;
+              m.pid = null;
             }
-          }
+          });
         }
         renderModels();
       } catch (e) { console.error('WS update error:', e); }
