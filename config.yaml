@@ -8,7 +8,7 @@ llama_server:
   backends_dir: ./backends
   binary: llama-server
   default_args: --no-webui --parallel 1 --jinja
-  selected_backend: llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.26.0
+  selected_backend: llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.27.0
 models:
   auto_save_state: false
   idle_timeout_seconds: 3600

@@ -72,7 +72,8 @@ def _read_gguf_name(gguf_path) -> Optional[str]:
         if field is None:
             return None
         return field.contents()
-    except Exception:
+    except Exception as e:
+        log.debug(f"Failed to read GGUF name from {gguf_path}: {e}")
         return None
 
 # --------------------------------------------------------------------------
@@ -212,6 +213,7 @@ class ModelManager:
         self._loading_tasks: Dict[str, asyncio.Task] = {}
         self._stop = False
         self._bg_task: Optional[asyncio.Task] = None
+        self._model_sizes: Dict[str, float] = {}
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
@@ -300,7 +302,7 @@ class ModelManager:
         return self.binary
 
     # ---------------- model discovery & resolution ----------------
-    def scan(self):
+    def scan(self) -> List[str]:
         """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
         all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
         model_paths = []
@@ -315,6 +317,7 @@ class ModelManager:
         found = {}
         self.gguf_paths = {}
         self.mmproj_paths = {}
+        self._model_sizes = {}
 
         for p in model_paths:
             mid = p.name  # use filename as id
@@ -367,52 +370,64 @@ class ModelManager:
                     cfg.mmproj_file = paired_mmproj.name
 
         self.models = found
+        # Cache model file sizes
+        for mid in self.gguf_paths:
+            path = self.gguf_paths[mid]
+            try:
+                self._model_sizes[mid] = path.stat().st_size / 1024 / 1024
+            except Exception:
+                self._model_sizes[mid] = 0.0
         log.info(f"Scan complete: {len(self.models)} models found (filtered {len(mmproj_paths)} mmproj vision modules)")
         return list(self.models.keys())
 
-    def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
-        if model_id_or_alias:
-            if model_id_or_alias in self.models:
-                return model_id_or_alias
-            # Match without .gguf suffix, stem, or lowercased name
-            target_lower = model_id_or_alias.lower()
-            for mid, cfg in self.models.items():
-                stem = Path(mid).stem.lower()
-                if target_lower == stem or target_lower == mid.lower():
-                    return mid
-                if cfg.name and target_lower == cfg.name.lower():
-                    return mid
-                if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
-                    return mid
+    async def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+        async with self._lock:
+            if model_id_or_alias:
+                if model_id_or_alias in self.models:
+                    return model_id_or_alias
+                # Match without .gguf suffix, stem, or lowercased name
+                target_lower = model_id_or_alias.lower()
+                for mid, cfg in self.models.items():
+                    stem = Path(mid).stem.lower()
+                    if target_lower == stem or target_lower == mid.lower():
+                        return mid
+                    if cfg.name and target_lower == cfg.name.lower():
+                        return mid
+                    if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
+                        return mid
 
-        # Fallback resolution (for generic model names, missing model param, or unmatched aliases)
-        if self.loaded:
-            ready_loaded = [m for m, lm in self.loaded.items() if lm.ready]
-            if ready_loaded:
-                model_id = ready_loaded[0]
+            # Fallback resolution (for generic model names, missing model param, or unmatched aliases)
+            if self.loaded:
+                ready_loaded = [m for m, lm in self.loaded.items() if lm.ready]
+                if ready_loaded:
+                    model_id = ready_loaded[0]
+                    log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to '{model_id}'")
+                    return model_id
+                model_id = next(iter(self.loaded.keys()))
                 log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to '{model_id}'")
                 return model_id
-            model_id = next(iter(self.loaded.keys()))
-            log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to '{model_id}'")
-            return model_id
-        for mid, cfg in self.models.items():
-            if cfg.default:
-                log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to default '{mid}'")
-                return mid
-        if len(self.models) == 1:
-            model_id = next(iter(self.models.keys()))
-            log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to single model '{model_id}'")
-            return model_id
-        return None
+            for mid, cfg in self.models.items():
+                if cfg.default:
+                    log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to default '{mid}'")
+                    return mid
+            if len(self.models) == 1:
+                model_id = next(iter(self.models.keys()))
+                log.debug(f"Model '{model_id_or_alias}' not found in registry; falling back to single model '{model_id}'")
+                return model_id
+            return None
 
-    def list_models(self) -> List[Dict[str, Any]]:
+    async def list_models(self) -> List[Dict[str, Any]]:
+        async with self._lock:
+            snapshots = list(self.models.items())
+            loaded_snap = dict(self.loaded)
+            sizes_snap = dict(self._model_sizes)
+            mmproj_snap = dict(self.mmproj_paths)
         out = []
-        for mid, cfg in self.models.items():
-            loaded = self.loaded.get(mid)
-            path = self.gguf_paths.get(mid)
-            size_mb = (path.stat().st_size / 1024 / 1024) if path and path.exists() else 0
+        for mid, cfg in snapshots:
+            loaded = loaded_snap.get(mid)
+            size_mb = sizes_snap.get(mid, 0.0)
             resolved_bin = self.resolve_binary(cfg)
-            mmproj_p = self.mmproj_paths.get(mid)
+            mmproj_p = mmproj_snap.get(mid)
             has_mmproj = mmproj_p is not None and mmproj_p.exists()
             out.append({
                 "id": mid,
@@ -442,11 +457,13 @@ class ModelManager:
             })
         return out
 
-    def get_config(self, model_id_or_alias: str) -> Optional[ModelConfig]:
-        mid = self.resolve_model_id(model_id_or_alias)
-        if mid:
+    async def get_config(self, model_id_or_alias: str) -> Optional[ModelConfig]:
+        mid = await self.resolve_model_id(model_id_or_alias)
+        if not mid:
+            return None
+        async with self._lock:
             self._ensure_gguf_name(mid)
-        return self.models.get(mid) if mid else None
+            return self.models.get(mid)
 
     def _ensure_gguf_name(self, mid: str):
         """Read gguf_name from GGUF file lazily, caching the result in config."""
@@ -456,15 +473,17 @@ class ModelManager:
             if path:
                 cfg.gguf_name = _read_gguf_name(path) or ""
 
-    def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
-        mid = self.resolve_model_id(model_id_or_alias)
-        if not mid or mid not in self.models:
-            raise KeyError(model_id_or_alias)
-        path = self.gguf_paths[mid]
+    async def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
+        mid = await self.resolve_model_id(model_id_or_alias)
+        async with self._lock:
+            if not mid or mid not in self.models:
+                raise KeyError(model_id_or_alias)
+            path = self.gguf_paths[mid]
         new_cfg.save(path)
-        self.models[mid] = new_cfg
-        if mid in self.loaded:
-            self.loaded[mid].config = new_cfg
+        async with self._lock:
+            self.models[mid] = new_cfg
+            if mid in self.loaded:
+                self.loaded[mid].config = new_cfg
         return new_cfg
 
     # ---------------- model ID sanitization ----------------
@@ -508,24 +527,25 @@ class ModelManager:
         url = f"http://127.0.0.1:{port}/health"
         log.info(f"Waiting for llama-server on port {port} at {url}...")
         start = time.time()
-        async with httpx.AsyncClient() as c:
-            while time.time() - start < timeout:
-                if proc and proc.poll() is not None:
-                    log.error(f"llama-server process exited prematurely with code {proc.poll()}")
-                    return False
-                try:
-                    r = await c.get(url, timeout=2.0)
-                    if r.status_code == 200:
-                        log.info(f"llama-server on port {port} is READY! (took {round(time.time() - start, 2)}s)")
-                        return True
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
+        while time.time() - start < timeout:
+            if proc and proc.poll() is not None:
+                log.error(f"llama-server process exited prematurely with code {proc.poll()}")
+                return False
+            try:
+                r = await self.client.get(url, timeout=2.0)
+                if r.status_code == 200:
+                    log.info(f"llama-server on port {port} is READY! (took {round(time.time() - start, 2)}s)")
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
         log.error(f"Timed out waiting for llama-server on port {port} after {timeout}s")
         return False
 
     async def _evict_lru_if_needed(self, target_model_id: str):
-        """If loaded models count >= max_loaded_models, unload LRU unpinned model."""
+        """If loaded models count >= max_loaded_models, unload LRU unpinned model (caller must hold self._lock)."""
         if len(self.loaded) < self.max_loaded_models:
             return
         candidates = [
@@ -538,17 +558,13 @@ class ModelManager:
         candidates.sort(key=lambda item: item[1].last_used)
         lru_id, lru_lm = candidates[0]
         log.info(f"Auto-evicting LRU model {lru_id} (last used {round(time.time() - lru_lm.last_used, 1)}s ago) to free slot")
-        await self._unload(lru_id)
+        await self._unload_unlocked(lru_id)
 
     async def load_model(self, model_id_input: str, force: bool = False) -> LoadedModel:
         """Load (JIT) a model with non-blocking concurrency for other requests."""
-        model_id = self.resolve_model_id(model_id_input)
+        model_id = await self.resolve_model_id(model_id_input)
         if not model_id:
             raise KeyError(f"Unknown model: {model_id_input}")
-
-        if model_id in self.loaded and self.loaded[model_id].ready and not force:
-            self.loaded[model_id].touch()
-            return self.loaded[model_id]
 
         async with self._lock:
             # Double-check under lock
@@ -556,7 +572,7 @@ class ModelManager:
                 self.loaded[model_id].touch()
                 return self.loaded[model_id]
 
-            if model_id in self._loading_tasks and not force:
+            if model_id in self._loading_tasks and not self._loading_tasks[model_id].done():
                 task = self._loading_tasks[model_id]
             else:
                 task = asyncio.create_task(self._do_load_model(model_id, force=force))
@@ -566,79 +582,84 @@ class ModelManager:
             return await task
         finally:
             async with self._lock:
-                if self._loading_tasks.get(model_id) == task:
+                if self._loading_tasks.get(model_id) is task:
                     self._loading_tasks.pop(model_id, None)
 
     async def _do_load_model(self, model_id: str, force: bool = False) -> LoadedModel:
-        async with self._lock:
-            if model_id in self.loaded and force:
-                await self._unload(model_id)
-            await self._evict_lru_if_needed(model_id)
-            cfg = self.models[model_id]
-            path = self.gguf_paths[model_id]
-            port = self._allocate_port()
-            binary_path = self.resolve_binary(cfg)
-            mmproj_p = self.mmproj_paths.get(model_id)
-            argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p, slot_save_dir=self.save_state_dir)
-
-            log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
-            log.info("argv: " + " ".join(argv))
-
-            # Spawn process
-            if platform.system() == "Windows":
-                proc = subprocess.Popen(
-                    argv,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
-            else:
-                proc = subprocess.Popen(
-                    argv,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-
-            lm = LoadedModel(
-                model_id=model_id,
-                gguf_path=path,
-                config=cfg,
-                port=port,
-                process=proc,
-                pid=proc.pid,
-                starting_at=time.time(),
-            )
-            self.loaded[model_id] = lm
-            self._start_log_thread(model_id, proc)
-            self._status_cache = None  # Force status cache rebuild after load
-
-        # Wait until ready OUTSIDE the lock!
-        ready = await self._wait_until_ready(port, proc=proc)
-        lm.ready = ready
-        if not ready:
-            log.error(f"Model {model_id} failed to become ready")
+        try:
             async with self._lock:
-                await self._unload(model_id)
-            raise RuntimeError(f"Model {model_id} failed to start")
+                if model_id in self.loaded and force:
+                    await self._unload_unlocked(model_id)
+                await self._evict_lru_if_needed(model_id)
+                cfg = self.models[model_id]
+                path = self.gguf_paths[model_id]
+                port = self._allocate_port()
+                binary_path = self.resolve_binary(cfg)
+                mmproj_p = self.mmproj_paths.get(model_id)
+                argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p, slot_save_dir=self.save_state_dir)
 
-        log.info(f"Model {model_id} ready on port {port}")
-        lm.touch()
+                log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
+                log.info("argv: " + " ".join(argv))
 
-        # Auto-restore session state if enabled and cached auto state exists
-        if cfg.auto_save_state or self.default_auto_save_state:
-            mid_clean = self._sanitize_model_id(model_id)
-            state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
-            if state_path.exists():
-                try:
-                    log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
-                    await self._perform_slot_restore(port, state_path, timeout=30.0)
-                    await self._warm_slot_cache(port)
-                    lm.state_path = state_path
-                except Exception as e:
-                    log.warning(f"Auto-restore failed for {model_id}: {e}")
+                # Spawn process
+                if platform.system() == "Windows":
+                    proc = subprocess.Popen(
+                        argv,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                    )
+                else:
+                    proc = subprocess.Popen(
+                        argv,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
 
-        return lm
+                lm = LoadedModel(
+                    model_id=model_id,
+                    gguf_path=path,
+                    config=cfg,
+                    port=port,
+                    process=proc,
+                    pid=proc.pid,
+                    starting_at=time.time(),
+                )
+                self.loaded[model_id] = lm
+                self._start_log_thread(model_id, proc)
+                self._status_cache = None  # Force status cache rebuild after load
+
+            # Wait until ready OUTSIDE the lock!
+            ready = await self._wait_until_ready(port, proc=proc)
+            lm.ready = ready
+            if not ready:
+                log.error(f"Model {model_id} failed to become ready")
+                async with self._lock:
+                    await self._unload_unlocked(model_id)
+                raise RuntimeError(f"Model {model_id} failed to start")
+
+            log.info(f"Model {model_id} ready on port {port}")
+            lm.touch()
+
+            # Auto-restore session state if enabled and cached auto state exists
+            if cfg.auto_save_state or self.default_auto_save_state:
+                mid_clean = self._sanitize_model_id(model_id)
+                state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
+                if state_path.exists():
+                    try:
+                        log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
+                        await self._perform_slot_restore(port, state_path, timeout=30.0)
+                        await self._warm_slot_cache(port)
+                        lm.state_path = state_path
+                    except Exception as e:
+                        log.warning(f"Auto-restore failed for {model_id}: {e}")
+
+            return lm
+        except asyncio.CancelledError:
+            async with self._lock:
+                await self._unload_unlocked(model_id)
+            raise
 
     def _start_log_thread(self, model_id: str, proc: subprocess.Popen):
         def _worker():
@@ -658,6 +679,12 @@ class ModelManager:
         t.start()
 
     async def _unload(self, model_id: str):
+        """Unload a model (acquires lock if not already held)."""
+        async with self._lock:
+            await self._unload_unlocked(model_id)
+
+    async def _unload_unlocked(self, model_id: str):
+        """Unload a model (caller must hold self._lock)."""
         lm = self.loaded.pop(model_id, None)
         if lm is None:
             return
@@ -711,17 +738,17 @@ class ModelManager:
         await asyncio.to_thread(_kill_proc)
 
     async def unload_model(self, model_id_input: str):
-        mid = self.resolve_model_id(model_id_input)
+        mid = await self.resolve_model_id(model_id_input)
         if not mid:
             return
         async with self._lock:
-            await self._unload(mid)
+            await self._unload_unlocked(mid)
 
     async def unload_all(self):
         async with self._lock:
             ids = list(self.loaded.keys())
             for mid in ids:
-                await self._unload(mid)
+                await self._unload_unlocked(mid)
 
     # ---------------- GPU info ----------------
     def gpus(self) -> List[GPUInfo]:
@@ -760,7 +787,7 @@ class ModelManager:
             "pct": m.percent,
         }
 
-    def per_model_ram_vram(self) -> Dict[str, Dict[str, int]]:
+    def per_model_ram_vram(self, loaded_items: Optional[List[tuple]] = None) -> Dict[str, Dict[str, int]]:
         """Best-effort per-model RAM/VRAM accounting via process info."""
         out: Dict[str, Dict[str, int]] = {}
         try:
@@ -775,7 +802,8 @@ class ModelManager:
                 parts = [x.strip() for x in line.split(",")]
                 if len(parts) >= 2 and parts[0].isdigit():
                     pid_to_vram[int(parts[0])] = _safe_int(parts[1], 0)
-            for mid, lm in self.loaded.items():
+            items = loaded_items if loaded_items is not None else list(self.loaded.items())
+            for mid, lm in items:
                 try:
                     p = psutil.Process(lm.pid)
                     ram = p.memory_info().rss / 1024 / 1024
@@ -791,7 +819,7 @@ class ModelManager:
     async def proxy(self, model_id_input: str, path: str, request: Request) -> Response:
         """Proxy a request to the loaded model's llama-server."""
         log.info(f"--> Incoming {request.method} request to '{request.url.path}' (model param input: {model_id_input!r})")
-        model_id = self.resolve_model_id(model_id_input)
+        model_id = await self.resolve_model_id(model_id_input)
         if not model_id:
             log.error(f"Could not resolve model for input {model_id_input!r}")
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id_input}")
@@ -799,15 +827,15 @@ class ModelManager:
         if model_id_input and model_id != model_id_input:
             log.warning(f"Model '{model_id_input}' not found; falling back to '{model_id}'")
         log.info(f"Resolved model ID: '{model_id}'")
-        if model_id not in self.loaded or not self.loaded[model_id].ready:
+        async with self._lock:
+            lm = self.loaded.get(model_id)
+        if lm is None or not lm.ready:
             log.info(f"Model '{model_id}' not loaded or not ready. Loading model JIT...")
             try:
-                await self.load_model(model_id)
+                lm = await self.load_model(model_id)
             except Exception as e:
                 log.error(f"Failed to load model '{model_id}': {e}")
                 raise HTTPException(status_code=503, detail=f"Failed to load model: {e}")
-
-        lm = self.loaded[model_id]
         lm.touch()
         log.info(f"Forwarding {request.method} {request.url.path} -> llama-server on port {lm.port}")
 
@@ -862,7 +890,7 @@ class ModelManager:
                             media_type=r.headers.get("content-type", "application/json"),
                             headers=cors_headers)
         except (httpx.ReadError, httpx.ReadTimeout):
-            raise HTTPException(status_code=200, detail="Model response completed")
+            raise HTTPException(status_code=502, detail="Model server read error")
         except httpx.ConnectError:
             raise HTTPException(status_code=502, detail="Model server unreachable")
 
@@ -919,10 +947,13 @@ class ModelManager:
             return False
 
     async def save_state(self, model_id_input: str, label: str = "default") -> Path:
-        model_id = self.resolve_model_id(model_id_input)
-        if not model_id or model_id not in self.loaded:
+        model_id = await self.resolve_model_id(model_id_input)
+        if not model_id:
             raise HTTPException(400, "Model not loaded")
-        lm = self.loaded[model_id]
+        async with self._lock:
+            if model_id not in self.loaded:
+                raise HTTPException(400, "Model not loaded")
+            lm = self.loaded[model_id]
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
@@ -936,10 +967,13 @@ class ModelManager:
         return state_path
 
     async def load_state(self, model_id_input: str, label: str = "default") -> Path:
-        model_id = self.resolve_model_id(model_id_input)
-        if not model_id or model_id not in self.loaded:
+        model_id = await self.resolve_model_id(model_id_input)
+        if not model_id:
             raise HTTPException(400, "Model not loaded")
-        lm = self.loaded[model_id]
+        async with self._lock:
+            if model_id not in self.loaded:
+                raise HTTPException(400, "Model not loaded")
+            lm = self.loaded[model_id]
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
@@ -953,20 +987,24 @@ class ModelManager:
         lm.state_path = state_path
         return state_path
 
-    def list_states(self, model_id_input: str) -> List[str]:
-        model_id = self.resolve_model_id(model_id_input) or model_id_input
+    async def list_states(self, model_id_input: str) -> List[str]:
+        model_id = await self.resolve_model_id(model_id_input) or model_id_input
+        mid_clean = self._sanitize_model_id(model_id)
         out = []
-        for p in self.save_state_dir.glob(f"{model_id}.*.bin"):
+        for p in self.save_state_dir.glob(f"{mid_clean}.*.bin"):
             label = p.stem.split(".", 1)[1]
             out.append(label)
         return out
 
     # ---------------- status cache ----------------
-    def _build_status(self) -> Dict[str, Any]:
+    async def _build_status(self) -> Dict[str, Any]:
         """Build a full status snapshot (cached to avoid redundant nvidia-smi calls)."""
         gpus = [asdict(g) for g in self.gpus()]
-        per = self.per_model_ram_vram()
         backends = self.list_backends()
+        async with self._lock:
+            loaded_snap = list(self.loaded.items())
+            total = len(self.models)
+        per = self.per_model_ram_vram(loaded_items=loaded_snap)
         return {
             "launcher": {
                 "host": self.host,
@@ -977,8 +1015,8 @@ class ModelManager:
             },
             "gpus": gpus,
             "ram": self.system_ram(),
-            "models_loaded": len(self.loaded),
-            "models_total": len(self.models),
+            "models_loaded": len(loaded_snap),
+            "models_total": total,
             "idle_timeout": self.idle_timeout,
             "max_loaded_models": self.max_loaded_models,
             "per_model": per,
@@ -990,7 +1028,7 @@ class ModelManager:
                     "uptime_s": round(time.time() - lm.starting_at, 1),
                     "last_used_s_ago": round(time.time() - lm.last_used, 1),
                     "ready": lm.ready,
-                } for mid, lm in self.loaded.items()
+                } for mid, lm in loaded_snap
             ],
         }
 
@@ -998,7 +1036,7 @@ class ModelManager:
         """Background task that refreshes status cache at poll_interval intervals."""
         while not self._stop:
             try:
-                status = await asyncio.to_thread(self._build_status)
+                status = await self._build_status()
                 async with self._lock:
                     self._status_cache_time = time.time()
                     self._status_cache = status
@@ -1010,9 +1048,17 @@ class ModelManager:
         """Return cached status, refreshing if stale."""
         async with self._lock:
             if self._status_cache is None or (time.time() - self._status_cache_time) > self._poll_interval:
+                needs_refresh = True
+            else:
+                needs_refresh = False
+            cached = self._status_cache.copy() if self._status_cache else {}
+        if needs_refresh:
+            status = await self._build_status()
+            async with self._lock:
                 self._status_cache_time = time.time()
-                self._status_cache = await asyncio.to_thread(self._build_status)
-            return self._status_cache.copy()
+                self._status_cache = status
+            return status
+        return cached
 
     # ---------------- background idle reaper ----------------
     async def idle_reaper(self) -> None:
@@ -1028,24 +1074,35 @@ class ModelManager:
                             to_unload.append(mid)
                     for mid in to_unload:
                         log.info(f"Idle-unloading {mid}")
-                        await self._unload(mid)
-                        self._loading_tasks.pop(mid, None)
+                        await self._unload_unlocked(mid)
             except Exception as e:
                 log.warning(f"idle_reaper error: {e}")
             await asyncio.sleep(10)
 
-    async def start(self):
+    async def start(self) -> None:
         async with self._lock:
             await asyncio.to_thread(self.scan)
         self._bg_task = asyncio.create_task(self.idle_reaper())
         self._status_task: Optional[asyncio.Task] = asyncio.create_task(self._status_cache_updater())
 
-    async def stop(self):
+    async def stop(self) -> None:
         self._stop = True
+        bg_tasks = []
         if self._bg_task:
             self._bg_task.cancel()
+            bg_tasks.append(self._bg_task)
         if getattr(self, "_status_task", None):
             self._status_task.cancel()
+            bg_tasks.append(self._status_task)
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+        # Cancel any in-flight loading tasks and wait for them
+        async with self._lock:
+            tasks = list(self._loading_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.unload_all()
         await self.client.aclose()
 
@@ -1054,10 +1111,12 @@ class ModelManager:
 # FastAPI app
 # --------------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("AUTOLOADER_CONFIG", "config.yaml")
-with open(CONFIG_PATH) as f:
-    CFG = yaml.safe_load(f)
-
-ModelManager.validate_config(CFG)
+try:
+    with open(CONFIG_PATH) as f:
+        CFG = yaml.safe_load(f)
+    ModelManager.validate_config(CFG)
+except Exception as e:
+    raise RuntimeError(f"Failed to load config from '{CONFIG_PATH}': {e}") from e
 manager = ModelManager(CFG)
 
 app = FastAPI(title="llama-autoloader", version="0.1.0")
@@ -1105,7 +1164,9 @@ async def index():
 @app.get("/health")
 @app.get("/v1/health")
 async def health():
-    return {"status": "ok", "models_loaded": len(manager.loaded)}
+    async with manager._lock:
+        count = len(manager.loaded)
+    return {"status": "ok", "models_loaded": count}
 
 @app.get("/v1/backends")
 async def get_backends():
@@ -1127,8 +1188,11 @@ async def select_backend(body: SelectBackendPayload):
     # Persist to config.yaml
     cfg_yaml = manager.cfg
     cfg_yaml["llama_server"]["selected_backend"] = body.backend
-    with open(CONFIG_PATH, "w") as f:
-        yaml.dump(cfg_yaml, f, default_flow_style=False)
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            yaml.dump(cfg_yaml, f, default_flow_style=False)
+    except OSError as e:
+        log.warning(f"Failed to persist backend selection to {CONFIG_PATH}: {e}")
     log.info(f"Global backend selected: '{body.backend}' -> resolved binary: '{manager.resolve_binary(None)}'")
     return {
         "selected_backend": manager.selected_backend,
@@ -1143,7 +1207,7 @@ async def status():
 @app.get("/v1/models")
 async def list_models():
     data = []
-    for m in manager.list_models():
+    for m in await manager.list_models():
         data.append({
             "id": m["id"],
             "object": "model",
@@ -1174,36 +1238,38 @@ async def list_models():
 
 @app.get("/v1/models/{model_id}")
 async def get_model(model_id: str):
-    mid = manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id(model_id)
     if not mid:
         raise HTTPException(404, "Model not found")
-    cfg = manager.get_config(mid)
+    cfg = await manager.get_config(mid)
+    async with manager._lock:
+        loaded = mid in manager.loaded
     return {
         "id": mid,
         "object": "model",
         "config": asdict(cfg) if cfg else {},
-        "loaded": mid in manager.loaded,
+        "loaded": loaded,
     }
 
 @app.put("/v1/models/{model_id}/config")
 async def update_model_config(model_id: str, body: ModelConfigUpdate):
-    mid = manager.resolve_model_id(model_id)
-    if not mid or mid not in manager.models:
+    mid = await manager.resolve_model_id(model_id)
+    if not mid:
         raise HTTPException(404, "Unknown model")
-    cfg = manager.models[mid]
+    cfg = await manager.get_config(mid)
     for k, v in body.model_dump(exclude_none=True).items():
         setattr(cfg, k, v)
-    manager.update_config(mid, cfg)
+    await manager.update_config(mid, cfg)
     return asdict(cfg)
 
 @app.post("/v1/models/{model_id}/vision/toggle")
 async def toggle_vision_ep(model_id: str):
-    mid = manager.resolve_model_id(model_id)
-    if not mid or mid not in manager.models:
+    mid = await manager.resolve_model_id(model_id)
+    if not mid:
         raise HTTPException(404, "Unknown model")
-    cfg = manager.models[mid]
+    cfg = await manager.get_config(mid)
     cfg.use_mmproj = not cfg.use_mmproj
-    manager.update_config(mid, cfg)
+    await manager.update_config(mid, cfg)
     return {"id": mid, "use_mmproj": cfg.use_mmproj, "mmproj_file": cfg.mmproj_file}
 
 @app.post("/v1/scan")
@@ -1246,7 +1312,7 @@ async def load_state_ep(model_id: str, body: StateLabel):
 
 @app.get("/v1/models/{model_id}/state")
 async def list_states_ep(model_id: str):
-    return {"id": model_id, "labels": manager.list_states(model_id)}
+    return {"id": model_id, "labels": await manager.list_states(model_id)}
 
 # ---------- OpenAI-compatible proxy endpoints ----------
 async def _resolve_proxy_model(body: bytes) -> str:
@@ -1260,7 +1326,7 @@ async def _resolve_proxy_model(body: bytes) -> str:
         except Exception:
             pass
 
-    resolved = manager.resolve_model_id(model_id)
+    resolved = await manager.resolve_model_id(model_id)
     if not resolved:
         raise HTTPException(404, "No matching model found and no loaded/default model available")
     return resolved
@@ -1321,9 +1387,11 @@ async def ws(websocket: WebSocket):
         while True:
             await asyncio.sleep(2.0)
             await websocket.send_json(await manager.get_cached_status())
+    except asyncio.CancelledError:
+        return
     except WebSocketDisconnect:
         return
-    except Exception as e:
+    except (RuntimeError, ConnectionError) as e:
         log.warning(f"WebSocket error: {e}")
         return
 
