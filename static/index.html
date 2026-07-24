@@ -270,7 +270,10 @@ Example cURL:
     </div>
     <div class="form-row">
       <label>Default Args</label>
-      <input id="s-default-args" />
+      <input id="s-default-args" placeholder="--cache-ram 16384 --kv-unified" />
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+        Extra flags for all llama-server instances. Default includes <code>--cache-ram 16384 --kv-unified</code> (16 GiB prompt cache). Requires 32+ GB RAM for safe operation.
+      </div>
     </div>
     <div class="form-row">
       <label>Selected Backend</label>

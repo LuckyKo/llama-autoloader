@@ -200,10 +200,18 @@ class ModelManager:
         self.binary = cfg["llama_server"]["binary"]
         self.backends_dir = Path(cfg["llama_server"].get("backends_dir", "./backends")).resolve()
         self.selected_backend = cfg["llama_server"].get("selected_backend", "")
-        self.default_args = cfg["llama_server"].get("default_args", "")
+        self.default_args = cfg["llama_server"].get("default_args", "--cache-ram 16384 --kv-unified")
         self.host = cfg["launcher"].get("host", "127.0.0.1")
         self.port = cfg["launcher"].get("port", 9123)
         self.base_port = cfg["launcher"].get("base_port", 9001)
+
+        # Warn if system RAM is below safe threshold for default cache size
+        try:
+            total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            if total_ram_gb < 32:
+                log.warning(f"System has {total_ram_gb:.1f} GB RAM. Default prompt cache of 16 GiB may cause memory pressure. Consider reducing --cache-ram in Global Settings.")
+        except Exception:
+            pass
         self.next_port = self.base_port
 
         self.models: Dict[str, ModelConfig] = {}      # id -> config
