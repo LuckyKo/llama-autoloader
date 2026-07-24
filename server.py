@@ -1156,6 +1156,7 @@ async def list_models():
             "loaded": m["loaded"],
             "ready": m["ready"],
             "port": m["port"],
+            "pid": m["pid"],
             "default": m["default"],
             "pinned": m["pinned"],
             "auto_save_state": m["auto_save_state"],

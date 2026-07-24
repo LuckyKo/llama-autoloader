@@ -439,14 +439,14 @@ function renderModels() {
   // Snapshot config fields to detect when a card needs full rebuild
   function configKey(m) {
     const tags = (m.tags||[]).join(',');
-    return `${m.name||''}|${tags}|${m.ctx_size}|${m.n_gpu_layers}|${m.args||''}|${m.default}|${m.pinned}|${m.auto_save_state}|${m.backend||''}|${m.use_mmproj}|${m.has_mmproj}|${m.estimated_vram_mb}|${m.size_mb}`;
+    return `${String(m.name||'')}|${tags}|${String(m.ctx_size)}|${String(m.n_gpu_layers)}|${String(m.args||'')}|${Boolean(m.default)}|${Boolean(m.pinned)}|${Boolean(m.auto_save_state)}|${String(m.backend||'')}|${Boolean(m.use_mmproj)}|${Boolean(m.has_mmproj)}|${String(m.estimated_vram_mb||0)}|${String(m.size_mb||0)}`;
   }
 
   list.forEach(m => {
     const pm = perModel[m.id] || {};
     let card = existingCards.get(m.id);
     const mKey = configKey(m);
-    const configChanged = card && card._configKey !== mKey;
+    const configChanged = card && card._configKey != null && card._configKey !== mKey;
 
     if (configChanged) {
       card.remove();
@@ -713,6 +713,7 @@ async function refreshAll() {
       loaded: d.loaded,
       ready: d.ready,
       port: d.port,
+      pid: d.pid,
       default: d.default,
       pinned: d.pinned,
       auto_save_state: d.auto_save_state,
