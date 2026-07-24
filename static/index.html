@@ -436,21 +436,19 @@ function renderModels() {
     if (!idsNeeded.has(id)) card.remove();
   });
 
-  // Snapshot config fields to detect when a card needs full rebuild
-  function configKey(m) {
-    const tags = (m.tags||[]).join(',');
-    return `${String(m.name||'')}|${tags}|${String(m.ctx_size)}|${String(m.n_gpu_layers)}|${String(m.args||'')}|${Boolean(m.default)}|${Boolean(m.pinned)}|${Boolean(m.auto_save_state)}|${String(m.backend||'')}|${Boolean(m.use_mmproj)}|${Boolean(m.has_mmproj)}|${String(m.estimated_vram_mb||0)}|${String(m.size_mb||0)}`;
-  }
+  // When modelsCache is replaced (refreshAll), the model objects are new references.
+  // We store the reference on the card and rebuild when it differs.
 
   list.forEach(m => {
     const pm = perModel[m.id] || {};
     let card = existingCards.get(m.id);
-    const mKey = configKey(m);
-    const configChanged = card && card._configKey != null && card._configKey !== mKey;
 
-    if (configChanged) {
-      card.remove();
-      card = null;
+    if (card) {
+      // Store model reference on card; if it differs from current m, config changed
+      if (card._modelRef !== m) {
+        card.remove();
+        card = null;
+      }
     }
 
     if (!card) {
@@ -530,7 +528,7 @@ function renderModels() {
       }
     }
 
-    card._configKey = mKey;
+    card._modelRef = m;
 
     // Wire buttons (works for both new and existing cards)
     card.querySelectorAll('button[data-act]').forEach(btn => {
