@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import shutil
 import signal
@@ -244,11 +245,17 @@ class ModelManager:
         if not root_dir:
             raise ValueError("Config 'models.root_dir' is required")
         idle_timeout = models.get("idle_timeout_seconds", 300)
-        if not isinstance(idle_timeout, (int, float)) or idle_timeout <= 0:
+        if not isinstance(idle_timeout, (int, float)) or (isinstance(idle_timeout, float) and math.isnan(idle_timeout)) or idle_timeout <= 0:
             raise ValueError(f"Config 'models.idle_timeout_seconds' must be positive, got {idle_timeout!r}")
         max_loaded = models.get("max_loaded_models", 1)
         if not isinstance(max_loaded, int) or max_loaded < 1:
             raise ValueError(f"Config 'models.max_loaded_models' must be >= 1, got {max_loaded!r}")
+
+        # gpu section
+        gpu = cfg.get("gpu", {})
+        poll_interval = gpu.get("poll_interval_seconds", 2)
+        if not isinstance(poll_interval, (int, float)) or poll_interval <= 0:
+            raise ValueError(f"Config 'gpu.poll_interval_seconds' must be positive, got {poll_interval!r}")
 
         # llama_server section
         ls = cfg.get("llama_server", {})
@@ -1202,6 +1209,112 @@ async def select_backend(body: SelectBackendPayload):
 @app.get("/v1/status")
 async def status():
     return await manager.get_cached_status()
+
+# ---------- global settings ----------
+@app.get("/v1/settings")
+async def get_settings():
+    return {
+        "idle_timeout_seconds": manager.idle_timeout,
+        "max_loaded_models": manager.max_loaded_models,
+        "auto_save_state": manager.default_auto_save_state,
+        "poll_interval_seconds": manager._poll_interval,
+        "base_port": manager.base_port,
+        "host": manager.host,
+        "port": manager.port,
+        "default_args": manager.default_args,
+        "selected_backend": manager.selected_backend,
+    }
+
+@app.put("/v1/settings")
+async def update_settings(request: Request):
+    body = await request.json()
+    errors = []
+
+    if "idle_timeout_seconds" in body:
+        v = body["idle_timeout_seconds"]
+        if not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
+            errors.append("'idle_timeout_seconds' must be > 0")
+    if "max_loaded_models" in body:
+        v = body["max_loaded_models"]
+        if not isinstance(v, int) or v < 1:
+            errors.append("'max_loaded_models' must be >= 1")
+    if "poll_interval_seconds" in body:
+        v = body["poll_interval_seconds"]
+        if not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
+            errors.append("'poll_interval_seconds' must be > 0")
+    if "base_port" in body:
+        v = body["base_port"]
+        if not isinstance(v, int) or v < 1024 or v > 65535:
+            errors.append("'base_port' must be 1024-65535")
+    if "auto_save_state" in body:
+        v = body["auto_save_state"]
+        if not isinstance(v, bool):
+            errors.append("'auto_save_state' must be a boolean")
+
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+
+    changed = []
+    if "idle_timeout_seconds" in body:
+        manager.idle_timeout = body["idle_timeout_seconds"]
+        changed.append("idle_timeout_seconds")
+    if "max_loaded_models" in body:
+        manager.max_loaded_models = body["max_loaded_models"]
+        changed.append("max_loaded_models")
+    if "auto_save_state" in body:
+        manager.default_auto_save_state = body["auto_save_state"]
+        changed.append("auto_save_state")
+    if "poll_interval_seconds" in body:
+        manager._poll_interval = body["poll_interval_seconds"]
+        changed.append("poll_interval_seconds")
+    if "default_args" in body:
+        manager.default_args = body["default_args"]
+        changed.append("default_args")
+    if "selected_backend" in body:
+        manager.selected_backend = body["selected_backend"]
+        changed.append("selected_backend")
+    if "base_port" in body:
+        manager.base_port = body["base_port"]
+        manager.next_port = max(manager.base_port, manager.next_port)
+        changed.append("base_port")
+
+    # Persist changes to config.yaml
+    if changed:
+        cfg = manager.cfg
+        if "idle_timeout_seconds" in body:
+            cfg["models"]["idle_timeout_seconds"] = body["idle_timeout_seconds"]
+        if "max_loaded_models" in body:
+            cfg["models"]["max_loaded_models"] = body["max_loaded_models"]
+        if "auto_save_state" in body:
+            cfg["models"]["auto_save_state"] = body["auto_save_state"]
+        if "poll_interval_seconds" in body:
+            cfg.setdefault("gpu", {})["poll_interval_seconds"] = body["poll_interval_seconds"]
+        if "default_args" in body:
+            cfg["llama_server"]["default_args"] = body["default_args"]
+        if "selected_backend" in body:
+            cfg["llama_server"]["selected_backend"] = body["selected_backend"]
+        if "base_port" in body:
+            cfg["launcher"]["base_port"] = body["base_port"]
+        if "host" in body:
+            cfg["launcher"]["host"] = body["host"]
+        if "port" in body:
+            cfg["launcher"]["port"] = body["port"]
+        try:
+            with open(CONFIG_PATH, "w") as f:
+                yaml.dump(cfg, f, default_flow_style=False)
+        except OSError as e:
+            log.warning(f"Failed to persist settings to {CONFIG_PATH}: {e}")
+
+    notes = []
+    if "host" in body or "port" in body:
+        notes.append("host/port require restart to take effect")
+
+    if changed:
+        log.info(f"Settings updated: {', '.join(changed)}")
+    if notes:
+        log.info(f"Note: {'; '.join(notes)}")
+
+    return await get_settings()
 
 # ---------- model list / config (LM Studio compatible) ----------
 @app.get("/v1/models")

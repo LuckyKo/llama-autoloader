@@ -175,6 +175,7 @@
     Loaded: <b id="loaded-count">0/0</b> &nbsp;|&nbsp;
     <button id="btn-rescan">Rescan</button>
     <button id="btn-unload-all" class="danger">Unload All</button>
+    <button id="btn-settings" title="Global Settings">⚙</button>
   </div>
 </header>
 
@@ -246,6 +247,62 @@ Example cURL:
 </main>
 
 <div id="toast-container"></div>
+
+<!-- Settings modal -->
+<div class="modal-overlay" id="settings-overlay">
+  <div class="modal">
+    <h2>Global Settings</h2>
+    <div class="form-row">
+      <label>Idle Timeout (seconds)</label>
+      <input id="s-idle" type="number" min="1" step="any" />
+    </div>
+    <div class="form-row">
+      <label>Max Loaded Models</label>
+      <input id="s-max-loaded" type="number" min="1" />
+    </div>
+    <div class="form-row">
+      <label>Poll Interval (seconds)</label>
+      <input id="s-poll" type="number" min="0.1" step="any" />
+    </div>
+    <div class="form-row">
+      <label>Base Port</label>
+      <input id="s-base-port" type="number" min="1024" max="65535" />
+    </div>
+    <div class="form-row">
+      <label>Default Args</label>
+      <input id="s-default-args" />
+    </div>
+    <div class="form-row">
+      <label>Selected Backend</label>
+      <input id="s-selected-backend" />
+    </div>
+    <div class="form-row">
+      <label>
+        <input type="checkbox" id="s-auto-save" style="width:auto;margin-right:6px;vertical-align:middle;" />
+        Auto Save State (global default)
+      </label>
+    </div>
+    <div class="form-row">
+      <div class="row2">
+        <div>
+          <label>Host</label>
+          <input id="s-host" type="text" readonly style="opacity:0.6;" />
+        </div>
+        <div>
+          <label>Port</label>
+          <input id="s-port" type="text" readonly style="opacity:0.6;" />
+        </div>
+      </div>
+    </div>
+    <div class="form-row" style="color:var(--muted);font-size:11px;">
+      Host / Port require a restart to take effect.
+    </div>
+    <div class="btn-row" style="justify-content:flex-end;">
+      <button id="settings-cancel">Cancel</button>
+      <button class="primary" id="settings-save">Save</button>
+    </div>
+  </div>
+</div>
 
 <!-- Edit modal -->
 <div class="modal-overlay" id="modal-overlay">
@@ -790,6 +847,79 @@ function wsLoop() {
   }
   connect();
 }
+
+// ---------- Settings ----------
+async function loadSettings() {
+  try {
+    const s = await apiJSON('/v1/settings');
+    $('s-idle').value = s.idle_timeout_seconds;
+    $('s-max-loaded').value = s.max_loaded_models;
+    $('s-poll').value = s.poll_interval_seconds;
+    $('s-base-port').value = s.base_port;
+    $('s-default-args').value = s.default_args || '';
+    $('s-selected-backend').value = s.selected_backend || '';
+    $('s-auto-save').checked = !!s.auto_save_state;
+    $('s-host').value = s.host || '';
+    $('s-port').value = s.port || '';
+  } catch (e) {
+    console.error('Failed to load settings:', e);
+    showToast('Failed to load settings: ' + e.message, 'error');
+  }
+}
+
+async function saveSettings() {
+  const idle = Number($('s-idle').value);
+  const maxLoaded = Number($('s-max-loaded').value);
+  const poll = Number($('s-poll').value);
+  const basePort = Number($('s-base-port').value);
+
+  if (isNaN(idle) || idle <= 0) {
+    showToast('Idle timeout must be a positive number', 'error');
+    return;
+  }
+  if (isNaN(maxLoaded) || maxLoaded < 1 || !Number.isInteger(maxLoaded)) {
+    showToast('Max loaded models must be an integer ≥ 1', 'error');
+    return;
+  }
+  if (isNaN(poll) || poll <= 0) {
+    showToast('Poll interval must be a positive number', 'error');
+    return;
+  }
+  if (isNaN(basePort) || basePort < 1024 || basePort > 65535 || !Number.isInteger(basePort)) {
+    showToast('Base port must be an integer between 1024 and 65535', 'error');
+    return;
+  }
+
+  const body = {
+    idle_timeout_seconds: idle,
+    max_loaded_models: maxLoaded,
+    poll_interval_seconds: poll,
+    base_port: basePort,
+    default_args: $('s-default-args').value,
+    selected_backend: $('s-selected-backend').value,
+    auto_save_state: $('s-auto-save').checked,
+  };
+  try {
+    await apiJSON('/v1/settings', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    $('settings-overlay').classList.remove('active');
+    showToast('Global settings saved', 'success');
+  } catch (e) {
+    showToast('Settings save failed: ' + e.message, 'error');
+  }
+}
+
+$('btn-settings').onclick = () => {
+  loadSettings().then(() => $('settings-overlay').classList.add('active'));
+};
+$('settings-cancel').onclick = () => $('settings-overlay').classList.remove('active');
+$('settings-save').onclick = saveSettings;
+
+// Load settings on startup alongside everything else
+loadSettings();
 
 refreshAll().then(wsLoop);
 </script>
