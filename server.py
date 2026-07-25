@@ -349,14 +349,19 @@ class ModelManager:
 
             # 1. Check explicit mmproj_file setting
             if cfg.mmproj_file:
-                mmproj_name = Path(cfg.mmproj_file).resolve().name
-                target_p = p.parent / mmproj_name
-                if target_p.exists():
-                    paired_mmproj = target_p
+                candidate = Path(cfg.mmproj_file)
+                if candidate.exists() and candidate.is_file():
+                    paired_mmproj = candidate
                 else:
-                    target_p2 = self.root_dir / mmproj_name
-                    if target_p2.exists():
-                        paired_mmproj = target_p2
+                    # Fall back to filename-only lookup in model dir and root dir
+                    mmproj_name = candidate.name
+                    target_p = p.parent / mmproj_name
+                    if target_p.exists() and target_p.is_file():
+                        paired_mmproj = target_p
+                    else:
+                        target_p2 = self.root_dir / mmproj_name
+                        if target_p2.exists() and target_p2.is_file():
+                            paired_mmproj = target_p2
 
             # 2. Look for sibling mmproj files in the same directory
             if not paired_mmproj:
