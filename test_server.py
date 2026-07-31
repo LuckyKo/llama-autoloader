@@ -523,6 +523,17 @@ class TestModelConfig:
         assert "--n-gpu-layers" in args
         assert "50" in args
 
+    def test_to_launch_args_alias(self):
+        cfg = ModelConfig()
+        args = cfg.to_launch_args(Path("/m"), 8080, "", model_id="my-model.gguf")
+        assert "--alias" in args
+        assert "my-model.gguf" in args
+
+    def test_to_launch_args_no_alias_without_model_id(self):
+        cfg = ModelConfig()
+        args = cfg.to_launch_args(Path("/m"), 8080, "")
+        assert "--alias" not in args
+
 
 # ---------------------------------------------------------------------------
 # _allocate_port

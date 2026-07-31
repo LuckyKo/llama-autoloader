@@ -137,7 +137,7 @@ class ModelConfig:
         sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
         sidecar.write_text(json.dumps(asdict(self), indent=2))
 
-    def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None, slot_save_dir: Optional[Path] = None) -> List[str]:
+    def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None, slot_save_dir: Optional[Path] = None, model_id: Optional[str] = None) -> List[str]:
         """Build argv for llama-server."""
         argv = [
             "--model", str(model_path),
@@ -146,6 +146,8 @@ class ModelConfig:
             "--ctx-size", str(self.ctx_size),
             "--n-gpu-layers", str(self.n_gpu_layers),
         ]
+        if model_id:
+            argv += ["--alias", model_id]
         if self.use_mmproj and mmproj_full_path and mmproj_full_path.exists():
             argv += ["--mmproj", str(mmproj_full_path)]
         if slot_save_dir:
@@ -606,6 +608,8 @@ class ModelManager:
                     self._loading_tasks.pop(model_id, None)
 
     async def _do_load_model(self, model_id: str, force: bool = False) -> LoadedModel:
+        if not model_id or not model_id.strip():
+            raise ValueError("Model ID must be a non-empty string")
         try:
             async with self._lock:
                 if model_id in self.loaded and force:
@@ -616,7 +620,7 @@ class ModelManager:
                 port = self._allocate_port()
                 binary_path = self.resolve_binary(cfg)
                 mmproj_p = self.mmproj_paths.get(model_id)
-                argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p, slot_save_dir=self.save_state_dir)
+                argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p, slot_save_dir=self.save_state_dir, model_id=model_id)
 
                 log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
                 log.info("argv: " + " ".join(argv))
