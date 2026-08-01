@@ -1023,7 +1023,6 @@ class ModelManager:
 
         try:
             await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
-            await self._warm_slot_cache(lm.port)
         except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
 
