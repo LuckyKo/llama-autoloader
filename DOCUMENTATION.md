@@ -522,8 +522,9 @@ curl -X POST "http://127.0.0.1:9001/slots/0?action=restore&filename=mysave.bin"
 
 1. **Same-model only**: State files are only compatible with the exact same model architecture and configuration.
 2. **Slot 0 only**: Currently only slot 0 (first conversation) is saved/restored.
-3. **Model must be loaded**: State can only be restored to a running llama-server instance.
-4. **Path sanitization**: Model IDs are sanitized (path separators removed) for file naming.
+3. **Path sanitization**: Model IDs are sanitized (path separators removed) for file naming.
+
+Note: If the model is not loaded when restoring state, it will be automatically loaded first.
 
 ### Step-by-Step Example: Full Save/Restore Cycle
 
