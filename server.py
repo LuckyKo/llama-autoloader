@@ -1061,13 +1061,22 @@ class ModelManager:
         Cleanup is per-model (not per-agent), so all agents sharing the same model
         share the state file pool. Keeps max 5 most recent state files by mtime.
         """
-        max_states = 5
+        max_states = max(1, 5)  # Ensure minimum of 1 file kept
         mid_clean = self._sanitize_model_id(model_id_input)
 
+        if not mid_clean:
+            log.debug("Skipping cleanup: empty sanitized model ID")
+            return
+
         try:
-            # Find all state files for this model
-            pattern = f"{mid_clean}.*.bin"
-            state_files = list(self.save_state_dir.glob(pattern))
+            # Find all state files for this model using prefix/suffix matching
+            # instead of glob to avoid pattern injection issues with special chars
+            state_files = [
+                p for p in self.save_state_dir.iterdir()
+                if (p.is_file() and 
+                    p.name.startswith(f"{mid_clean}.") and 
+                    p.name.endswith(".bin"))
+            ]
 
             if len(state_files) <= max_states:
                 return
@@ -1082,11 +1091,11 @@ class ModelManager:
                     old_file.unlink()
                     log.info(f"Cleaned up old state file: {old_file.name} ({size_mb:.1f} MB)")
                 except Exception as e:
-                    log.warning(f"Failed to delete old state file {old_file.name}: {e}")
+                    log.warning(f"Failed to delete old state file {old_file.absolute()} for model={model_id_input}: {e}")
 
         except Exception as e:
             # Best-effort cleanup - don't fail the save if cleanup fails
-            log.warning(f"State cleanup failed for model={model_id_input}: {e}")
+            log.debug(f"State cleanup failed for model={model_id_input}: {e}")
 
     # ---------------- status cache ----------------
     async def _build_status(self) -> Dict[str, Any]:
