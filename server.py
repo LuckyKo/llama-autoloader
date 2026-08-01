@@ -993,10 +993,22 @@ class ModelManager:
     async def load_state(self, model_id_input: str, label: str = "default") -> Path:
         model_id = await self.resolve_model_id(model_id_input)
         if not model_id:
-            raise HTTPException(400, "Model not loaded")
+            raise HTTPException(404, f"Unknown model: {model_id_input}")
+
         async with self._lock:
-            if model_id not in self.loaded:
-                raise HTTPException(400, "Model not loaded")
+            lm = self.loaded.get(model_id)
+
+        if lm is None or not lm.ready:
+            log.info(f"Auto-loading model '{model_id}' before state restore")
+            try:
+                lm = await asyncio.wait_for(self.load_model(model_id), timeout=60.0)
+            except asyncio.TimeoutError:
+                raise HTTPException(504, f"Timeout loading model '{model_id}' for state restore")
+            except Exception as e:
+                log.error(f"Failed to load model '{model_id}' before state restore: {e}")
+                raise HTTPException(503, f"Failed to load model before state restore: {e}")
+
+        async with self._lock:
             lm = self.loaded[model_id]
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
