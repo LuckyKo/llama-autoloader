@@ -988,6 +988,13 @@ class ModelManager:
             raise HTTPException(500, f"save failed: {e}")
 
         lm.state_path = state_path
+
+        # Clean up old states for this model (best-effort)
+        try:
+            await self._cleanup_old_states(model_id)
+        except Exception as e:
+            log.debug(f"State cleanup failed (non-critical): {e}")
+
         return state_path
 
     async def load_state(self, model_id_input: str, label: str = "default") -> Path:
@@ -1047,6 +1054,39 @@ class ModelManager:
             log.info(f"Deleted state file: {state_path.name}")
         except Exception as e:
             raise HTTPException(500, f"Failed to delete state file: {e}")
+
+    async def _cleanup_old_states(self, model_id_input: str) -> None:
+        """Delete old state files for a model, keeping only the latest N files.
+
+        Cleanup is per-model (not per-agent), so all agents sharing the same model
+        share the state file pool. Keeps max 5 most recent state files by mtime.
+        """
+        max_states = 5
+        mid_clean = self._sanitize_model_id(model_id_input)
+
+        try:
+            # Find all state files for this model
+            pattern = f"{mid_clean}.*.bin"
+            state_files = list(self.save_state_dir.glob(pattern))
+
+            if len(state_files) <= max_states:
+                return
+
+            # Sort by modification time (newest first)
+            state_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+            # Delete files beyond the limit
+            for old_file in state_files[max_states:]:
+                try:
+                    size_mb = old_file.stat().st_size / (1024 * 1024)
+                    old_file.unlink()
+                    log.info(f"Cleaned up old state file: {old_file.name} ({size_mb:.1f} MB)")
+                except Exception as e:
+                    log.warning(f"Failed to delete old state file {old_file.name}: {e}")
+
+        except Exception as e:
+            # Best-effort cleanup - don't fail the save if cleanup fails
+            log.warning(f"State cleanup failed for model={model_id_input}: {e}")
 
     # ---------------- status cache ----------------
     async def _build_status(self) -> Dict[str, Any]:
