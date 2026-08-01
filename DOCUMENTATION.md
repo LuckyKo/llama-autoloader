@@ -302,7 +302,7 @@ Save slot 0 KV cache state to a file. State files are stored in `save_state_dir`
 
 #### `POST /v1/models/{model_id}/state/load`
 
-Restore slot 0 KV cache state from a saved file. After restore, the autoloader sends a minimal request (`_warm_slot_cache()`) to prime the checkpoint cache — this is required for llama.cpp v2.26.0+.
+Restore slot 0 KV cache state from a saved file. Restored state preserves conversation context for resumed sessions, allowing llama.cpp's prompt cache to skip reprocessing tokens on subsequent requests.
 
 **Request Body:**
 ```json
@@ -469,7 +469,6 @@ Slot state refers to the **KV cache** (key-value cache) maintained by llama.cpp 
 - Testing or debugging stateful interactions
 
 **Do NOT rely on slot state for:**
-- **Prompt cache population**: Restored KV cache does NOT populate the separate RAM-based prompt cache (`cache_prompt`). Resending the exact same prompt after restore will reprocess tokens.
 - **Cross-model compatibility**: State files are model-specific and cannot be restored to a different model.
 - **Guaranteed persistence**: If save fails during unload, state may be lost.
 
@@ -522,10 +521,9 @@ curl -X POST "http://127.0.0.1:9001/slots/0?action=restore&filename=mysave.bin"
 ### Important Limitations
 
 1. **Same-model only**: State files are only compatible with the exact same model architecture and configuration.
-2. **No prompt cache**: Restored KV cache does not populate RAM-based prompt cache. The first generation after restore will use the KV cache for history, but resending the exact same prompt will reprocess tokens.
-3. **Slot 0 only**: Currently only slot 0 (first conversation) is saved/restored.
-4. **Model must be loaded**: State can only be restored to a running llama-server instance.
-5. **Path sanitization**: Model IDs are sanitized (path separators removed) for file naming.
+2. **Slot 0 only**: Currently only slot 0 (first conversation) is saved/restored.
+3. **Model must be loaded**: State can only be restored to a running llama-server instance.
+4. **Path sanitization**: Model IDs are sanitized (path separators removed) for file naming.
 
 ### Step-by-Step Example: Full Save/Restore Cycle
 
@@ -591,7 +589,7 @@ curl -X POST http://127.0.0.1:9123/v1/models/mymodel/state/load \
   -d '{"label": "mysave"}'
 ```
 
-After restore, the autoloader sends a minimal request (`_warm_slot_cache()`) to prime the checkpoint cache — this is required for llama.cpp v2.26.0+.
+After restore, the slot's KV cache contains the previous conversation context. Subsequent requests with matching prompts will leverage llama.cpp's prompt cache to skip reprocessing tokens.
 
 **Alternative: via direct llama-server slot endpoint**
 ```bash
