@@ -1020,6 +1020,22 @@ class ModelManager:
             out.append(label)
         return out
 
+    async def delete_state(self, model_id_input: str, label: str) -> None:
+        """Delete a state file for the given model and label."""
+        model_id = await self.resolve_model_id(model_id_input) or model_id_input
+        mid_clean = self._sanitize_model_id(model_id)
+        label_clean = self._sanitize_label(label)
+        state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
+
+        if not state_path.exists():
+            raise HTTPException(404, f"State file not found: {state_path.name}")
+
+        try:
+            state_path.unlink()
+            log.info(f"Deleted state file: {state_path.name}")
+        except Exception as e:
+            raise HTTPException(500, f"Failed to delete state file: {e}")
+
     # ---------------- status cache ----------------
     async def _build_status(self) -> Dict[str, Any]:
         """Build a full status snapshot (cached to avoid redundant nvidia-smi calls)."""
@@ -1432,17 +1448,43 @@ async def unload_all_ep():
 # ---------- state save / load ----------
 @app.post("/v1/models/{model_id}/state/save")
 async def save_state_ep(model_id: str, body: StateLabel):
-    p = await manager.save_state(model_id, body.label)
-    return {"id": model_id, "label": body.label, "path": str(p)}
+    try:
+        p = await manager.save_state(model_id, body.label)
+        size = p.stat().st_size
+        log.info(f"State saved for model={model_id} label={body.label} path={p.name} size={size} bytes")
+        return {"id": model_id, "label": body.label, "path": str(p)}
+    except HTTPException as e:
+        if e.status_code == 400:
+            log.info(f"State save skipped for model={model_id} label={body.label}: {e.detail}")
+        raise
 
 @app.post("/v1/models/{model_id}/state/load")
 async def load_state_ep(model_id: str, body: StateLabel):
-    p = await manager.load_state(model_id, body.label)
-    return {"id": model_id, "label": body.label, "path": str(p)}
+    try:
+        p = await manager.load_state(model_id, body.label)
+        log.info(f"State restored for model={model_id} label={body.label} path={p.name}")
+        return {"id": model_id, "label": body.label, "path": str(p)}
+    except HTTPException as e:
+        if "restore failed" in e.detail and "not found" in e.detail.lower():
+            log.info(f"State restore skipped for model={model_id} label={body.label}: state file missing")
+        raise
 
 @app.get("/v1/models/{model_id}/state")
 async def list_states_ep(model_id: str):
-    return {"id": model_id, "labels": await manager.list_states(model_id)}
+    labels = await manager.list_states(model_id)
+    log.info(f"List states requested for model={model_id}, found {len(labels)} state(s)")
+    return {"id": model_id, "labels": labels}
+
+@app.delete("/v1/models/{model_id}/state/{label}")
+async def delete_state_ep(model_id: str, label: str):
+    try:
+        await manager.delete_state(model_id, label)
+        log.info(f"State deleted for model={model_id} label={label}")
+        return {"id": model_id, "label": label, "deleted": True}
+    except HTTPException as e:
+        if e.status_code == 404:
+            log.info(f"State delete skipped for model={model_id} label={label}: {e.detail}")
+        raise
 
 # ---------- OpenAI-compatible proxy endpoints ----------
 async def _resolve_proxy_model(body: bytes) -> str:
