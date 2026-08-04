@@ -87,7 +87,7 @@ class ModelConfig:
     description: str = ""
     args: str = ""                  # extra args appended to llama-server
     ctx_size: int = 8192
-    n_gpu_layers: int = 999
+    n_gpu_layers: Optional[int] = None   # None = don't pass --n-gpu-layers (let llama.cpp auto-detect)
     default: bool = False
     pinned: bool = False            # never auto-unload
     auto_save_state: bool = False   # auto save/restore slot 0 session state
@@ -105,7 +105,7 @@ class ModelConfig:
             description="",
             args="",
             ctx_size=8192,
-            n_gpu_layers=999,
+            n_gpu_layers=None,
             default=False,
             pinned=False,
             auto_save_state=False,
@@ -144,8 +144,9 @@ class ModelConfig:
             "--host", "127.0.0.1",
             "--port", str(port),
             "--ctx-size", str(self.ctx_size),
-            "--n-gpu-layers", str(self.n_gpu_layers),
         ]
+        if self.n_gpu_layers is not None:
+            argv += ["--n-gpu-layers", str(self.n_gpu_layers)]
         if model_id:
             argv += ["--alias", model_id]
         if self.use_mmproj and mmproj_full_path and mmproj_full_path.exists():
@@ -1009,6 +1010,7 @@ class ModelManager:
             raise HTTPException(500, f"restore failed: {e}")
 
         lm.state_path = state_path
+        
         return state_path
 
     async def list_states(self, model_id_input: str) -> List[str]:

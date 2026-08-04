@@ -492,6 +492,26 @@ models:
 
 Global setting can be overridden by per-model config.
 
+### SWA/Hybrid-Memory Models (e.g., Qwen3.6-27B)
+
+For models with Sliding Window Attention (SWA), enabling `auto_save_state` alone is NOT sufficient to get cache reuse after restore. Due to how llama.cpp manages SWA checkpoints in RAM only (not persisted to slot state files), the model will fully reprocess prompts on every request after restore, even though the KV cache was restored.
+
+To fix this for SWA models, add `--swa-full` to the model's args:
+
+```json
+{
+  "name": "Qwen3.6-27B",
+  "auto_save_state": true,
+  "args": "--swa-full"
+}
+```
+
+This allocates a full-size SWA cache instead of the compact windowed variant, bypassing the checkpoint requirement that would otherwise force full reprocessing. Trade-offs:
+- **Pro**: KV cache reuse works correctly after state restore (no more 108s reprocessing for 81K token prompts)
+- **Con**: Uses more VRAM; negligible impact on per-token speed in practice
+
+This is only needed for SWA/hybrid-memory models; regular models don't need it.
+
 ### Manual Save/Restore via Direct llama-server Slot API
 
 You can manually save and restore slot state using the autoloader's proxy endpoints or direct llama-server calls.

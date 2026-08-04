@@ -3,7 +3,7 @@ gpu:
 launcher:
   base_port: 9001
   host: 127.0.0.1
-  port: 9123
+  port: 9124
 llama_server:
   backends_dir: ./backends
   binary: llama-server
