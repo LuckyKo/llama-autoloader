@@ -601,22 +601,22 @@ class ModelManager:
                 self.loaded[mid].config = new_cfg
         return new_cfg
 
-    # ---------------- model ID sanitization ----------------
+    # ---------------- sanitization ----------------
+    @staticmethod
+    def sanitize_safe_string(s: str) -> str:
+        """Strip path separators and parent references from user-supplied strings."""
+        if not s:
+            return s
+        return s.replace("\\", "").replace("/", "").replace("..", "").strip()
+
+    # Alias for backwards compatibility with existing call sites
     @staticmethod
     def _sanitize_model_id(model_id: str) -> str:
-        """Strip path separators and parent references from model IDs."""
-        if not model_id:
-            return model_id
-        # Remove path separators and parent refs
-        mid = model_id.replace("\\", "").replace("/", "").replace("..", "")
-        return mid.strip()
+        return ModelManager.sanitize_safe_string(model_id)
 
     @staticmethod
     def _sanitize_label(label: str) -> str:
-        """Strip path traversal chars from state labels."""
-        if not label:
-            return label
-        return label.replace("\\", "").replace("/", "").replace("..", "").strip()
+        return ModelManager.sanitize_safe_string(label)
 
     # ---------------- process lifecycle & port allocation ----------------
     def _is_port_available(self, port: int) -> bool:
@@ -1013,24 +1013,26 @@ class ModelManager:
     # ---------------- state save/load ----------------
     async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0) -> bool:
         """Attempt a slot action (save/restore) trying supported endpoint formats."""
-        endpoints = [
-            (f"http://127.0.0.1:{port}/slots/0?action={action}", {"filename": state_path.name}),
-            (f"http://127.0.0.1:{port}/slots?action={action}", {"id_slot": 0, "filename": state_path.name}),
-            (f"http://127.0.0.1:{port}/slots", {"action": action, "id_slot": 0, "filename": state_path.name}),
+        base = f"http://127.0.0.1:{port}"
+        attempts = [
+            ("/slots/0", {"filename": state_path.name}, f"URL param: ?action={action}"),
+            ("/slots", {"id_slot": 0, "filename": state_path.name}, f"URL param: ?action={action}"),
+            ("/slots", {"action": action, "id_slot": 0, "filename": state_path.name}, "JSON body params"),
         ]
 
         last_err = None
-        for url, payload in endpoints:
+        for path, payload, desc in attempts:
             try:
+                url = f"{base}{path}?action={action}"
                 r = await self.client.post(url, json=payload, timeout=timeout)
                 if r.status_code == 200:
+                    log.debug(f"Slot {action} succeeded via {desc}")
                     return True
-                else:
-                    last_err = f"HTTP {r.status_code}: {r.text}"
+                last_err = f"[{desc}] HTTP {r.status_code}: {r.text}"
             except Exception as e:
-                last_err = str(e)
+                last_err = f"[{desc}] {e}"
 
-        raise RuntimeError(last_err or f"{action} failed across all slot endpoints")
+        raise RuntimeError(f"{action} failed across all slot endpoints. Last error: {last_err}")
 
     async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
         """Attempt to save slot state trying supported endpoint formats."""
@@ -1644,42 +1646,19 @@ async def _resolve_proxy_model(body: bytes) -> str:
         raise HTTPException(404, "No matching model found and no loaded/default model available")
     return resolved
 
-@app.api_route("/v1/chat/completions", methods=["POST"])
-async def proxy_chat(request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/chat/completions", request)
+def _make_proxy_route(endpoint: str):
+    """Factory that creates a proxy handler for the given upstream endpoint."""
+    async def handler(request: Request):
+        body = await request.body()
+        model_id = await _resolve_proxy_model(body)
+        return await manager.proxy(model_id, endpoint, request)
+    return handler
 
-@app.api_route("/v1/completions", methods=["POST"])
-async def proxy_completions(request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/completions", request)
-
-@app.api_route("/v1/embeddings", methods=["POST"])
-async def proxy_embeddings(request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/embeddings", request)
-
-# Top-level non-/v1 routes (for clients connecting without /v1 prefix)
-@app.api_route("/chat/completions", methods=["POST"])
-async def proxy_chat_top(request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/chat/completions", request)
-
-@app.api_route("/completions", methods=["POST"])
-async def proxy_completions_top(request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/completions", request)
-
-@app.api_route("/embeddings", methods=["POST"])
-async def proxy_embeddings_top(request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/embeddings", request)
+# Register /v1/* and bare routes using the factory (no logic duplication)
+for prefix in ("", "/v1"):
+    app.api_route(prefix + "/chat/completions", methods=["POST"])(_make_proxy_route("/v1/chat/completions"))
+    app.api_route(prefix + "/completions", methods=["POST"])(_make_proxy_route("/v1/completions"))
+    app.api_route(prefix + "/embeddings", methods=["POST"])(_make_proxy_route("/v1/embeddings"))
 
 # Pass-through other llama-server endpoints (e.g. /slots, /tokenize, /detokenize)
 @app.api_route("/v1/raw/{model_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
