@@ -599,9 +599,9 @@ class TestReadGGUFMetadata:
         mock_reader = MagicMock()
         mock_reader.get_field.return_value = None  # general.name not present
 
-        # Simulate a context_length field
+        # Simulate a context_length field using contents() API
         mock_field = MagicMock()
-        mock_field.parts[-1].tolist.return_value = [4096]
+        mock_field.contents.return_value = 4096
         mock_reader.fields = {"llama.context_length": mock_field}
 
         mock_reader_cls.return_value = mock_reader
@@ -633,9 +633,9 @@ class TestReadGGUFMetadata:
         name_field.contents.return_value = "Test Model"
         mock_reader.get_field.return_value = name_field
 
-        # Simulate a field that raises on tolist()
+        # Simulate a field that raises on contents()
         bad_field = MagicMock()
-        bad_field.parts[-1].tolist.side_effect = ValueError("bad data")
+        bad_field.contents.side_effect = ValueError("bad data")
         mock_reader.fields = {"llama.context_length": bad_field}
 
         mock_reader_cls.return_value = mock_reader

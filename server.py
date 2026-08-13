@@ -67,7 +67,11 @@ def _safe_float(val: str, default: float = 0.0) -> float:
 
 
 def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
-    """Read (general.name, context_length) from GGUF file metadata."""
+    """Read (general.name, context_length) from GGUF file metadata.
+
+    Uses mmap-based reader that only loads KV header metadata, not tensor data.
+    Should complete in milliseconds even for 20GB+ files.
+    """
     name = None
     max_ctx = None
     try:
@@ -81,19 +85,15 @@ def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
             except Exception as e:
                 log.warning(f"Failed to read 'general.name' from {gguf_path}: {e}")
 
-        # Read context_length (architecture-specific field)
-        ctx_found = False
+        # Read context_length (architecture-specific field like llama.context_length, qwen2.context_length, etc.)
         for k, f in reader.fields.items():
             if k.endswith('.context_length'):
                 try:
-                    val = f.parts[-1].tolist()[0]
+                    val = f.contents()
                     max_ctx = int(val)
-                    ctx_found = True
                     break
                 except Exception as e:
                     log.warning(f"Failed to parse '{k}' from {gguf_path}: {e}")
-        if not ctx_found:
-            log.debug(f"No context_length field found in GGUF metadata for {gguf_path}")
 
     except Exception as e:
         log.debug(f"Failed to read GGUF metadata from {gguf_path}: {e}")
@@ -447,13 +447,25 @@ class ModelManager:
         for cfg in self.models.values():
             if cfg.n_gpu_layers is None:
                 cfg.n_gpu_layers = self.default_n_gpu_layers
-        # Cache model file sizes
+        # Cache model file sizes and read GGUF metadata (name, context_length)
         for mid in self.gguf_paths:
             path = self.gguf_paths[mid]
             try:
                 self._model_sizes[mid] = path.stat().st_size / 1024 / 1024
             except Exception:
                 self._model_sizes[mid] = 0.0
+            # Read GGUF metadata at scan time so it's available immediately for list_models
+            try:
+                name, max_ctx = _read_gguf_metadata(path)
+                cfg = self.models[mid]
+                if name and not cfg.gguf_name:
+                    cfg.gguf_name = name
+                    if not cfg.name or cfg.name == path.stem:
+                        cfg.name = name
+                if max_ctx:
+                    cfg.max_ctx_size = max_ctx
+            except Exception as e:
+                log.debug(f"Failed to read GGUF metadata for {mid}: {e}")
         log.info(f"Scan complete: {len(self.models)} models found (filtered {len(mmproj_paths)} mmproj vision modules)")
         return list(self.models.keys())
 
@@ -499,9 +511,6 @@ class ModelManager:
             loaded_snap = dict(self.loaded)
             sizes_snap = dict(self._model_sizes)
             mmproj_snap = dict(self.mmproj_paths)
-
-        # Pre-populate GGUF metadata concurrently for models that haven't been read yet
-        await asyncio.gather(*(self._ensure_gguf_name(mid) for mid, _ in snapshots), return_exceptions=True)
 
         out = []
         for mid, cfg in snapshots:
