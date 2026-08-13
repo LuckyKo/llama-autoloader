@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from server import ModelManager, ModelConfig, LoadedModel
+from server import ModelManager, ModelConfig, LoadedModel, _read_gguf_metadata, _read_gguf_name
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -534,6 +534,10 @@ class TestModelConfig:
         args = cfg.to_launch_args(Path("/m"), 8080, "")
         assert "--alias" not in args
 
+    def test_max_ctx_size_field(self):
+        cfg = ModelConfig(ctx_size=8192, max_ctx_size=32768)
+        assert cfg.max_ctx_size == 32768
+
 
 # ---------------------------------------------------------------------------
 # _allocate_port
@@ -568,3 +572,81 @@ class TestLoadedModel:
         t2 = time.time()
         lm.touch()
         assert t1 <= lm.last_used <= t2
+
+
+# ---------------------------------------------------------------------------
+# _read_gguf_metadata error handling
+# ---------------------------------------------------------------------------
+
+class TestReadGGUFMetadata:
+    def test_returns_none_on_missing_file(self):
+        """When file doesn't exist, function should return (None, None) without raising."""
+        name, max_ctx = _read_gguf_metadata(Path("/nonexistent/path/model.gguf"))
+        assert name is None
+        assert max_ctx is None
+
+    def test_returns_none_on_invalid_gguf_data(self, tmp_path):
+        """When file exists but isn't valid GGUF, function should return (None, None)."""
+        fake_gguf = tmp_path / "fake.gguf"
+        fake_gguf.write_bytes(b"NOT_A_REAL_GGUF_FILE" * 100)
+        name, max_ctx = _read_gguf_metadata(fake_gguf)
+        assert name is None
+        assert max_ctx is None
+
+    @patch("server.gguf.GGUFReader")
+    def test_handles_missing_name_field(self, mock_reader_cls):
+        """When general.name field is missing, name should be None but context_length still read."""
+        mock_reader = MagicMock()
+        mock_reader.get_field.return_value = None  # general.name not present
+
+        # Simulate a context_length field
+        mock_field = MagicMock()
+        mock_field.parts[-1].tolist.return_value = [4096]
+        mock_reader.fields = {"llama.context_length": mock_field}
+
+        mock_reader_cls.return_value = mock_reader
+
+        name, max_ctx = _read_gguf_metadata(Path("test.gguf"))
+        assert name is None
+        assert max_ctx == 4096
+
+    @patch("server.gguf.GGUFReader")
+    def test_handles_missing_context_length_field(self, mock_reader_cls):
+        """When context_length field is missing, max_ctx should be None but name still read."""
+        mock_reader = MagicMock()
+        name_field = MagicMock()
+        name_field.contents.return_value = "Test Model"
+        mock_reader.get_field.return_value = name_field
+        mock_reader.fields = {}  # No context_length fields
+
+        mock_reader_cls.return_value = mock_reader
+
+        name, max_ctx = _read_gguf_metadata(Path("test.gguf"))
+        assert name == "Test Model"
+        assert max_ctx is None
+
+    @patch("server.gguf.GGUFReader")
+    def test_handles_parse_error_in_context_length(self, mock_reader_cls):
+        """When context_length value can't be parsed, should log warning and return None for max_ctx."""
+        mock_reader = MagicMock()
+        name_field = MagicMock()
+        name_field.contents.return_value = "Test Model"
+        mock_reader.get_field.return_value = name_field
+
+        # Simulate a field that raises on tolist()
+        bad_field = MagicMock()
+        bad_field.parts[-1].tolist.side_effect = ValueError("bad data")
+        mock_reader.fields = {"llama.context_length": bad_field}
+
+        mock_reader_cls.return_value = mock_reader
+
+        name, max_ctx = _read_gguf_metadata(Path("test.gguf"))
+        assert name == "Test Model"
+        assert max_ctx is None
+
+    def test_read_gguf_name_delegates_correctly(self):
+        """_read_gguf_name should return just the name from _read_gguf_metadata."""
+        with patch("server._read_gguf_metadata") as mock_fn:
+            mock_fn.return_value = ("Mocked Name", 8192)
+            result = _read_gguf_name(Path("test.gguf"))
+            assert result == "Mocked Name"

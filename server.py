@@ -25,7 +25,7 @@ import platform
 import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, AsyncIterator
+from typing import Any, Dict, List, Optional, AsyncIterator, Tuple
 
 import httpx
 import psutil
@@ -65,17 +65,44 @@ def _safe_float(val: str, default: float = 0.0) -> float:
     except Exception:
         return default
 
-def _read_gguf_name(gguf_path) -> Optional[str]:
-    """Read general.name from GGUF file metadata. Returns None on failure."""
+
+def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
+    """Read (general.name, context_length) from GGUF file metadata."""
+    name = None
+    max_ctx = None
     try:
         reader = gguf.GGUFReader(str(gguf_path))
-        field = reader.get_field('general.name')
-        if field is None:
-            return None
-        return field.contents()
+
+        # Read general.name
+        name_field = reader.get_field('general.name')
+        if name_field is not None:
+            try:
+                name = str(name_field.contents())
+            except Exception as e:
+                log.warning(f"Failed to read 'general.name' from {gguf_path}: {e}")
+
+        # Read context_length (architecture-specific field)
+        ctx_found = False
+        for k, f in reader.fields.items():
+            if k.endswith('.context_length'):
+                try:
+                    val = f.parts[-1].tolist()[0]
+                    max_ctx = int(val)
+                    ctx_found = True
+                    break
+                except Exception as e:
+                    log.warning(f"Failed to parse '{k}' from {gguf_path}: {e}")
+        if not ctx_found:
+            log.debug(f"No context_length field found in GGUF metadata for {gguf_path}")
+
     except Exception as e:
-        log.debug(f"Failed to read GGUF name from {gguf_path}: {e}")
-        return None
+        log.debug(f"Failed to read GGUF metadata from {gguf_path}: {e}")
+    return name, max_ctx
+
+def _read_gguf_name(gguf_path) -> Optional[str]:
+    """Read general.name from GGUF file metadata. Returns None on failure."""
+    name, _ = _read_gguf_metadata(gguf_path)
+    return name
 
 # --------------------------------------------------------------------------
 # Data models
@@ -87,7 +114,8 @@ class ModelConfig:
     description: str = ""
     args: str = ""                  # extra args appended to llama-server
     ctx_size: int = 8192
-    n_gpu_layers: Optional[int] = None   # None = don't pass --n-gpu-layers (let llama.cpp auto-detect)
+    max_ctx_size: Optional[int] = None   # max context window extracted from GGUF metadata
+    n_gpu_layers: Optional[int] = 999   # 999 = offload all layers to GPU by default
     default: bool = False
     pinned: bool = False            # never auto-unload
     auto_save_state: bool = False   # auto save/restore slot 0 session state
@@ -105,7 +133,8 @@ class ModelConfig:
             description="",
             args="",
             ctx_size=8192,
-            n_gpu_layers=None,
+            max_ctx_size=None,
+            n_gpu_layers=999,
             default=False,
             pinned=False,
             auto_save_state=False,
@@ -204,6 +233,8 @@ class ModelManager:
         self.backends_dir = Path(cfg["llama_server"].get("backends_dir", "./backends")).resolve()
         self.selected_backend = cfg["llama_server"].get("selected_backend", "")
         self.default_args = cfg["llama_server"].get("default_args", "--cache-ram 16384 --kv-unified")
+        # Read global default for n_gpu_layers; None=auto-detect, 999=all layers to GPU
+        self.default_n_gpu_layers: Optional[int] = cfg["llama_server"].get("default_n_gpu_layers", 999)
         self.host = cfg["launcher"].get("host", "127.0.0.1")
         self.port = cfg["launcher"].get("port", 9123)
         self.base_port = cfg["launcher"].get("base_port", 9001)
@@ -223,6 +254,8 @@ class ModelManager:
         self.loaded: Dict[str, LoadedModel] = {}      # id -> loaded instance
         self._lock = asyncio.Lock()
         self._loading_tasks: Dict[str, asyncio.Task] = {}
+        # Track in-flight GGUF metadata reads to avoid duplicate slow I/O on concurrent calls
+        self._gguf_read_tasks: Dict[str, asyncio.Task] = {}
         self._stop = False
         self._bg_task: Optional[asyncio.Task] = None
         self._model_sizes: Dict[str, float] = {}
@@ -231,6 +264,23 @@ class ModelManager:
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
         self._status_cache: Optional[Dict[str, Any]] = None
         self._status_cache_time: float = 0.0
+
+        # Validate selected backend exists at startup
+        self._validate_backend()
+
+    def _validate_backend(self) -> None:
+        """Validate that the selected_backend directory exists and contains llama-server binary."""
+        if not self.selected_backend:
+            return
+        b_dir = self.backends_dir / self.selected_backend
+        exe = b_dir / "llama-server.exe"
+        if not exe.exists():
+            exe = b_dir / "llama-server"
+        if not exe.exists():
+            log.warning(
+                f"Selected backend '{self.selected_backend}' is configured but the binary was not found at: {exe}. "
+                f"Model loading will fail until this is fixed or another backend is selected."
+            )
 
     # ---------------- config validation ----------------
     @staticmethod
@@ -393,6 +443,10 @@ class ModelManager:
                     cfg.mmproj_file = paired_mmproj.name
 
         self.models = found
+        # Apply global default_n_gpu_layers to models that have n_gpu_layers=None
+        for cfg in self.models.values():
+            if cfg.n_gpu_layers is None:
+                cfg.n_gpu_layers = self.default_n_gpu_layers
         # Cache model file sizes
         for mid in self.gguf_paths:
             path = self.gguf_paths[mid]
@@ -466,6 +520,7 @@ class ModelManager:
                 "use_mmproj": cfg.use_mmproj,
                 "mmproj_file": cfg.mmproj_file,
                 "ctx_size": cfg.ctx_size,
+                "max_ctx_size": cfg.max_ctx_size,
                 "n_gpu_layers": cfg.n_gpu_layers,
                 "estimated_vram_mb": cfg.estimated_vram_mb,
                 "args": cfg.args,
@@ -484,25 +539,62 @@ class ModelManager:
         mid = await self.resolve_model_id(model_id_or_alias)
         if not mid:
             return None
+        await self._ensure_gguf_name(mid)
         async with self._lock:
-            self._ensure_gguf_name(mid)
             return self.models.get(mid)
 
-    def _ensure_gguf_name(self, mid: str):
-        """Read gguf_name from GGUF file lazily, caching the result in config."""
-        cfg = self.models.get(mid)
-        if cfg and not cfg.gguf_name:
+    async def _ensure_gguf_name(self, mid: str):
+        """Read gguf_name and max_ctx_size from GGUF file lazily, caching the result in config.
+
+        Uses a pending-reads tracker to avoid duplicate slow I/O when multiple callers
+        request metadata for the same model concurrently. The lock is held during the
+        entire read-modify-write of shared state (cfg + _gguf_read_tasks).
+        """
+        async with self._lock:
+            cfg = self.models.get(mid)
             path = self.gguf_paths.get(mid)
-            if path:
-                cfg.gguf_name = _read_gguf_name(path) or ""
+            if not cfg or not path or (cfg.gguf_name and cfg.max_ctx_size is not None):
+                return  # Already cached
+
+            # Check if another task is already reading this file
+            if mid in self._gguf_read_tasks:
+                task = self._gguf_read_tasks[mid]
+            else:
+                task = asyncio.create_task(self._do_gguf_metadata_read(mid, path))
+                self._gguf_read_tasks[mid] = task
+
+        # Await outside the lock so other callers can proceed
+        await task
+
+    async def _do_gguf_metadata_read(self, mid: str, path: Path):
+        """Internal worker that performs the GGUF metadata read and updates config under lock."""
+        try:
+            name, max_ctx = await asyncio.to_thread(_read_gguf_metadata, path)
+            async with self._lock:
+                cfg = self.models.get(mid)
+                if not cfg:
+                    return
+                if name:
+                    cfg.gguf_name = name
+                    # Default model display name to gguf_name if unedited or defaulted to stem
+                    if not cfg.name or cfg.name == path.stem:
+                        cfg.name = name
+                if max_ctx:
+                    cfg.max_ctx_size = max_ctx
+        finally:
+            async with self._lock:
+                self._gguf_read_tasks.pop(mid, None)
 
     async def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
         mid = await self.resolve_model_id(model_id_or_alias)
+        if not mid:
+            raise KeyError(model_id_or_alias)
         async with self._lock:
-            if not mid or mid not in self.models:
+            if mid not in self.models:
                 raise KeyError(model_id_or_alias)
             path = self.gguf_paths[mid]
-        new_cfg.save(path)
+
+        await asyncio.to_thread(new_cfg.save, path)
         async with self._lock:
             self.models[mid] = new_cfg
             if mid in self.loaded:
@@ -1222,6 +1314,7 @@ class ModelConfigUpdate(BaseModel):
     description: Optional[str] = None
     args: Optional[str] = None
     ctx_size: Optional[int] = None
+    max_ctx_size: Optional[int] = None
     n_gpu_layers: Optional[int] = None
     default: Optional[bool] = None
     pinned: Optional[bool] = None
@@ -1419,6 +1512,7 @@ async def list_models():
             "mmproj_file": m["mmproj_file"],
             "has_mmproj": m["has_mmproj"],
             "ctx_size": m["ctx_size"],
+            "max_ctx_size": m["max_ctx_size"],
             "n_gpu_layers": m["n_gpu_layers"],
             "estimated_vram_mb": m["estimated_vram_mb"],
             "args": m["args"],
@@ -1449,6 +1543,9 @@ async def update_model_config(model_id: str, body: ModelConfigUpdate):
     cfg = await manager.get_config(mid)
     for k, v in body.model_dump(exclude_none=True).items():
         setattr(cfg, k, v)
+    if cfg.max_ctx_size and cfg.ctx_size and cfg.ctx_size > cfg.max_ctx_size:
+        log.info(f"Capping ctx_size ({cfg.ctx_size}) to max_ctx_size ({cfg.max_ctx_size}) for model {mid}")
+        cfg.ctx_size = cfg.max_ctx_size
     await manager.update_config(mid, cfg)
     return asdict(cfg)
 

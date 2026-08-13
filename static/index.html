@@ -4,6 +4,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>llama-autoloader</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
     --bg: #0c0e16;
@@ -18,8 +21,8 @@
     --red: #f87171;
     --border: #232842;
     --radius: 12px;
-    --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+    --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
@@ -32,21 +35,21 @@
   }
   header {
     display: flex; align-items: center; justify-content: space-between;
-    padding: 16px 24px; border-bottom: 1px solid var(--border);
-    background: rgba(20,24,38,0.6); backdrop-filter: blur(10px);
-    position: sticky; top: 0; z-index: 10;
+    padding: 14px 24px; border-bottom: 1px solid var(--border);
+    background: rgba(20,24,38,0.75); backdrop-filter: blur(12px);
+    position: sticky; top: 0; z-index: 10; flex-wrap: wrap; gap: 12px;
   }
-  .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 16px; letter-spacing: -0.02em; }
   .brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent);
                 box-shadow: 0 0 16px var(--accent); }
   .brand .accent { color: var(--accent2); }
-  .launcher-info { font-family: var(--mono); color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; }
+  .launcher-info { font-family: var(--mono); color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .launcher-info b { color: var(--fg); }
 
   main { max-width: 1400px; margin: 0 auto; padding: 24px; }
 
   .section-title { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
-                   color: var(--muted); margin: 24px 0 12px; }
+                   color: var(--muted); margin: 24px 0 12px; font-weight: 600; }
 
   /* GPU strip */
   .gpu-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -67,24 +70,31 @@
   .ram-card .name { font-weight: 600; }
 
   /* Models grid */
-  .models-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  .models-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
                  gap: 14px; }
   .model-card { background: var(--bg2); border: 1px solid var(--border);
                 border-radius: var(--radius); padding: 16px;
                 display: flex; flex-direction: column; gap: 10px;
-                transition: border-color 0.2s, transform 0.2s; }
-  .model-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+                transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s; }
+  .model-card:hover { border-color: rgba(124,92,255,0.4); transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
   .model-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
   .model-name { font-weight: 600; font-size: 15px; word-break: break-all; }
   .model-meta { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 4px; }
   .status-badge { font-size: 11px; padding: 3px 8px; border-radius: 999px;
-                  font-family: var(--mono); white-space: nowrap; border: 1px solid; }
+                  font-family: var(--mono); white-space: nowrap; border: 1px solid;
+                  display: inline-flex; align-items: center; }
   .status-loaded { color: var(--green); border-color: rgba(74,222,128,0.4);
                    background: rgba(74,222,128,0.08); }
+  .status-loaded::before {
+    content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green); margin-right: 6px; box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s infinite;
+  }
   .status-loading { color: var(--amber); border-color: rgba(251,191,36,0.4);
                     background: rgba(251,191,36,0.08); }
   .status-unloaded { color: var(--muted); border-color: var(--border);
                      background: var(--bg3); }
+  @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 
   .args-box { background: var(--bg); border: 1px solid var(--border);
               border-radius: 8px; padding: 10px; font-family: var(--mono);
@@ -98,41 +108,45 @@
   .btn-row { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
   button { background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
            padding: 7px 12px; border-radius: 8px; font-size: 12px; cursor: pointer;
-           font-family: var(--sans); transition: all 0.15s; }
+           font-family: var(--sans); transition: all 0.15s; font-weight: 500; }
   button:hover { background: var(--accent); border-color: var(--accent); color: white; }
   button:disabled { opacity: 0.4; cursor: not-allowed; }
   button.primary { background: var(--accent); color: white; border-color: var(--accent); }
   button.primary:hover { filter: brightness(1.15); }
   button.danger:hover { background: var(--red); border-color: var(--red); color: white; }
 
-  /* Edit modal */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6);
-                   display: none; align-items: center; justify-content: center; z-index: 50; }
+  /* Modals */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+                   backdrop-filter: blur(4px); display: none; align-items: center;
+                   justify-content: center; z-index: 50; }
   .modal-overlay.active { display: flex; }
   .modal { background: var(--bg2); border: 1px solid var(--border);
            border-radius: var(--radius); padding: 22px; width: 560px; max-width: 95vw;
-           max-height: 85vh; overflow: auto; }
-  .modal h2 { margin: 0 0 12px; font-size: 16px; }
+           max-height: 85vh; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+  .modal h2 { margin: 0 0 14px; font-size: 16px; font-weight: 600; }
   .form-row { margin-bottom: 12px; }
   .form-row label { display: block; font-size: 11px; color: var(--muted);
-                    text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 4px; }
+                    text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 4px; font-weight: 600; }
   .form-row input, .form-row textarea, select {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
     color: var(--fg); padding: 8px 10px; border-radius: 8px; font-family: var(--mono);
-    font-size: 12px;
+    font-size: 12px; transition: border-color 0.15s;
+  }
+  .form-row input:focus, .form-row textarea:focus, select:focus {
+    outline: none; border-color: var(--accent);
   }
   .form-row textarea { min-height: 60px; resize: vertical; }
   .form-row .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
   .tag { display: inline-block; background: var(--bg3); border: 1px solid var(--border);
          padding: 2px 8px; border-radius: 999px; font-size: 10px; color: var(--muted);
-         margin-right: 4px; }
+         margin-right: 4px; font-family: var(--mono); }
 
   .empty { color: var(--muted); padding: 40px; text-align: center; grid-column: 1 / -1; }
 
   .tools-row { display: flex; justify-content: space-between; align-items: center; gap: 8px;
                margin-bottom: 12px; flex-wrap: wrap; }
-  .tools-row .left { display: flex; gap: 8px; align-items: center; }
+  .tools-row .left { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .tools-row .right { color: var(--muted); font-size: 12px; font-family: var(--mono); }
 
   details.api-doc { background: var(--bg2); border: 1px solid var(--border);
@@ -159,6 +173,12 @@
   .toast.error { border-left: 4px solid var(--red); }
   .toast.info { border-left: 4px solid var(--accent); }
   @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+  /* State list items */
+  .state-item { display: flex; justify-content: space-between; align-items: center;
+                padding: 6px 10px; border-bottom: 1px solid var(--border); font-family: var(--mono); font-size: 12px; }
+  .state-item:last-child { border-bottom: none; }
+  .state-item .actions { display: flex; gap: 6px; }
 
 </style>
 </head>
@@ -230,6 +250,7 @@ Extensions:
   POST /v1/models/{id}/state/save              {"label":"default"} save slot 0
   POST /v1/models/{id}/state/load              {"label":"default"} restore slot 0
   GET  /v1/models/{id}/state                   list saved labels
+  DELETE /v1/models/{id}/state/{label}         delete saved label
   POST /v1/scan                                rescan root dir for *.gguf
   POST /v1/unload_all                          unload everything
   POST /v1/raw/{id}/{path}                     raw pass-through to llama-server
@@ -332,12 +353,12 @@ Example cURL:
     <div class="form-row">
       <div class="row2">
         <div>
-          <label>ctx_size</label>
-          <input id="f-ctx" type="number" />
+          <label id="f-ctx-label">ctx_size</label>
+          <input id="f-ctx" type="number" placeholder="8192" />
         </div>
         <div>
           <label>n_gpu_layers</label>
-          <input id="f-ngl" type="number" />
+          <input id="f-ngl" type="number" placeholder="999" />
         </div>
       </div>
     </div>
@@ -345,7 +366,7 @@ Example cURL:
       <div class="row2">
         <div>
           <label>estimated_vram_mb</label>
-          <input id="f-vram" type="number" />
+          <input id="f-vram" type="number" placeholder="0" />
         </div>
         <div>
           <label>tags (comma sep)</label>
@@ -382,11 +403,38 @@ Example cURL:
   </div>
 </div>
 
+<!-- State Management Modal -->
+<div class="modal-overlay" id="state-overlay">
+  <div class="modal">
+    <h2>Manage Session State (<span id="sm-model-id" style="color:var(--accent2);"></span>)</h2>
+    <div class="form-row">
+      <label>Saved States</label>
+      <div id="sm-states-list" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:6px;max-height:180px;overflow:auto;margin-bottom:12px;">
+        <div class="empty" style="padding:12px;">Loading states…</div>
+      </div>
+    </div>
+    <div class="form-row">
+      <label>Save New State</label>
+      <div style="display:flex;gap:8px;">
+        <input id="sm-new-label" placeholder="Label name (e.g. default)" value="default" />
+        <button class="primary" id="sm-btn-save" style="white-space:nowrap;">Save State</button>
+      </div>
+    </div>
+    <div class="btn-row" style="justify-content:flex-end;margin-top:16px;">
+      <button id="sm-cancel">Close</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let modelsCache = [];
 let statusCache = null;
 let editingId = null;
+let stateManagingId = null;
+
+// Track in-flight async actions per model to prevent WS re-renders from blowing away button state
+const inFlightActions = new Map();
 
 function esc(str) {
   const div = document.createElement('div');
@@ -429,8 +477,8 @@ function fmtBytes(mb) {
 }
 
 function statusBadge(loaded, ready) {
-  if (loaded && ready) return '<span class="status-badge status-loaded">● Ready</span>';
-  if (loaded) return '<span class="status-badge status-loading">● Loading...</span>';
+  if (loaded && ready) return '<span class="status-badge status-loaded">Ready</span>';
+  if (loaded) return '<span class="status-badge status-loading">Loading...</span>';
   return '<span class="status-badge status-unloaded">○ Offline</span>';
 }
 
@@ -444,7 +492,7 @@ function renderGPUs(gpus) {
     const pct = g.total_mb ? (g.used_mb / g.total_mb * 100) : 0;
     return `
       <div class="gpu-card">
-        <div class="name"><span>${g.name}</span><span class="idx">GPU ${g.index}</span></div>
+        <div class="name"><span>${esc(g.name)}</span><span class="idx">GPU ${g.index}</span></div>
         <div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div>
         <div class="gpu-stats">
           <span>${fmtBytes(g.used_mb)} / ${fmtBytes(g.total_mb)}</span>
@@ -459,6 +507,96 @@ function renderRAM(ram) {
   $('ram-bar').style.width = pct.toFixed(1) + '%';
   $('ram-used').textContent = fmtBytes(ram.used_mb) + ' used';
   $('ram-total').textContent = fmtBytes(ram.total_mb) + ' total';
+}
+
+function buildButtonRowHTML(m) {
+  const act = inFlightActions.get(m.id);
+  const isLoadInFlight = act === 'load';
+  const isUnloadInFlight = act === 'unload';
+  const isVisionInFlight = act === 'toggle-vision';
+
+  const visionBtn = m.has_mmproj ? (
+    m.use_mmproj
+      ? `<button class="primary" data-act="toggle-vision" ${isVisionInFlight ? 'disabled' : ''}>${isVisionInFlight ? 'Updating...' : '👁 Vision: ON'}</button>`
+      : `<button data-act="toggle-vision" ${isVisionInFlight ? 'disabled' : ''}>${isVisionInFlight ? 'Updating...' : '👁 Vision: OFF'}</button>`
+  ) : '';
+
+  let loadBtn = '';
+  if (m.loaded) {
+    loadBtn = `<button class="danger" data-act="unload" ${isUnloadInFlight ? 'disabled' : ''}>${isUnloadInFlight ? 'Unloading...' : 'Unload'}</button>`;
+  } else {
+    loadBtn = `<button class="primary" data-act="load" ${isLoadInFlight ? 'disabled' : ''}>${isLoadInFlight ? 'Loading...' : 'Load'}</button>`;
+  }
+
+  return `
+    ${loadBtn}
+    <button data-act="edit" ${act ? 'disabled' : ''}>Edit</button>
+    ${visionBtn}
+    <button data-act="copy-curl">cURL</button>
+    <button data-act="states">States</button>
+  `;
+}
+
+function updateButtonRow(card, m) {
+  // Update buttons in-place to avoid flickering from innerHTML replacement.
+  // Only called for existing cards during incremental updates.
+  const btnRow = card.querySelector('.btn-row');
+  if (!btnRow) return;
+
+  const act = inFlightActions.get(m.id);
+  const isLoadInFlight = act === 'load';
+  const isUnloadInFlight = act === 'unload';
+  const isVisionInFlight = act === 'toggle-vision';
+
+  // Update or toggle load/unload button based on model state
+  let loadBtn = btnRow.querySelector('button[data-act="load"], button[data-act="unload"]');
+  if (!loadBtn) {
+    // Button doesn't exist yet (e.g., loaded state changed), rebuild row once
+    btnRow.innerHTML = buildButtonRowHTML(m);
+    return;
+  }
+
+  if (m.loaded && loadBtn.dataset.act !== 'unload') {
+    // Model is now loaded but we have a "Load" button — swap to Unload
+    loadBtn.dataset.act = 'unload';
+    loadBtn.className = 'danger';
+    loadBtn.textContent = isUnloadInFlight ? 'Unloading...' : 'Unload';
+    loadBtn.disabled = isUnloadInFlight;
+  } else if (!m.loaded && loadBtn.dataset.act !== 'load') {
+    // Model is now unloaded but we have an "Unload" button — swap to Load
+    loadBtn.dataset.act = 'load';
+    loadBtn.className = 'primary';
+    loadBtn.textContent = isLoadInFlight ? 'Loading...' : 'Load';
+    loadBtn.disabled = isLoadInFlight;
+  } else {
+    // Same action type, just update text/disabled state for in-flight
+    if (m.loaded) {
+      loadBtn.textContent = isUnloadInFlight ? 'Unloading...' : 'Unload';
+      loadBtn.disabled = isUnloadInFlight;
+    } else {
+      loadBtn.textContent = isLoadInFlight ? 'Loading...' : 'Load';
+      loadBtn.disabled = isLoadInFlight;
+    }
+  }
+
+  // Update vision button if present
+  const visionBtn = btnRow.querySelector('button[data-act="toggle-vision"]');
+  if (visionBtn && m.has_mmproj) {
+    if (m.use_mmproj) {
+      visionBtn.className = 'primary';
+      visionBtn.textContent = isVisionInFlight ? 'Updating...' : '👁 Vision: ON';
+    } else {
+      visionBtn.className = '';
+      visionBtn.textContent = isVisionInFlight ? 'Updating...' : '👁 Vision: OFF';
+    }
+    visionBtn.disabled = isVisionInFlight;
+  }
+
+  // Update Edit button disabled state during any in-flight action
+  const editBtn = btnRow.querySelector('button[data-act="edit"]');
+  if (editBtn) {
+    editBtn.disabled = !!act;
+  }
 }
 
 function renderModels() {
@@ -488,37 +626,28 @@ function renderModels() {
 
   const perModel = (statusCache && statusCache.per_model) || {};
   const idsNeeded = new Set(list.map(m => m.id));
+
+  // Collect existing card nodes by data-id
   const existingCards = new Map();
   grid.querySelectorAll('.model-card').forEach(c => existingCards.set(c.dataset.id, c));
 
-  // Remove cards no longer needed
+  // Remove cards no longer present in filtered list
   existingCards.forEach((card, id) => {
     if (!idsNeeded.has(id)) card.remove();
   });
-
-  // When modelsCache is replaced (refreshAll), the model objects are new references.
-  // We store the reference on the card and rebuild when it differs.
 
   list.forEach(m => {
     const pm = perModel[m.id] || {};
     let card = existingCards.get(m.id);
 
-    if (card) {
-      // Store model reference on card; if it differs from current m, config changed
-      if (card._modelRef !== m) {
-        card.remove();
-        card = null;
-      }
-    }
-
     if (!card) {
-      // Build a new card
+      // Build brand new card element
       const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
       const argsDisplay = `--ctx-size ${m.ctx_size} --n-gpu-layers ${m.n_gpu_layers} ${m.args||''}`.trim();
       const visionTag = m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '';
-      const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
       const name = esc(m.name || m.id);
       const id = esc(m.id);
+
       card = document.createElement('div');
       card.className = 'model-card';
       card.dataset.id = m.id;
@@ -529,7 +658,7 @@ function renderModels() {
             <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
             <div style="margin-top:6px;">${tags}${m.default?'<span class="tag">default</span>':''}${m.pinned?'<span class="tag">pinned</span>':''}${m.auto_save_state?'<span class="tag">autosave</span>':''}${visionTag}</div>
           </div>
-          ${statusBadge(m.loaded, m.ready)}
+          <div class="status-wrap">${statusBadge(m.loaded, m.ready)}</div>
         </div>
 
         <div class="args-box">${esc(argsDisplay) || '(no extra args)'}</div>
@@ -537,60 +666,38 @@ function renderModels() {
         <div class="model-stats">
           <div>VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
           <div>RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
-          <div>est:  <b>${m.estimated_vram_mb ? fmtBytes(m.estimated_vram_mb) : '—'}</b></div>
+          <div>ctx / max: <b>${m.ctx_size}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b></div>
           <div>uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
         </div>
 
-        <div class="btn-row">
-          ${m.loaded ? `<button class="danger" data-act="unload">Unload</button>`
-                     : `<button class="primary" data-act="load">Load</button>`}
-          <button data-act="edit">Edit</button>
-          ${visionBtn}
-          <button data-act="copy-curl">cURL</button>
-          ${m.loaded ? `
-            <button data-act="save-state">Save State</button>
-            <button data-act="load-state">Load State</button>
-          ` : ''}
-        </div>`;
+        <div class="btn-row">${buildButtonRowHTML(m)}</div>`;
+
       grid.appendChild(card);
     } else {
-      // Config unchanged — update only dynamic stats fields in-place
+      // In-place DOM update without tearing down node
+      const metaEl = card.querySelector('.model-meta');
+      if (metaEl) {
+        metaEl.innerHTML = `${esc(m.id)} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
+      }
+
+      const statusWrap = card.querySelector('.status-wrap');
+      if (statusWrap) {
+        statusWrap.innerHTML = statusBadge(m.loaded, m.ready);
+      }
+
       const statsDiv = card.querySelector('.model-stats');
       if (statsDiv && statsDiv.children.length >= 4) {
         statsDiv.children[0].innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
         statsDiv.children[1].innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
-        statsDiv.children[2].innerHTML = `est:  <b>${m.estimated_vram_mb ? fmtBytes(m.estimated_vram_mb) : '—'}</b>`;
+        statsDiv.children[2].innerHTML = `ctx / max: <b>${m.ctx_size}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
         statsDiv.children[3].innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
       }
-      const metaEl = card.querySelector('.model-meta');
-      if (metaEl) {
-        const id = esc(m.id);
-        metaEl.innerHTML = `${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
-      }
-      const badge = card.querySelector('.status-badge');
-      if (badge) {
-        badge.outerHTML = statusBadge(m.loaded, m.ready);
-      }
-      const btnRow = card.querySelector('.btn-row');
-      if (btnRow) {
-        const visionBtn = m.has_mmproj ? (m.use_mmproj ? '<button class="primary" data-act="toggle-vision">👁 Vision: ON</button>' : '<button data-act="toggle-vision">👁 Vision: OFF</button>') : '';
-        btnRow.innerHTML = `
-          ${m.loaded ? `<button class="danger" data-act="unload">Unload</button>`
-                     : `<button class="primary" data-act="load">Load</button>`}
-          <button data-act="edit">Edit</button>
-          ${visionBtn}
-          <button data-act="copy-curl">cURL</button>
-          ${m.loaded ? `
-            <button data-act="save-state">Save State</button>
-            <button data-act="load-state">Load State</button>
-          ` : ''}
-        `;
-      }
+
+      // Update button row in-place to avoid flickering from innerHTML rebuild
+      updateButtonRow(card, m);
     }
 
-    card._modelRef = m;
-
-    // Wire buttons (works for both new and existing cards)
+    // Attach/update button click listeners (idempotent)
     card.querySelectorAll('button[data-act]').forEach(btn => {
       btn.onclick = () => handleAction(m.id, btn.dataset.act, btn);
     });
@@ -598,7 +705,7 @@ function renderModels() {
 }
 
 function formatUptime(id) {
-  if (!statusCache) return '—';
+  if (!statusCache || !Array.isArray(statusCache.uptime_models)) return '—';
   const m = statusCache.uptime_models.find(x => x.id === id);
   if (!m) return '—';
   const s = m.uptime_s;
@@ -608,25 +715,27 @@ function formatUptime(id) {
 }
 
 async function handleAction(id, act, btn) {
-  btn.disabled = true;
-  const originalText = btn.textContent;
+  inFlightActions.set(id, act);
+  renderModels(); // refresh UI immediately to disable button
+
   try {
     if (act === 'load') {
-      btn.textContent = 'Loading...';
       await apiJSON(`/v1/models/${encodeURIComponent(id)}/load`, {method:'POST'});
-      showToast(`Model ${id} loaded successfully`, 'success');
+      showToast(`Model '${id}' loaded successfully`, 'success');
     }
     if (act === 'unload') {
-      btn.textContent = 'Unloading...';
       await apiJSON(`/v1/models/${encodeURIComponent(id)}/unload`, {method:'POST'});
-      showToast(`Model ${id} unloaded`, 'info');
+      showToast(`Model '${id}' unloaded`, 'info');
     }
     if (act === 'edit') {
       openEditModal(id);
     }
+    if (act === 'states') {
+      openStateModal(id);
+    }
     if (act === 'toggle-vision') {
       const res = await apiJSON(`/v1/models/${encodeURIComponent(id)}/vision/toggle`, {method:'POST'});
-      showToast(`Vision ${res.use_mmproj ? 'enabled' : 'disabled'} for ${id}`, 'info');
+      showToast(`Vision ${res.use_mmproj ? 'enabled' : 'disabled'} for '${id}'`, 'info');
     }
     if (act === 'copy-curl') {
       const host = statusCache ? statusCache.launcher.host : 'localhost';
@@ -635,34 +744,12 @@ async function handleAction(id, act, btn) {
       await navigator.clipboard.writeText(cmd);
       showToast('cURL command copied to clipboard!', 'success');
     }
-    if (act === 'save-state') {
-      const label = prompt('State label:', 'default');
-      if (label) {
-        await apiJSON(`/v1/models/${encodeURIComponent(id)}/state/save`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({label})
-        });
-        showToast(`Saved state '${label}' for ${id}`, 'success');
-      }
-    }
-    if (act === 'load-state') {
-      const states = await apiJSON(`/v1/models/${encodeURIComponent(id)}/state`);
-      const label = prompt('State label (' + (states.labels.join(', ') || 'none') + '):', 'default');
-      if (label) {
-        await apiJSON(`/v1/models/${encodeURIComponent(id)}/state/load`, {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({label})
-        });
-        showToast(`Loaded state '${label}' for ${id}`, 'success');
-      }
-    }
   } catch (e) {
     showToast('Error: ' + e.message, 'error');
   } finally {
-    btn.disabled = false;
-    btn.textContent = originalText;
+    inFlightActions.delete(id);
+    await refreshAll();
   }
-  await refreshAll();
 }
 
 function renderBackendSelectors(st) {
@@ -672,7 +759,6 @@ function renderBackendSelectors(st) {
   const gSel = $('global-backend-select');
   const fSel = $('f-backend');
 
-  const gVal = gSel.value;
   const fVal = fSel.value;
 
   let gHtml = '<option value="">System Default</option>';
@@ -693,7 +779,7 @@ function renderBackendSelectors(st) {
 $('global-backend-select').onchange = async (ev) => {
   const val = ev.target.value;
   try {
-    const r = await apiJSON('/v1/backend/select', {
+    await apiJSON('/v1/backend/select', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({backend: val})
@@ -713,8 +799,20 @@ function openEditModal(id) {
   $('f-desc').value = m.description || '';
   $('f-backend').value = m.backend || '';
   $('f-args').value = m.args || '';
-  $('f-ctx').value = m.ctx_size;
-  $('f-ngl').value = m.n_gpu_layers;
+  $('f-ctx').value = m.ctx_size !== undefined && m.ctx_size !== null ? m.ctx_size : '';
+  const ctxLbl = $('f-ctx-label');
+  if (ctxLbl) {
+    ctxLbl.textContent = m.max_ctx_size ? `ctx_size (max: ${m.max_ctx_size.toLocaleString()})` : 'ctx_size';
+  }
+  const ctxInp = $('f-ctx');
+  if (m.max_ctx_size) {
+    ctxInp.max = m.max_ctx_size;
+    ctxInp.placeholder = `Max ${m.max_ctx_size}`;
+  } else {
+    ctxInp.removeAttribute('max');
+    ctxInp.placeholder = '8192';
+  }
+  $('f-ngl').value = m.n_gpu_layers !== undefined && m.n_gpu_layers !== null ? m.n_gpu_layers : '';
   $('f-vram').value = m.estimated_vram_mb || 0;
   $('f-tags').value = (m.tags||[]).join(', ');
   $('f-mmproj-file').value = m.mmproj_file || '';
@@ -727,14 +825,18 @@ function openEditModal(id) {
 
 $('modal-cancel').onclick = () => $('modal-overlay').classList.remove('active');
 $('modal-save').onclick = async () => {
+  const ctxVal = $('f-ctx').value.trim();
+  const nglVal = $('f-ngl').value.trim();
+  const vramVal = $('f-vram').value.trim();
+
   const body = {
     name: $('f-name').value,
     description: $('f-desc').value,
     backend: $('f-backend').value,
     args: $('f-args').value,
-    ctx_size: parseInt($('f-ctx').value),
-    n_gpu_layers: parseInt($('f-ngl').value),
-    estimated_vram_mb: parseInt($('f-vram').value || '0'),
+    ctx_size: ctxVal ? parseInt(ctxVal, 10) : undefined,
+    n_gpu_layers: nglVal ? parseInt(nglVal, 10) : undefined,
+    estimated_vram_mb: vramVal ? parseInt(vramVal, 10) : 0,
     tags: $('f-tags').value.split(',').map(s=>s.trim()).filter(Boolean),
     mmproj_file: $('f-mmproj-file').value,
     default: $('f-default').checked,
@@ -742,6 +844,18 @@ $('modal-save').onclick = async () => {
     auto_save_state: $('f-autosave').checked,
     use_mmproj: $('f-use-mmproj').checked,
   };
+
+  const currentModel = modelsCache.find(x => x.id === editingId);
+  if (currentModel && currentModel.max_ctx_size && body.ctx_size > currentModel.max_ctx_size) {
+    body.ctx_size = currentModel.max_ctx_size;
+    showToast(`Capped ctx_size to model max (${currentModel.max_ctx_size.toLocaleString()})`, 'info');
+  }
+
+  const btn = $('modal-save');
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Saving...';
+
   try {
     await apiJSON(`/v1/models/${encodeURIComponent(editingId)}/config`, {
       method: 'PUT', headers:{'Content-Type':'application/json'},
@@ -752,8 +866,90 @@ $('modal-save').onclick = async () => {
     await refreshAll();
   } catch (e) {
     showToast('Save failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
   }
 };
+
+// ---------- State Management Modal ----------
+async function openStateModal(id) {
+  stateManagingId = id;
+  $('sm-model-id').textContent = id;
+  $('sm-states-list').innerHTML = '<div class="empty" style="padding:12px;">Loading states…</div>';
+  $('state-overlay').classList.add('active');
+  await refreshStateList();
+}
+
+async function refreshStateList() {
+  if (!stateManagingId) return;
+  try {
+    const res = await apiJSON(`/v1/models/${encodeURIComponent(stateManagingId)}/state`);
+    const labels = res.labels || [];
+    const listEl = $('sm-states-list');
+
+    if (labels.length === 0) {
+      listEl.innerHTML = '<div class="empty" style="padding:12px;">No saved states found for this model.</div>';
+      return;
+    }
+
+    listEl.innerHTML = labels.map(lbl => `
+      <div class="state-item">
+        <span><b>${esc(lbl)}</b></span>
+        <div class="actions">
+          <button class="primary" data-act="restore-state" data-lbl="${esc(lbl)}">Restore</button>
+          <button class="danger" data-act="delete-state" data-lbl="${esc(lbl)}">Delete</button>
+        </div>
+      </div>
+    `).join('');
+
+    listEl.querySelectorAll('button[data-act]').forEach(btn => {
+      btn.onclick = () => handleStateAction(btn.dataset.act, btn.dataset.lbl);
+    });
+  } catch (e) {
+    $('sm-states-list').innerHTML = `<div class="empty" style="padding:12px;color:var(--red);">Failed to load states: ${esc(e.message)}</div>`;
+  }
+}
+
+async function handleStateAction(act, label) {
+  if (!stateManagingId || !label) return;
+  try {
+    if (act === 'restore-state') {
+      await apiJSON(`/v1/models/${encodeURIComponent(stateManagingId)}/state/load`, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({label})
+      });
+      showToast(`Restored state '${label}' for '${stateManagingId}'`, 'success');
+    }
+    if (act === 'delete-state') {
+      if (!confirm(`Delete state '${label}'?`)) return;
+      await apiJSON(`/v1/models/${encodeURIComponent(stateManagingId)}/state/${encodeURIComponent(label)}`, {
+        method: 'DELETE'
+      });
+      showToast(`Deleted state '${label}'`, 'info');
+      await refreshStateList();
+    }
+  } catch (e) {
+    showToast('State action failed: ' + e.message, 'error');
+  }
+}
+
+$('sm-btn-save').onclick = async () => {
+  const label = ($('sm-new-label').value || 'default').trim();
+  if (!stateManagingId || !label) return;
+  try {
+    await apiJSON(`/v1/models/${encodeURIComponent(stateManagingId)}/state/save`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({label})
+    });
+    showToast(`Saved state '${label}' for '${stateManagingId}'`, 'success');
+    await refreshStateList();
+  } catch (e) {
+    showToast('Failed to save state: ' + e.message, 'error');
+  }
+};
+
+$('sm-cancel').onclick = () => $('state-overlay').classList.remove('active');
 
 async function refreshAll() {
   try {
@@ -761,7 +957,6 @@ async function refreshAll() {
       apiJSON('/v1/models'),
       apiJSON('/v1/status'),
     ]);
-    // Use data from list_models directly — no need for individual /v1/models/{id} calls
     modelsCache = (models.data||[]).map(d => ({
       id: d.id,
       name: d.name || d.id,
@@ -803,20 +998,24 @@ $('btn-rescan').onclick = async () => {
   showToast('Rescanned models directory', 'info');
   await refreshAll();
 };
+
 $('btn-unload-all').onclick = async () => {
   if (!confirm('Unload all models?')) return;
   await apiJSON('/v1/unload_all', {method:'POST'});
   showToast('All models unloaded', 'info');
   await refreshAll();
 };
+
 $('filter').oninput = renderModels;
 $('status-filter').onchange = renderModels;
 
 function wsLoop() {
   let ws;
+  let retryDelay = 1000;
   function connect() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
+    ws.onopen = () => { retryDelay = 1000; };
     ws.onmessage = async (ev) => {
       try {
         const st = JSON.parse(ev.data);
@@ -824,7 +1023,7 @@ function wsLoop() {
         renderGPUs(st.gpus);
         renderRAM(st.ram);
         $('loaded-count').textContent = `${st.models_loaded}/${st.models_total}`;
-        // Update live status fields from uptime_models (single-pass, O(n) via Map)
+
         if (Array.isArray(st.uptime_models)) {
           const umMap = new Map(st.uptime_models.map(um => [um.id, um]));
           modelsCache.forEach(m => {
@@ -845,7 +1044,10 @@ function wsLoop() {
         renderModels();
       } catch (e) { console.error('WS update error:', e); }
     };
-    ws.onclose = () => { setTimeout(connect, 2000); };
+    ws.onclose = () => {
+      setTimeout(connect, retryDelay);
+      retryDelay = Math.min(retryDelay * 1.5, 10000);
+    };
     ws.onerror = () => ws.close();
   }
   connect();
@@ -921,9 +1123,8 @@ $('btn-settings').onclick = () => {
 $('settings-cancel').onclick = () => $('settings-overlay').classList.remove('active');
 $('settings-save').onclick = saveSettings;
 
-// Load settings on startup alongside everything else
+// Load settings on startup
 loadSettings();
-
 refreshAll().then(wsLoop);
 </script>
 </body>
