@@ -499,6 +499,10 @@ class ModelManager:
             loaded_snap = dict(self.loaded)
             sizes_snap = dict(self._model_sizes)
             mmproj_snap = dict(self.mmproj_paths)
+
+        # Pre-populate GGUF metadata concurrently for models that haven't been read yet
+        await asyncio.gather(*(self._ensure_gguf_name(mid) for mid, _ in snapshots), return_exceptions=True)
+
         out = []
         for mid, cfg in snapshots:
             loaded = loaded_snap.get(mid)
