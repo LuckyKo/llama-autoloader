@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import struct
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -574,9 +575,98 @@ class TestLoadedModel:
         assert t1 <= lm.last_used <= t2
 
 
-# ---------------------------------------------------------------------------
-# _read_gguf_metadata error handling
-# ---------------------------------------------------------------------------
+def _make_dummy_gguf(name: str | None = None, max_ctx: int | None = None,
+                     ctx_vtype: int = 4) -> bytes:
+    """Build a minimal GGUF header with optional general.name and llama.context_length.
+
+    ctx_vtype selects the value type used for context_length (default 4=UINT32);
+    pass 10=UINT64 or 11=INT64 to exercise the wider integer branches in skip_val.
+    """
+    import struct
+    buf = bytearray(b"GGUF")
+    kvs = 0
+    if name is not None: kvs += 1
+    if max_ctx is not None: kvs += 1
+    buf.extend(struct.pack("<IQQ", 3, 0, kvs))
+
+    if name is not None:
+        key = "general.name".encode('utf-8')
+        val = name.encode('utf-8')
+        buf.extend(struct.pack("<Q", len(key)) + key)
+        buf.extend(struct.pack("<I", 8)) # STRING
+        buf.extend(struct.pack("<Q", len(val)) + val)
+
+    if max_ctx is not None:
+        key = "llama.context_length".encode('utf-8')
+        buf.extend(struct.pack("<Q", len(key)) + key)
+        if ctx_vtype == 4:      # UINT32
+            buf.extend(struct.pack("<I", 4))
+            buf.extend(struct.pack("<I", max_ctx))
+        elif ctx_vtype == 10:   # UINT64
+            buf.extend(struct.pack("<I", 10))
+            buf.extend(struct.pack("<Q", max_ctx))
+        elif ctx_vtype == 11:   # INT64
+            buf.extend(struct.pack("<I", 11))
+            buf.extend(struct.pack("<q", max_ctx))
+        else:
+            raise ValueError(f"unsupported ctx_vtype {ctx_vtype}")
+
+    return bytes(buf)
+
+
+def _make_gguf_with_skips(name: str | None = None, max_ctx: int | None = None,
+                          skip_fields: list | None = None) -> bytes:
+    """Build a GGUF header with optional extra KV fields (to be skipped by the parser)
+    placed before general.name and llama.context_length.
+
+    Each entry in skip_fields is (key, vtype, payload_bytes). This exercises the
+    skip_val path for FLOAT32 (6), BOOL (7) and ARRAY (9) value types.
+    """
+    import struct
+    skip_fields = skip_fields or []
+    buf = bytearray(b"GGUF")
+    kvs = len(skip_fields)
+    if name is not None: kvs += 1
+    if max_ctx is not None: kvs += 1
+    buf.extend(struct.pack("<IQQ", 3, 0, kvs))
+
+    for key, vtype, payload in skip_fields:
+        kb = key.encode('utf-8')
+        buf.extend(struct.pack("<Q", len(kb)) + kb)
+        buf.extend(struct.pack("<I", vtype))
+        buf.extend(payload)
+
+    if name is not None:
+        key = "general.name".encode('utf-8')
+        val = name.encode('utf-8')
+        buf.extend(struct.pack("<Q", len(key)) + key)
+        buf.extend(struct.pack("<I", 8)) # STRING
+        buf.extend(struct.pack("<Q", len(val)) + val)
+
+    if max_ctx is not None:
+        key = "llama.context_length".encode('utf-8')
+        buf.extend(struct.pack("<Q", len(key)) + key)
+        buf.extend(struct.pack("<I", 4)) # UINT32
+        buf.extend(struct.pack("<I", max_ctx))
+
+    return bytes(buf)
+
+
+def _make_gguf_unknown_vtype(unknown_vtype: int = 13) -> bytes:
+    """Build a GGUF header whose first KV value has an unrecognized type code.
+
+    The parser's skip_val should raise on it and the outer handler returns (None, None).
+    """
+    import struct
+    buf = bytearray(b"GGUF")
+    buf.extend(struct.pack("<IQQ", 3, 0, 1))
+    key = "some.unknown".encode('utf-8')
+    buf.extend(struct.pack("<Q", len(key)) + key)
+    buf.extend(struct.pack("<I", unknown_vtype))
+    # A little trailing payload that would be misread if the parser failed to abort.
+    buf.extend(b"\x00" * 16)
+    return bytes(buf)
+
 
 class TestReadGGUFMetadata:
     def test_returns_none_on_missing_file(self):
@@ -593,60 +683,70 @@ class TestReadGGUFMetadata:
         assert name is None
         assert max_ctx is None
 
-    @patch("server.gguf.GGUFReader")
-    def test_handles_missing_name_field(self, mock_reader_cls):
+    def test_handles_missing_name_field(self, tmp_path):
         """When general.name field is missing, name should be None but context_length still read."""
-        mock_reader = MagicMock()
-        mock_reader.get_field.return_value = None  # general.name not present
-
-        # Simulate a context_length field using contents() API
-        mock_field = MagicMock()
-        mock_field.contents.return_value = 4096
-        mock_reader.fields = {"llama.context_length": mock_field}
-
-        mock_reader_cls.return_value = mock_reader
-
-        name, max_ctx = _read_gguf_metadata(Path("test.gguf"))
+        gguf_file = tmp_path / "no_name.gguf"
+        gguf_file.write_bytes(_make_dummy_gguf(name=None, max_ctx=4096))
+        name, max_ctx = _read_gguf_metadata(gguf_file)
         assert name is None
         assert max_ctx == 4096
 
-    @patch("server.gguf.GGUFReader")
-    def test_handles_missing_context_length_field(self, mock_reader_cls):
+    def test_handles_missing_context_length_field(self, tmp_path):
         """When context_length field is missing, max_ctx should be None but name still read."""
-        mock_reader = MagicMock()
-        name_field = MagicMock()
-        name_field.contents.return_value = "Test Model"
-        mock_reader.get_field.return_value = name_field
-        mock_reader.fields = {}  # No context_length fields
-
-        mock_reader_cls.return_value = mock_reader
-
-        name, max_ctx = _read_gguf_metadata(Path("test.gguf"))
+        gguf_file = tmp_path / "no_ctx.gguf"
+        gguf_file.write_bytes(_make_dummy_gguf(name="Test Model", max_ctx=None))
+        name, max_ctx = _read_gguf_metadata(gguf_file)
         assert name == "Test Model"
         assert max_ctx is None
 
-    @patch("server.gguf.GGUFReader")
-    def test_handles_parse_error_in_context_length(self, mock_reader_cls):
-        """When context_length value can't be parsed, should log warning and return None for max_ctx."""
-        mock_reader = MagicMock()
-        name_field = MagicMock()
-        name_field.contents.return_value = "Test Model"
-        mock_reader.get_field.return_value = name_field
+    def test_handles_parse_error_in_context_length(self, tmp_path):
+        """When file has a corrupt header (bad magic/counts), gracefully returns (None, None)."""
+        gguf_file = tmp_path / "bad.gguf"
+        gguf_file.write_bytes(b"GGUF" + b"\xff" * 20)
+        name, max_ctx = _read_gguf_metadata(gguf_file)
+        assert name is None
+        assert max_ctx is None
 
-        # Simulate a field that raises on contents()
-        bad_field = MagicMock()
-        bad_field.contents.side_effect = ValueError("bad data")
-        mock_reader.fields = {"llama.context_length": bad_field}
+    def test_context_length_uint64(self, tmp_path):
+        """context_length stored as UINT64 (vtype 10) is read correctly."""
+        gguf_file = tmp_path / "ctx_u64.gguf"
+        gguf_file.write_bytes(_make_dummy_gguf(name="U64 Model", max_ctx=32768, ctx_vtype=10))
+        name, max_ctx = _read_gguf_metadata(gguf_file)
+        assert name == "U64 Model"
+        assert max_ctx == 32768
 
-        mock_reader_cls.return_value = mock_reader
+    def test_context_length_int64(self, tmp_path):
+        """context_length stored as INT64 (vtype 11) is read correctly."""
+        gguf_file = tmp_path / "ctx_i64.gguf"
+        gguf_file.write_bytes(_make_dummy_gguf(name="I64 Model", max_ctx=65536, ctx_vtype=11))
+        name, max_ctx = _read_gguf_metadata(gguf_file)
+        assert name == "I64 Model"
+        assert max_ctx == 65536
 
-        name, max_ctx = _read_gguf_metadata(Path("test.gguf"))
-        assert name == "Test Model"
+    def test_skips_float32_bool_and_array_fields(self, tmp_path):
+        """Extra KV fields (FLOAT32, BOOL, ARRAY of uint32) before the target fields
+        are skipped correctly, and name + context_length are still read."""
+        skip_fields = [
+            ("some.float", 6, struct.pack("<f", 1.5)),                 # FLOAT32
+            ("some.bool", 7, b"\x01"),                                 # BOOL
+            ("some.arr", 9, struct.pack("<IQ", 4, 3) + struct.pack("<III", 1, 2, 3)),  # ARRAY of uint32
+        ]
+        gguf_file = tmp_path / "skip.gguf"
+        gguf_file.write_bytes(_make_gguf_with_skips(name="Skip Model", max_ctx=4096, skip_fields=skip_fields))
+        name, max_ctx = _read_gguf_metadata(gguf_file)
+        assert name == "Skip Model"
+        assert max_ctx == 4096
+
+    def test_unknown_value_type_returns_none(self, tmp_path):
+        """An unrecognized value type aborts parsing and returns (None, None) gracefully."""
+        gguf_file = tmp_path / "unknown.gguf"
+        gguf_file.write_bytes(_make_gguf_unknown_vtype(unknown_vtype=13))
+        name, max_ctx = _read_gguf_metadata(gguf_file)
+        assert name is None
         assert max_ctx is None
 
     def test_read_gguf_name_delegates_correctly(self):
         """_read_gguf_name should return just the name from _read_gguf_metadata."""
         with patch("server._read_gguf_metadata") as mock_fn:
             mock_fn.return_value = ("Mocked Name", 8192)
-            result = _read_gguf_name(Path("test.gguf"))
-            assert result == "Mocked Name"
+            assert _read_gguf_name(Path("test.gguf")) == "Mocked Name"

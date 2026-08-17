@@ -547,6 +547,7 @@ async function refreshAll() {
       mmproj_file: d.mmproj_file,
       has_mmproj: d.has_mmproj,
       ctx_size: d.ctx_size,
+      max_ctx_size: d.max_ctx_size,
       n_gpu_layers: d.n_gpu_layers,
       estimated_vram_mb: d.estimated_vram_mb,
       args: d.args,

@@ -18,6 +18,7 @@ import os
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import time
 import logging
@@ -37,7 +38,6 @@ from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
-import gguf
 
 # --------------------------------------------------------------------------
 # Logging
@@ -67,36 +67,58 @@ def _safe_float(val: str, default: float = 0.0) -> float:
 
 
 def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
-    """Read (general.name, context_length) from GGUF file metadata.
+    """Read (general.name, context_length) from GGUF file metadata using fast binary stream parsing.
 
-    Uses mmap-based reader that only loads KV header metadata, not tensor data.
-    Should complete in milliseconds even for 20GB+ files.
+    Bypasses np.memmap and tensor allocations, executing in < 1ms per file.
     """
     name = None
     max_ctx = None
     try:
-        reader = gguf.GGUFReader(str(gguf_path))
+        with open(gguf_path, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'GGUF':
+                return None, None
+            ver, tensors, kvs = struct.unpack('<IQQ', f.read(20))
+            if kvs > 1_000_000:
+                return None, None
 
-        # Read general.name
-        name_field = reader.get_field('general.name')
-        if name_field is not None:
-            try:
-                name = str(name_field.contents())
-            except Exception as e:
-                log.warning(f"Failed to read 'general.name' from {gguf_path}: {e}")
+            def read_str():
+                l = struct.unpack('<Q', f.read(8))[0]
+                return f.read(l).decode('utf-8', errors='replace')
 
-        # Read context_length (architecture-specific field like llama.context_length, qwen2.context_length, etc.)
-        for k, f in reader.fields.items():
-            if k.endswith('.context_length'):
-                try:
-                    val = f.contents()
-                    max_ctx = int(val)
+            def skip_val(vtype):
+                if vtype in (0, 1, 7): f.seek(1, 1)
+                elif vtype in (2, 3): f.seek(2, 1)
+                elif vtype in (4, 5, 6): f.seek(4, 1)
+                elif vtype in (10, 11, 12): f.seek(8, 1)
+                elif vtype == 8:
+                    l = struct.unpack('<Q', f.read(8))[0]
+                    f.seek(l, 1)
+                elif vtype == 9:
+                    itype, ilen = struct.unpack('<IQ', f.read(12))
+                    for _ in range(ilen):
+                        skip_val(itype)
+                else:
+                    # Unknown/corrupt value type — can't safely skip; abort parse.
+                    raise ValueError(f"Unknown GGUF value type {vtype}")
+
+            for _ in range(kvs):
+                key = read_str()
+                vtype = struct.unpack('<I', f.read(4))[0]
+                if key == 'general.name' and vtype == 8:
+                    name = read_str()
+                elif key.endswith('.context_length'):
+                    if vtype == 4: max_ctx = struct.unpack('<I', f.read(4))[0]
+                    elif vtype == 10: max_ctx = struct.unpack('<Q', f.read(8))[0]
+                    elif vtype == 5: max_ctx = struct.unpack('<i', f.read(4))[0]
+                    elif vtype == 11: max_ctx = struct.unpack('<q', f.read(8))[0]
+                    else: skip_val(vtype)
+                else:
+                    skip_val(vtype)
+                if name and max_ctx:
                     break
-                except Exception as e:
-                    log.warning(f"Failed to parse '{k}' from {gguf_path}: {e}")
-
     except Exception as e:
-        log.debug(f"Failed to read GGUF metadata from {gguf_path}: {e}")
+        log.debug(f"Fast GGUF header read failed for {gguf_path}: {e}")
     return name, max_ctx
 
 def _read_gguf_name(gguf_path) -> Optional[str]:
@@ -254,8 +276,6 @@ class ModelManager:
         self.loaded: Dict[str, LoadedModel] = {}      # id -> loaded instance
         self._lock = asyncio.Lock()
         self._loading_tasks: Dict[str, asyncio.Task] = {}
-        # Track in-flight GGUF metadata reads to avoid duplicate slow I/O on concurrent calls
-        self._gguf_read_tasks: Dict[str, asyncio.Task] = {}
         self._stop = False
         self._bg_task: Optional[asyncio.Task] = None
         self._model_sizes: Dict[str, float] = {}
@@ -557,46 +577,30 @@ class ModelManager:
             return self.models.get(mid)
 
     async def _ensure_gguf_name(self, mid: str):
-        """Read gguf_name and max_ctx_size from GGUF file lazily, caching the result in config.
-
-        Uses a pending-reads tracker to avoid duplicate slow I/O when multiple callers
-        request metadata for the same model concurrently. The lock is held during the
-        entire read-modify-write of shared state (cfg + _gguf_read_tasks).
-        """
+        """Read gguf_name and max_ctx_size from GGUF file lazily, caching the result in config."""
+        # Fast path: check cache without holding the lock across I/O.
         async with self._lock:
             cfg = self.models.get(mid)
             path = self.gguf_paths.get(mid)
             if not cfg or not path or (cfg.gguf_name and cfg.max_ctx_size is not None):
                 return  # Already cached
 
-            # Check if another task is already reading this file
-            if mid in self._gguf_read_tasks:
-                task = self._gguf_read_tasks[mid]
-            else:
-                task = asyncio.create_task(self._do_gguf_metadata_read(mid, path))
-                self._gguf_read_tasks[mid] = task
+        # Perform the (now-fast) blocking read outside the lock so we don't
+        # serialize other lock users during file I/O.
+        name, max_ctx = await asyncio.to_thread(_read_gguf_metadata, path)
+        if not name and not max_ctx:
+            return
 
-        # Await outside the lock so other callers can proceed
-        await task
-
-    async def _do_gguf_metadata_read(self, mid: str, path: Path):
-        """Internal worker that performs the GGUF metadata read and updates config under lock."""
-        try:
-            name, max_ctx = await asyncio.to_thread(_read_gguf_metadata, path)
-            async with self._lock:
-                cfg = self.models.get(mid)
-                if not cfg:
-                    return
-                if name:
-                    cfg.gguf_name = name
-                    # Default model display name to gguf_name if unedited or defaulted to stem
-                    if not cfg.name or cfg.name == path.stem:
-                        cfg.name = name
-                if max_ctx:
-                    cfg.max_ctx_size = max_ctx
-        finally:
-            async with self._lock:
-                self._gguf_read_tasks.pop(mid, None)
+        async with self._lock:
+            cfg = self.models.get(mid)
+            if not cfg:
+                return
+            if name and not cfg.gguf_name:
+                cfg.gguf_name = name
+                if not cfg.name or cfg.name == path.stem:
+                    cfg.name = name
+            if max_ctx and cfg.max_ctx_size is None:
+                cfg.max_ctx_size = max_ctx
 
     async def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
         mid = await self.resolve_model_id(model_id_or_alias)
