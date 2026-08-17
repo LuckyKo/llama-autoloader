@@ -295,34 +295,41 @@ if __name__ == "__main__":
 
 
 def _can_run_fake_backend() -> bool:
-    """Return True if we can spawn a Python subprocess that binds a port here."""
-    try:
-        # Quick capability probe: spawn the fake on an ephemeral port, hit /health.
-        port = _free_port()
-        proc = subprocess.Popen(
-            [sys.executable, "-c", _FAKE_SERVER_SCRIPT, "--port", str(port)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
+    """Return True if we can spawn a Python subprocess that binds a port here.
+
+    Retries the probe up to 3 times: under full-suite load (many subprocesses
+    spawned in quick succession) the first attempt's one-shot 5s deadline can be
+    exceeded by slow Python startup / port bind, producing a false-negative skip.
+    """
+    import time
+    import urllib.request
+
+    for _attempt in range(3):
         try:
-            import urllib.request
-            deadline = 5.0
-            import time
-            start = time.time()
-            ok = False
-            while time.time() - start < deadline:
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as resp:
-                        if resp.status == 200:
-                            ok = True
-                            break
-                except Exception:
-                    pass
-                time.sleep(0.1)
-            return ok
-        finally:
-            _kill_proc(proc)
-    except Exception:
-        return False
+            # Quick capability probe: spawn the fake on an ephemeral port, hit /health.
+            port = _free_port()
+            proc = subprocess.Popen(
+                [sys.executable, "-c", _FAKE_SERVER_SCRIPT, "--port", str(port)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+            try:
+                deadline = 5.0
+                start = time.time()
+                while time.time() - start < deadline:
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.5) as resp:
+                            if resp.status == 200:
+                                return True
+                    except Exception:
+                        pass
+                    time.sleep(0.1)
+            finally:
+                _kill_proc(proc)
+                # Let the OS release the bound port (Windows TIME_WAIT) before retrying.
+                time.sleep(0.2)
+        except Exception:
+            pass
+    return False
 
 
 def _free_port() -> int:

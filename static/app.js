@@ -5,6 +5,10 @@ let statusCache = null;
 let editingId = null;
 let stateManagingId = null;
 
+// Toast timing (ms)
+const TOAST_MS = 3500;
+const TOAST_FADE_MS = 300;
+
 // Track in-flight async actions per model to prevent WS re-renders from blowing away button state
 const inFlightActions = new Map();
 
@@ -24,8 +28,8 @@ function showToast(msg, type = 'info') {
     toast.style.opacity = '0';
     toast.style.transform = 'translateX(100%)';
     toast.style.transition = 'all 0.3s ease';
-    setTimeout(() => toast.remove(), 300);
-  }, 3500);
+    setTimeout(() => toast.remove(), TOAST_FADE_MS);
+  }, TOAST_MS);
 }
 
 async function api(path, opts={}) {
@@ -87,11 +91,18 @@ function renderRAM(ram) {
   $('ram-total').textContent = fmtBytes(ram.total_mb) + ' total';
 }
 
+function getInFlightState(id) {
+  const act = inFlightActions.get(id);
+  return {
+    act,
+    isLoadInFlight: act === 'load',
+    isUnloadInFlight: act === 'unload',
+    isVisionInFlight: act === 'toggle-vision',
+  };
+}
+
 function buildButtonRowHTML(m) {
-  const act = inFlightActions.get(m.id);
-  const isLoadInFlight = act === 'load';
-  const isUnloadInFlight = act === 'unload';
-  const isVisionInFlight = act === 'toggle-vision';
+  const { act, isLoadInFlight, isUnloadInFlight, isVisionInFlight } = getInFlightState(m.id);
 
   const visionBtn = m.has_mmproj ? (
     m.use_mmproj
@@ -121,33 +132,23 @@ function updateButtonRow(card, m) {
   const btnRow = card.querySelector('.btn-row');
   if (!btnRow) return;
 
-  const act = inFlightActions.get(m.id);
-  const isLoadInFlight = act === 'load';
-  const isUnloadInFlight = act === 'unload';
-  const isVisionInFlight = act === 'toggle-vision';
+  const { act, isLoadInFlight, isUnloadInFlight, isVisionInFlight } = getInFlightState(m.id);
 
-  // Update or toggle load/unload button based on model state
-  let loadBtn = btnRow.querySelector('button[data-act="load"], button[data-act="unload"]');
-  if (!loadBtn) {
-    // Button doesn't exist yet (e.g., loaded state changed), rebuild row once
+  // Structure of the row is determined by load-state (Load vs Unload button) and
+  // whether a Vision button exists. If either changed, rebuild in one shot — this
+  // covers load/unload swaps AND vision-button create/remove cleanly.
+  const currentLoaded = !!btnRow.querySelector('button[data-act="unload"]');
+  const currentHasVision = !!btnRow.querySelector('button[data-act="toggle-vision"]');
+  if (currentLoaded !== !!m.loaded || currentHasVision !== !!m.has_mmproj) {
     btnRow.innerHTML = buildButtonRowHTML(m);
     return;
   }
 
-  if (m.loaded && loadBtn.dataset.act !== 'unload') {
-    // Model is now loaded but we have a "Load" button — swap to Unload
-    loadBtn.dataset.act = 'unload';
-    loadBtn.className = 'danger';
-    loadBtn.textContent = isUnloadInFlight ? 'Unloading...' : 'Unload';
-    loadBtn.disabled = isUnloadInFlight;
-  } else if (!m.loaded && loadBtn.dataset.act !== 'load') {
-    // Model is now unloaded but we have an "Unload" button — swap to Load
-    loadBtn.dataset.act = 'load';
-    loadBtn.className = 'primary';
-    loadBtn.textContent = isLoadInFlight ? 'Loading...' : 'Load';
-    loadBtn.disabled = isLoadInFlight;
-  } else {
-    // Same action type, just update text/disabled state for in-flight
+  // Structure unchanged — fine-grained text/disabled updates only.
+  const loadBtn = m.loaded
+    ? btnRow.querySelector('button[data-act="unload"]')
+    : btnRow.querySelector('button[data-act="load"]');
+  if (loadBtn) {
     if (m.loaded) {
       loadBtn.textContent = isUnloadInFlight ? 'Unloading...' : 'Unload';
       loadBtn.disabled = isUnloadInFlight;
@@ -175,6 +176,15 @@ function updateButtonRow(card, m) {
   if (editBtn) {
     editBtn.disabled = !!act;
   }
+}
+
+function tagsRowHTML(m) {
+  const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
+  return tags
+    + (m.default ? '<span class="tag">default</span>' : '')
+    + (m.pinned ? '<span class="tag">pinned</span>' : '')
+    + (m.auto_save_state ? '<span class="tag">autosave</span>' : '')
+    + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '');
 }
 
 function renderModels() {
@@ -219,15 +229,15 @@ function renderModels() {
     const pm = perModel[m.id] || {};
     let card = existingCards.get(m.id);
 
+    // Extra-args display, computed once and shared by both render paths.
+    const parts = [];
+    if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
+    if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
+    if (m.args) parts.push(m.args);
+    const argsDisplay = parts.join(' ');
+
     if (!card) {
       // Build brand new card element
-      const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
-      const parts = [];
-      if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
-      if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
-      if (m.args) parts.push(m.args);
-      const argsDisplay = parts.join(' ');
-      const visionTag = m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '';
       const name = esc(m.name || m.id);
       const id = esc(m.id);
 
@@ -239,7 +249,7 @@ function renderModels() {
           <div>
             <div class="model-name">${name}</div>
             <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
-            <div style="margin-top:6px;">${tags}${m.default?'<span class="tag">default</span>':''}${m.pinned?'<span class="tag">pinned</span>':''}${m.auto_save_state?'<span class="tag">autosave</span>':''}${visionTag}</div>
+            <div class="tags-row" style="margin-top:6px;">${tagsRowHTML(m)}</div>
           </div>
           <div class="status-wrap">${statusBadge(m.loaded, m.ready)}</div>
         </div>
@@ -247,10 +257,10 @@ function renderModels() {
         <div class="args-box">${esc(argsDisplay) || '(no extra args)'}</div>
 
         <div class="model-stats">
-          <div>VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
-          <div>RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
-          <div>ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b></div>
-          <div>uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
+          <div data-stat="vram">VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
+          <div data-stat="ram">RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
+          <div data-stat="ctx">ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b></div>
+          <div data-stat="uptime">uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
         </div>
 
         <div class="btn-row">${buildButtonRowHTML(m)}</div>`;
@@ -258,9 +268,24 @@ function renderModels() {
       grid.appendChild(card);
     } else {
       // In-place DOM update without tearing down node
+      const nameEl = card.querySelector('.model-name');
+      if (nameEl) {
+        nameEl.textContent = m.name || m.id;
+      }
+
       const metaEl = card.querySelector('.model-meta');
       if (metaEl) {
         metaEl.innerHTML = `${esc(m.id)} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
+      }
+
+      const tagsRow = card.querySelector('.tags-row');
+      if (tagsRow) {
+        tagsRow.innerHTML = tagsRowHTML(m);
+      }
+
+      const argsBox = card.querySelector('.args-box');
+      if (argsBox) {
+        argsBox.textContent = argsDisplay || '(no extra args)';
       }
 
       const statusWrap = card.querySelector('.status-wrap');
@@ -269,11 +294,15 @@ function renderModels() {
       }
 
       const statsDiv = card.querySelector('.model-stats');
-      if (statsDiv && statsDiv.children.length >= 4) {
-        statsDiv.children[0].innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
-        statsDiv.children[1].innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
-        statsDiv.children[2].innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
-        statsDiv.children[3].innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
+      if (statsDiv) {
+        const vramEl = statsDiv.querySelector('[data-stat="vram"]');
+        const ramEl = statsDiv.querySelector('[data-stat="ram"]');
+        const ctxEl = statsDiv.querySelector('[data-stat="ctx"]');
+        const uptimeEl = statsDiv.querySelector('[data-stat="uptime"]');
+        if (vramEl) vramEl.innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
+        if (ramEl) ramEl.innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
+        if (ctxEl) ctxEl.innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
+        if (uptimeEl) uptimeEl.innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
       }
 
       // Update button row in-place to avoid flickering from innerHTML rebuild
@@ -407,7 +436,7 @@ function openEditModal(id) {
   $('modal-overlay').classList.add('active');
 }
 
-$('modal-cancel').onclick = () => $('modal-overlay').classList.remove('active');
+$('modal-cancel').onclick = () => { editingId = null; $('modal-overlay').classList.remove('active'); };
 $('modal-save').onclick = async () => {
   const ctxVal = $('f-ctx').value.trim();
   const nglVal = $('f-ngl').value.trim();
@@ -533,7 +562,7 @@ $('sm-btn-save').onclick = async () => {
   }
 };
 
-$('sm-cancel').onclick = () => $('state-overlay').classList.remove('active');
+$('sm-cancel').onclick = () => { stateManagingId = null; $('state-overlay').classList.remove('active'); };
 
 async function refreshAll() {
   try {
