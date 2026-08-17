@@ -39,13 +39,20 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 
+# Console-log-to-file logging (see logger.py). init_logging() is called in the
+# __main__ block below, BEFORE uvicorn.run(), so uvicorn's dictConfig handlers
+# bind to our capturing stdout/stderr streams and land in the log file.
+from logger import init_logging
+
 # --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+# NOTE: We intentionally do NOT call logging.basicConfig() at module level. The
+# dedicated "autoloader" logger is fully configured by init_logging() (console +
+# rotating file handlers). Keeping basicConfig off here avoids a root-level
+# handler double-printing autoloader lines once stdout is tee'd to the file.
+# Tests that import this module without calling init_logging still get output via
+# Python's default lastResort handler / uvicorn's own logging config.
 
 # Enable uvicorn access logging so all requests are visible in the console
 logging.getLogger("uvicorn.access").setLevel(logging.INFO)
@@ -1725,4 +1732,24 @@ if __name__ == "__main__":
     args = ap.parse_args()
     manager.host = args.host
     manager.port = args.port
-    uvicorn.run(app, host=args.host, port=args.port, reload=False)
+
+    # We pass use_colors=False to uvicorn.run() below so the log file stays free of
+    # ANSI escape codes (uvicorn ignores NO_COLOR and auto-detects TTY).
+
+    # Set up console-log-to-file logging BEFORE uvicorn.run() so that uvicorn's
+    # dictConfig handlers bind to our capturing stdout/stderr streams (see logger.py).
+    _lg = CFG.get("logging", {})
+    if _lg.get("enabled", True):
+        _base = Path(__file__).resolve().parent
+        _ldir = _lg.get("log_dir", "./logs")
+        if not os.path.isabs(_ldir):
+            _ldir = str(_base / _ldir)
+        init_logging(
+            level=getattr(logging, str(_lg.get("level", "INFO")).upper(), logging.INFO),
+            log_dir=_ldir,
+            filename=_lg.get("filename", "console.log"),
+            max_bytes=_safe_int(_lg.get("max_bytes", 10 * 1024 * 1024), 10 * 1024 * 1024),
+            backup_count=_safe_int(_lg.get("backup_count", 5), 5),
+        )
+
+    uvicorn.run(app, host=args.host, port=args.port, reload=False, use_colors=False)

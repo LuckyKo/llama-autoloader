@@ -19,3 +19,10 @@ models:
   max_loaded_models: 1
   root_dir: n:/work/stuff/Beta
   save_state_dir: ./states
+logging:
+  enabled: true
+  level: INFO
+  log_dir: ./logs
+  filename: console.log
+  max_bytes: 10485760
+  backup_count: 5
