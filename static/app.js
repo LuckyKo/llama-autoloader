@@ -75,6 +75,12 @@ function renderGPUs(gpus) {
 }
 
 function renderRAM(ram) {
+  if (!ram) {
+    $('ram-bar').style.width = '0%';
+    $('ram-used').textContent = '—';
+    $('ram-total').textContent = '—';
+    return;
+  }
   const pct = ram.pct;
   $('ram-bar').style.width = pct.toFixed(1) + '%';
   $('ram-used').textContent = fmtBytes(ram.used_mb) + ' used';
@@ -192,7 +198,8 @@ function renderModels() {
   }
 
   if (list.length === 0) {
-    grid.innerHTML = '<div class="empty">No models match your filter.</div>';
+    const hasFilter = filter || statusFilter !== 'all';
+    grid.innerHTML = `<div class="empty">${hasFilter ? 'No models match your filter.' : 'No models found.'}</div>`;
     return;
   }
 
@@ -215,7 +222,11 @@ function renderModels() {
     if (!card) {
       // Build brand new card element
       const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
-      const argsDisplay = `--ctx-size ${m.ctx_size} --n-gpu-layers ${m.n_gpu_layers} ${m.args||''}`.trim();
+      const parts = [];
+      if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
+      if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
+      if (m.args) parts.push(m.args);
+      const argsDisplay = parts.join(' ');
       const visionTag = m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '';
       const name = esc(m.name || m.id);
       const id = esc(m.id);
@@ -238,7 +249,7 @@ function renderModels() {
         <div class="model-stats">
           <div>VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
           <div>RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
-          <div>ctx / max: <b>${m.ctx_size}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b></div>
+          <div>ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b></div>
           <div>uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
         </div>
 
@@ -261,7 +272,7 @@ function renderModels() {
       if (statsDiv && statsDiv.children.length >= 4) {
         statsDiv.children[0].innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
         statsDiv.children[1].innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
-        statsDiv.children[2].innerHTML = `ctx / max: <b>${m.ctx_size}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
+        statsDiv.children[2].innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
         statsDiv.children[3].innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
       }
 
@@ -293,11 +304,11 @@ async function handleAction(id, act, btn) {
   try {
     if (act === 'load') {
       await apiJSON(`/v1/models/${encodeURIComponent(id)}/load`, {method:'POST'});
-      showToast(`Model '${id}' loaded successfully`, 'success');
+      showToast(`Model ${id} loaded successfully`, 'success');
     }
     if (act === 'unload') {
       await apiJSON(`/v1/models/${encodeURIComponent(id)}/unload`, {method:'POST'});
-      showToast(`Model '${id}' unloaded`, 'info');
+      showToast(`Model ${id} unloaded`, 'info');
     }
     if (act === 'edit') {
       openEditModal(id);
@@ -307,7 +318,7 @@ async function handleAction(id, act, btn) {
     }
     if (act === 'toggle-vision') {
       const res = await apiJSON(`/v1/models/${encodeURIComponent(id)}/vision/toggle`, {method:'POST'});
-      showToast(`Vision ${res.use_mmproj ? 'enabled' : 'disabled'} for '${id}'`, 'info');
+      showToast(`Vision ${res.use_mmproj ? 'enabled' : 'disabled'} for ${id}`, 'info');
     }
     if (act === 'copy-curl') {
       const host = statusCache ? statusCache.launcher.host : 'localhost';
@@ -331,8 +342,6 @@ function renderBackendSelectors(st) {
   const gSel = $('global-backend-select');
   const fSel = $('f-backend');
 
-  const fVal = fSel.value;
-
   let gHtml = '<option value="">System Default</option>';
   let fHtml = '<option value="">(Use Global Default)</option>';
 
@@ -342,9 +351,12 @@ function renderBackendSelectors(st) {
   });
 
   gSel.innerHTML = gHtml;
-  fSel.innerHTML = fHtml;
-
   gSel.value = selected;
+
+  // Always rebuild the edit-modal backend select so its options stay fresh
+  // (openEditModal only sets .value on these options and never rebuilds them).
+  const fVal = fSel.value;
+  fSel.innerHTML = fHtml;
   if (fVal) fSel.value = fVal;
 }
 
@@ -491,14 +503,14 @@ async function handleStateAction(act, label) {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({label})
       });
-      showToast(`Restored state '${label}' for '${stateManagingId}'`, 'success');
+      showToast(`Restored state ${label} for ${stateManagingId}`, 'success');
     }
     if (act === 'delete-state') {
       if (!confirm(`Delete state '${label}'?`)) return;
       await apiJSON(`/v1/models/${encodeURIComponent(stateManagingId)}/state/${encodeURIComponent(label)}`, {
         method: 'DELETE'
       });
-      showToast(`Deleted state '${label}'`, 'info');
+      showToast(`Deleted state ${label}`, 'info');
       await refreshStateList();
     }
   } catch (e) {
@@ -514,7 +526,7 @@ $('sm-btn-save').onclick = async () => {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({label})
     });
-    showToast(`Saved state '${label}' for '${stateManagingId}'`, 'success');
+    showToast(`Saved state ${label} for ${stateManagingId}`, 'success');
     await refreshStateList();
   } catch (e) {
     showToast('Failed to save state: ' + e.message, 'error');
@@ -562,21 +574,30 @@ async function refreshAll() {
     renderModels();
   } catch (e) {
     console.error(e);
+    showToast('Refresh failed: ' + e.message, 'error');
   }
 }
 
 $('btn-rescan').onclick = async () => {
-  await apiJSON('/v1/scan', {method:'POST'});
-  modelsCache = [];
-  showToast('Rescanned models directory', 'info');
-  await refreshAll();
+  try {
+    await apiJSON('/v1/scan', {method:'POST'});
+    modelsCache = [];
+    showToast('Rescanned models directory', 'info');
+    await refreshAll();
+  } catch (e) {
+    showToast('Rescan failed: ' + e.message, 'error');
+  }
 };
 
 $('btn-unload-all').onclick = async () => {
   if (!confirm('Unload all models?')) return;
-  await apiJSON('/v1/unload_all', {method:'POST'});
-  showToast('All models unloaded', 'info');
-  await refreshAll();
+  try {
+    await apiJSON('/v1/unload_all', {method:'POST'});
+    showToast('All models unloaded', 'info');
+    await refreshAll();
+  } catch (e) {
+    showToast('Unload all failed: ' + e.message, 'error');
+  }
 };
 
 $('filter').oninput = renderModels;
@@ -630,10 +651,10 @@ function wsLoop() {
 async function loadSettings() {
   try {
     const s = await apiJSON('/v1/settings');
-    $('s-idle').value = s.idle_timeout_seconds;
-    $('s-max-loaded').value = s.max_loaded_models;
-    $('s-poll').value = s.poll_interval_seconds;
-    $('s-base-port').value = s.base_port;
+    $('s-idle').value = s.idle_timeout_seconds ?? '';
+    $('s-max-loaded').value = s.max_loaded_models ?? '';
+    $('s-poll').value = s.poll_interval_seconds ?? '';
+    $('s-base-port').value = s.base_port ?? '';
     $('s-default-args').value = s.default_args || '';
     $('s-selected-backend').value = s.selected_backend || '';
     $('s-auto-save').checked = !!s.auto_save_state;
