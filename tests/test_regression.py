@@ -591,15 +591,36 @@ class TestModelIdResolution:
         gb.write_gguf(mgr.root_dir / "qwen-b.gguf", name="Qwen3.8-27B", max_ctx=8192)
         mgr.scan()
 
-        names = [mgr.models["qwen-a.gguf"].name, mgr.models["qwen-b.gguf"].name]
+        first_names = [mgr.models["qwen-a.gguf"].name, mgr.models["qwen-b.gguf"].name]
         # Names must be unique (case-insensitive) even though gguf_name is shared.
-        assert len({n.lower() for n in names}) == 2
+        assert len({n.lower() for n in first_names}) == 2
         # The first model keeps the clean promoted name; the second is disambiguated.
         assert mgr.models["qwen-a.gguf"].name == "Qwen3.8-27B"
         assert mgr.models["qwen-b.gguf"].name != "Qwen3.8-27B"
+        # A re-scan must be deterministic: identical names, no drift on the second pass.
+        mgr.scan()
+        second_names = [mgr.models["qwen-a.gguf"].name, mgr.models["qwen-b.gguf"].name]
+        assert first_names == second_names
         # Both still carry the shared internal gguf_name (display-only metadata).
         assert mgr.models["qwen-a.gguf"].gguf_name == "Qwen3.8-27B"
         assert mgr.models["qwen-b.gguf"].gguf_name == "Qwen3.8-27B"
+
+    async def test_scan_empty_metadata_name_falls_back_to_bare_stem(self, tmp_path):
+        """A GGUF with NO general.name gets its display name set to the bare filename stem
+        (NOT 'stem (stem)') when no other model uses that stem."""
+        cfg = build_cfg_local(tmp_path)
+        mgr = ModelManager(cfg)
+        # name=None -> write_gguf omits the general.name key entirely.
+        gb.write_gguf(mgr.root_dir / "nameless-a.gguf", name=None, max_ctx=4096)
+        gb.write_gguf(mgr.root_dir / "nameless-b.gguf", name=None, max_ctx=8192)
+        mgr.scan()
+
+        # Each nameless model keeps its bare distinct stem as the display name.
+        assert mgr.models["nameless-a.gguf"].name == "nameless-a"
+        assert mgr.models["nameless-b.gguf"].name == "nameless-b"
+        # No spurious disambiguation suffix was appended to either.
+        assert "(nameless-a)" not in mgr.models["nameless-a.gguf"].name
+        assert "(nameless-b)" not in mgr.models["nameless-b.gguf"].name
 
     async def test_single_model_fallback_still_works(self, tmp_path):
         """The bottom-of-function fallback (single model) is unchanged."""

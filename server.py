@@ -412,10 +412,11 @@ class ModelManager:
                 for o_mid, o_cfg in self.models.items()
             )
 
-        if desired and not collides(desired):
-            return desired
         if not desired:
             desired = stem  # no usable metadata name -> fall back to the filename stem
+
+        if not collides(desired):
+            return desired
 
         candidate = f"{desired} ({stem})"
         i = 2
@@ -667,7 +668,7 @@ class ModelManager:
                     if other_cfg.name and other_cfg.name.lower() == target_name:
                         raise ValueError(
                             f"Model name '{new_cfg.name}' is already used by "
-                            f"'{other_mid}'; names must be unique (they are the retrieval key)."
+                            f"'{other_cfg.name}' (model ID '{other_mid}'); names must be unique (they are the retrieval key)."
                         )
 
         await asyncio.to_thread(new_cfg.save, path)
