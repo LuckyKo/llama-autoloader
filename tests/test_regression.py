@@ -489,3 +489,123 @@ class TestState:
         with pytest.raises(HTTPException) as exc:
             await mgr.delete_state("m.gguf", "missing")
         assert exc.value.status_code == 404
+
+
+# ===========================================================================
+# Model-ID resolution: editable `name` is the retrieval key, gguf_name is NOT an alias
+# ===========================================================================
+
+def _make_resolution_manager(tmp_path):
+    """Two models sharing the SAME GGUF internal name but DIFFERENT display names.
+
+    This reproduces the original collision bug: two quants of the same base model
+    (e.g. "Qwen3.8-27B") read the identical ``general.name`` from their GGUF bytes,
+    so ``gguf_name`` collides while the user-editable ``name`` stays distinct.
+    """
+    cfg = build_cfg_local(tmp_path)
+    mgr = ModelManager(cfg)
+    # Both files embed the same internal name "Qwen3.8-27B" in their GGUF metadata.
+    gb.write_gguf(mgr.root_dir / "qwen-a.gguf", name="Qwen3.8-27B", max_ctx=4096)
+    gb.write_gguf(mgr.root_dir / "qwen-b.gguf", name="Qwen3.8-27B", max_ctx=8192)
+    mgr.scan()
+    # scan() promotes the shared gguf_name to display name; force distinct names so we
+    # exercise resolution by the editable `name` (the retrieval key).
+    mgr.models["qwen-a.gguf"].name = "Qwen A"
+    mgr.models["qwen-b.gguf"].name = "Qwen B"
+    return mgr
+
+
+class TestModelIdResolution:
+    """Locks in the new rule: resolution is by filename/stem or editable `name`,
+    and the shared internal gguf_name must NOT act as a request alias."""
+
+    async def test_resolve_by_editable_name_is_distinct(self, tmp_path):
+        mgr = _make_resolution_manager(tmp_path)
+        # Both models genuinely share the same gguf_name (the collision precondition).
+        assert mgr.models["qwen-a.gguf"].gguf_name == "Qwen3.8-27B"
+        assert mgr.models["qwen-b.gguf"].gguf_name == "Qwen3.8-27B"
+
+        # Requesting each by its editable `name` resolves to the CORRECT distinct model.
+        assert await mgr.resolve_model_id("Qwen A") == "qwen-a.gguf"
+        assert await mgr.resolve_model_id("Qwen B") == "qwen-b.gguf"
+
+    async def test_resolve_by_filename_still_works(self, tmp_path):
+        mgr = _make_resolution_manager(tmp_path)
+        # Exact filename (registry key).
+        assert await mgr.resolve_model_id("qwen-a.gguf") == "qwen-a.gguf"
+        assert await mgr.resolve_model_id("qwen-b.gguf") == "qwen-b.gguf"
+        # Stem / full-id fallback.
+        assert await mgr.resolve_model_id("qwen-a") == "qwen-a.gguf"
+        assert await mgr.resolve_model_id("QWEN-B.GGUF") == "qwen-b.gguf"
+
+    async def test_gguf_name_is_not_a_request_alias(self, tmp_path):
+        """Regression: the shared internal gguf_name must NOT resolve a request.
+
+        With two models sharing gguf_name="Qwen3.8-27B", requesting that string used to
+        silently pick one of them (cross-model collision). It must now fall through to
+        the fallback logic (no loaded/default model -> None), never to a specific model.
+        """
+        mgr = _make_resolution_manager(tmp_path)
+        assert await mgr.resolve_model_id("Qwen3.8-27B") is None
+
+    async def test_name_resolution_case_insensitive(self, tmp_path):
+        mgr = _make_resolution_manager(tmp_path)
+        assert await mgr.resolve_model_id("qwen a") == "qwen-a.gguf"
+        assert await mgr.resolve_model_id("QWEN B") == "qwen-b.gguf"
+
+    async def test_update_config_rejects_duplicate_name(self, tmp_path):
+        """Setting a `name` that duplicates another model's `name` must be rejected."""
+        mgr = _make_resolution_manager(tmp_path)
+        new_cfg = ModelConfig(name="Qwen B")  # already used by qwen-b.gguf
+        with pytest.raises(ValueError, match="already used"):
+            await mgr.update_config("qwen-a.gguf", new_cfg)
+
+    async def test_update_config_rejects_duplicate_name_case_insensitive(self, tmp_path):
+        mgr = _make_resolution_manager(tmp_path)
+        new_cfg = ModelConfig(name="qwen b")  # case-insensitive duplicate of "Qwen B"
+        with pytest.raises(ValueError, match="already used"):
+            await mgr.update_config("qwen-a.gguf", new_cfg)
+
+    async def test_update_config_allows_unique_name(self, tmp_path):
+        """The normal (non-colliding) case must still work and persist the new name."""
+        mgr = _make_resolution_manager(tmp_path)
+        new_cfg = ModelConfig(name="Qwen A Renamed")
+        result = await mgr.update_config("qwen-a.gguf", new_cfg)
+        assert result.name == "Qwen A Renamed"
+        assert mgr.models["qwen-a.gguf"].name == "Qwen A Renamed"
+        # And it is now resolvable by the new name.
+        assert await mgr.resolve_model_id("Qwen A Renamed") == "qwen-a.gguf"
+
+    async def test_update_config_allows_renaming_to_self(self, tmp_path):
+        """Re-saving a model's own current name is not a collision (only OTHER models)."""
+        mgr = _make_resolution_manager(tmp_path)
+        new_cfg = ModelConfig(name="Qwen A")  # same as its own current name
+        result = await mgr.update_config("qwen-a.gguf", new_cfg)
+        assert result.name == "Qwen A"
+
+    async def test_scan_disambiguates_colliding_promoted_names(self, tmp_path):
+        """When scan promotes a shared gguf_name to display name, names stay unique."""
+        cfg = build_cfg_local(tmp_path)
+        mgr = ModelManager(cfg)
+        gb.write_gguf(mgr.root_dir / "qwen-a.gguf", name="Qwen3.8-27B", max_ctx=4096)
+        gb.write_gguf(mgr.root_dir / "qwen-b.gguf", name="Qwen3.8-27B", max_ctx=8192)
+        mgr.scan()
+
+        names = [mgr.models["qwen-a.gguf"].name, mgr.models["qwen-b.gguf"].name]
+        # Names must be unique (case-insensitive) even though gguf_name is shared.
+        assert len({n.lower() for n in names}) == 2
+        # The first model keeps the clean promoted name; the second is disambiguated.
+        assert mgr.models["qwen-a.gguf"].name == "Qwen3.8-27B"
+        assert mgr.models["qwen-b.gguf"].name != "Qwen3.8-27B"
+        # Both still carry the shared internal gguf_name (display-only metadata).
+        assert mgr.models["qwen-a.gguf"].gguf_name == "Qwen3.8-27B"
+        assert mgr.models["qwen-b.gguf"].gguf_name == "Qwen3.8-27B"
+
+    async def test_single_model_fallback_still_works(self, tmp_path):
+        """The bottom-of-function fallback (single model) is unchanged."""
+        cfg = build_cfg_local(tmp_path)
+        mgr = ModelManager(cfg)
+        gb.write_gguf(mgr.root_dir / "only.gguf", name="Solo", max_ctx=4096)
+        mgr.scan()
+        # Unmatched request with exactly one registered model -> that model.
+        assert await mgr.resolve_model_id("does-not-exist") == "only.gguf"

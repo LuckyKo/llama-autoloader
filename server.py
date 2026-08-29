@@ -397,6 +397,38 @@ class ModelManager:
         return self.binary
 
     # ---------------- model discovery & resolution ----------------
+    def _unique_display_name(self, desired: str, owner_mid: str, stem: str) -> str:
+        """Return ``desired`` if it is unique (case-insensitive) among registered models.
+
+        Because the editable ``name`` is the retrieval key, two models must never share
+        one. When a collision is detected we disambiguate deterministically by appending
+        the owner's filename stem (then a short numeric suffix if still needed), so names
+        stay unique and re-scans are stable. Logs a warning whenever we disambiguate.
+        """
+        def collides(name: str) -> bool:
+            n = name.lower()
+            return any(
+                o_mid != owner_mid and o_cfg.name and o_cfg.name.lower() == n
+                for o_mid, o_cfg in self.models.items()
+            )
+
+        if desired and not collides(desired):
+            return desired
+        if not desired:
+            desired = stem  # no usable metadata name -> fall back to the filename stem
+
+        candidate = f"{desired} ({stem})"
+        i = 2
+        while collides(candidate):
+            candidate = f"{desired} ({stem}-{i})"
+            i += 1
+        if candidate != desired:
+            log.warning(
+                f"Model name '{desired}' already in use; disambiguating to '{candidate}' "
+                f"for {owner_mid} (names must be unique as retrieval keys)."
+            )
+        return candidate
+
     def scan(self) -> List[str]:
         """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
         all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
@@ -488,7 +520,10 @@ class ModelManager:
                 if name and not cfg.gguf_name:
                     cfg.gguf_name = name
                     if not cfg.name or cfg.name == path.stem:
-                        cfg.name = name
+                        # Promote the GGUF internal name to display name, but keep it
+                        # unique (it is the retrieval key). Two quants of the same base
+                        # model share the same gguf_name, so disambiguate on collision.
+                        cfg.name = self._unique_display_name(name, mid, path.stem)
                 if max_ctx:
                     cfg.max_ctx_size = max_ctx
             except Exception as e:
@@ -505,11 +540,14 @@ class ModelManager:
                 target_lower = model_id_or_alias.lower()
                 for mid, cfg in self.models.items():
                     stem = Path(mid).stem.lower()
+                    # Order: exact filename -> stem/full id -> editable display name.
+                    # gguf_name is intentionally NOT a request alias here: it is the
+                    # GGUF's internal general.name, shared across quants of the same
+                    # base model, so using it would let one model silently resolve to
+                    # another (cross-model collision). It stays display-only metadata.
                     if target_lower == stem or target_lower == mid.lower():
                         return mid
                     if cfg.name and target_lower == cfg.name.lower():
-                        return mid
-                    if cfg.gguf_name and target_lower == cfg.gguf_name.lower():
                         return mid
 
             # Fallback resolution (for generic model names, missing model param, or unmatched aliases)
@@ -605,7 +643,9 @@ class ModelManager:
             if name and not cfg.gguf_name:
                 cfg.gguf_name = name
                 if not cfg.name or cfg.name == path.stem:
-                    cfg.name = name
+                    # Keep the promoted display name unique (retrieval key). Same
+                    # rationale as the scan path above.
+                    cfg.name = self._unique_display_name(name, mid, path.stem)
             if max_ctx and cfg.max_ctx_size is None:
                 cfg.max_ctx_size = max_ctx
 
@@ -617,6 +657,18 @@ class ModelManager:
             if mid not in self.models:
                 raise KeyError(model_id_or_alias)
             path = self.gguf_paths[mid]
+            # Uniqueness guard: `name` is now the retrieval key, so it must stay
+            # unique (case-insensitive). Reject a name already used by ANOTHER model.
+            if new_cfg.name:
+                target_name = new_cfg.name.lower()
+                for other_mid, other_cfg in self.models.items():
+                    if other_mid == mid:
+                        continue
+                    if other_cfg.name and other_cfg.name.lower() == target_name:
+                        raise ValueError(
+                            f"Model name '{new_cfg.name}' is already used by "
+                            f"'{other_mid}'; names must be unique (they are the retrieval key)."
+                        )
 
         await asyncio.to_thread(new_cfg.save, path)
         async with self._lock:
@@ -985,9 +1037,20 @@ class ModelManager:
                    if k.lower() not in ("host", "content-length", "accept-encoding")}
         req_method = request.method
 
-        # Streaming?
+        # Parse body and normalize assistant reasoning content if needed
         try:
             parsed = json.loads(body) if body else {}
+            if isinstance(parsed, dict) and "messages" in parsed and isinstance(parsed["messages"], list):
+                modified = False
+                for msg in parsed["messages"]:
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        reasoning = msg.get("reasoning_content") or ""
+                        content = msg.get("content") or ""
+                        if reasoning and not content.startswith("<think>"):
+                            msg["content"] = f"<think>\n{reasoning}\n</think>\n\n{content}"
+                            modified = True
+                if modified:
+                    body = json.dumps(parsed).encode("utf-8")
         except Exception:
             parsed = {}
         stream = parsed.get("stream", False) if isinstance(parsed, dict) else False
