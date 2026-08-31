@@ -434,7 +434,7 @@ class ModelManager:
         """Return all .gguf files under root_dir whose name contains 'mmproj' (case-insensitive), sorted for determinism."""
         return sorted(p for p in self.root_dir.rglob("*.gguf") if "mmproj" in p.name.lower())
 
-    def _pair_mmproj(self, mid: str, p: Path, cfg: "ModelConfig", mmproj_paths: List[Path]) -> Optional[Path]:
+    def _pair_mmproj(self, p: Path, cfg: "ModelConfig", mmproj_paths: List[Path]) -> Optional[Path]:
         """Resolve the vision (mmproj) module for a single model.
 
         Single source of truth for the pairing rules; shared by scan() and
@@ -471,9 +471,9 @@ class ModelManager:
                 best_score = -1
                 for mp in sibling_mmprojs:
                     mp_stem = mp.stem.lower()
-                    common_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
-                    if common_len > best_score:
-                        best_score = common_len
+                    common_prefix_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
+                    if common_prefix_len > best_score:
+                        best_score = common_prefix_len
                         best_match = mp
                 paired_mmproj = best_match
 
@@ -487,10 +487,11 @@ class ModelManager:
         """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
         all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
         model_paths = []
-        mmproj_paths = [p for p in all_ggufs if "mmproj" in p.name.lower()]
-
+        mmproj_paths = []
         for p in all_ggufs:
-            if "mmproj" not in p.name.lower():
+            if "mmproj" in p.name.lower():
+                mmproj_paths.append(p)
+            else:
                 model_paths.append(p)
 
         found = {}
@@ -509,7 +510,7 @@ class ModelManager:
         # Auto-pair mmproj files with sibling models
         for mid, p in self.gguf_paths.items():
             cfg = found[mid]
-            paired_mmproj = self._pair_mmproj(mid, p, cfg, mmproj_paths)
+            paired_mmproj = self._pair_mmproj(p, cfg, mmproj_paths)
             if paired_mmproj:
                 self.mmproj_paths[mid] = paired_mmproj
                 if not cfg.mmproj_file:
@@ -687,7 +688,7 @@ class ModelManager:
         # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
         # mmproj_file is written to the sidecar (matches scan() behavior).
         mmprojs = self._list_mmproj_files()
-        paired = self._pair_mmproj(mid, path, new_cfg, mmprojs)
+        paired = self._pair_mmproj(path, new_cfg, mmprojs)
         if paired is not None and not new_cfg.mmproj_file:
             new_cfg.mmproj_file = paired.name
 
