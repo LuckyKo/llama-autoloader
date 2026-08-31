@@ -430,16 +430,67 @@ class ModelManager:
             )
         return candidate
 
+    def _list_mmproj_files(self) -> List[Path]:
+        """Return all .gguf files under root_dir whose name contains 'mmproj' (case-insensitive), sorted for determinism."""
+        return sorted(p for p in self.root_dir.rglob("*.gguf") if "mmproj" in p.name.lower())
+
+    def _pair_mmproj(self, mid: str, p: Path, cfg: "ModelConfig", mmproj_paths: List[Path]) -> Optional[Path]:
+        """Resolve the vision (mmproj) module for a single model.
+
+        Single source of truth for the pairing rules; shared by scan() and
+        update_config(). Returns the resolved Path or None. Does NOT mutate
+        self.mmproj_paths or cfg — callers apply the mutation so both behave
+        identically to today.
+        """
+        paired_mmproj = None
+
+        # 1. Check explicit mmproj_file setting
+        if cfg.mmproj_file:
+            candidate = Path(cfg.mmproj_file)
+            if candidate.exists() and candidate.is_file():
+                paired_mmproj = candidate
+            else:
+                # Fall back to filename-only lookup in model dir and root dir
+                mmproj_name = candidate.name
+                target_p = p.parent / mmproj_name
+                if target_p.exists() and target_p.is_file():
+                    paired_mmproj = target_p
+                else:
+                    target_p2 = self.root_dir / mmproj_name
+                    if target_p2.exists() and target_p2.is_file():
+                        paired_mmproj = target_p2
+
+        # 2. Look for sibling mmproj files in the same directory
+        if not paired_mmproj:
+            sibling_mmprojs = [mp for mp in mmproj_paths if mp.parent == p.parent]
+            if len(sibling_mmprojs) == 1:
+                paired_mmproj = sibling_mmprojs[0]
+            elif len(sibling_mmprojs) > 1:
+                p_stem = p.stem.lower()
+                best_match = None
+                best_score = -1
+                for mp in sibling_mmprojs:
+                    mp_stem = mp.stem.lower()
+                    common_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
+                    if common_len > best_score:
+                        best_score = common_len
+                        best_match = mp
+                paired_mmproj = best_match
+
+        # 3. Fallback: single mmproj in root_dir
+        if not paired_mmproj and len(mmproj_paths) == 1:
+            paired_mmproj = mmproj_paths[0]
+
+        return paired_mmproj
+
     def scan(self) -> List[str]:
         """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
         all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
         model_paths = []
-        mmproj_paths = []
+        mmproj_paths = [p for p in all_ggufs if "mmproj" in p.name.lower()]
 
         for p in all_ggufs:
-            if "mmproj" in p.name.lower():
-                mmproj_paths.append(p)
-            else:
+            if "mmproj" not in p.name.lower():
                 model_paths.append(p)
 
         found = {}
@@ -458,45 +509,7 @@ class ModelManager:
         # Auto-pair mmproj files with sibling models
         for mid, p in self.gguf_paths.items():
             cfg = found[mid]
-            paired_mmproj = None
-
-            # 1. Check explicit mmproj_file setting
-            if cfg.mmproj_file:
-                candidate = Path(cfg.mmproj_file)
-                if candidate.exists() and candidate.is_file():
-                    paired_mmproj = candidate
-                else:
-                    # Fall back to filename-only lookup in model dir and root dir
-                    mmproj_name = candidate.name
-                    target_p = p.parent / mmproj_name
-                    if target_p.exists() and target_p.is_file():
-                        paired_mmproj = target_p
-                    else:
-                        target_p2 = self.root_dir / mmproj_name
-                        if target_p2.exists() and target_p2.is_file():
-                            paired_mmproj = target_p2
-
-            # 2. Look for sibling mmproj files in the same directory
-            if not paired_mmproj:
-                sibling_mmprojs = [mp for mp in mmproj_paths if mp.parent == p.parent]
-                if len(sibling_mmprojs) == 1:
-                    paired_mmproj = sibling_mmprojs[0]
-                elif len(sibling_mmprojs) > 1:
-                    p_stem = p.stem.lower()
-                    best_match = None
-                    best_score = -1
-                    for mp in sibling_mmprojs:
-                        mp_stem = mp.stem.lower()
-                        common_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
-                        if common_len > best_score:
-                            best_score = common_len
-                            best_match = mp
-                    paired_mmproj = best_match
-
-            # 3. Fallback: single mmproj in root_dir
-            if not paired_mmproj and len(mmproj_paths) == 1:
-                paired_mmproj = mmproj_paths[0]
-
+            paired_mmproj = self._pair_mmproj(mid, p, cfg, mmproj_paths)
             if paired_mmproj:
                 self.mmproj_paths[mid] = paired_mmproj
                 if not cfg.mmproj_file:
@@ -671,11 +684,24 @@ class ModelManager:
                             f"'{other_cfg.name}' (model ID '{other_mid}'); names must be unique (they are the retrieval key)."
                         )
 
+        # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
+        # mmproj_file is written to the sidecar (matches scan() behavior).
+        mmprojs = self._list_mmproj_files()
+        paired = self._pair_mmproj(mid, path, new_cfg, mmprojs)
+        if paired is not None and not new_cfg.mmproj_file:
+            new_cfg.mmproj_file = paired.name
+
         await asyncio.to_thread(new_cfg.save, path)
         async with self._lock:
             self.models[mid] = new_cfg
             if mid in self.loaded:
                 self.loaded[mid].config = new_cfg
+            # Sync the mmproj pairing computed above so --mmproj is correct at launch.
+            if paired is not None:
+                self.mmproj_paths[mid] = paired
+            else:
+                # Stale/cleared: drop any previous pairing so --mmproj is dropped at launch.
+                self.mmproj_paths.pop(mid, None)
         return new_cfg
 
     # ---------------- sanitization ----------------

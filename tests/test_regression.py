@@ -16,6 +16,7 @@ Covers (plan §3):
 from __future__ import annotations
 
 import asyncio
+import json
 import struct
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -630,3 +631,159 @@ class TestModelIdResolution:
         mgr.scan()
         # Unmatched request with exactly one registered model -> that model.
         assert await mgr.resolve_model_id("does-not-exist") == "only.gguf"
+
+
+# ===========================================================================
+# mmproj pairing: explicit full path set via update_config must be loaded at launch
+# ===========================================================================
+
+def _make_mmproj_manager(tmp_path):
+    """One model gguf in the root dir and an mmproj in a SEPARATE subdirectory.
+
+    The target mmproj is deliberately NOT a sibling of the model (it lives in its
+    own subdir), and a decoy mmproj sits in a SECOND subdir so that:
+      - rule 2 (sibling match) finds no mmproj in the model's own dir, and
+      - rule 3 (single-mmproj-in-root fallback) does not fire (two mmprojs total).
+    This isolates the explicit-full-path resolution path from every auto-pairing
+    shortcut.
+    """
+    cfg = build_cfg_local(tmp_path)
+    mgr = ModelManager(cfg)
+    model_p = mgr.root_dir / "vision-model.gguf"
+    gb.write_gguf(model_p, name="VisionModel", max_ctx=4096)
+    # Target mmproj in its own subdir -> not a sibling of the model.
+    sub = mgr.root_dir / "projectors"
+    sub.mkdir(parents=True, exist_ok=True)
+    mmproj_p = sub / "vision-model-mmproj.gguf"
+    gb.write_gguf(mmproj_p, name="ClipProj", max_ctx=None)
+    # Decoy mmproj in a separate subdir -> keeps len(mmproj_paths) > 1 so rule 3 skips.
+    decoy_sub = mgr.root_dir / "other"
+    decoy_sub.mkdir(parents=True, exist_ok=True)
+    decoy_p = decoy_sub / "decoy-mmproj.gguf"
+    gb.write_gguf(decoy_p, name="DecoyProj", max_ctx=None)
+    mgr.scan()
+    return mgr, "vision-model.gguf", model_p, mmproj_p
+
+
+class TestMmprojPairingUpdateConfig:
+    """Regression: an explicitly-set vision (mmproj) full path must be loaded at launch.
+
+    update_config() previously persisted the new sidecar but never re-ran the
+    mmproj pairing, so self.mmproj_paths[mid] stayed empty and --mmproj was
+    silently dropped from the launch args.
+    """
+
+    async def test_explicit_full_path_paired_and_in_launch_args(self, tmp_path):
+        mgr, mid, model_p, mmproj_p = _make_mmproj_manager(tmp_path)
+        # Precondition: scan() did NOT auto-pair (mmproj is not a sibling).
+        assert mid not in mgr.mmproj_paths
+
+        new_cfg = ModelConfig(name="VisionModel", use_mmproj=True,
+                              mmproj_file=str(mmproj_p))
+        await mgr.update_config(mid, new_cfg)
+
+        # The dict entry must resolve to the EXACT explicit file.
+        assert Path(mgr.mmproj_paths[mid]) == mmproj_p
+
+        # And the resulting launch args include --mmproj pointing at it.
+        argv = new_cfg.to_launch_args(
+            model_p, 9001, mgr.default_args,
+            mmproj_full_path=mgr.mmproj_paths.get(mid),
+        )
+        assert "--mmproj" in argv
+        assert str(mmproj_p) in argv
+
+    async def test_nonexistent_mmproj_path_drops_pairing(self, tmp_path):
+        mgr, mid, model_p, _ = _make_mmproj_manager(tmp_path)
+        # First establish a valid pairing, then clear it to a bad path.
+        good_cfg = ModelConfig(name="VisionModel", use_mmproj=True,
+                               mmproj_file=str(mgr.root_dir / "projectors" / "vision-model-mmproj.gguf"))
+        await mgr.update_config(mid, good_cfg)
+        assert mid in mgr.mmproj_paths
+
+        # Now point at a non-existent path with no sibling fallback available.
+        bad_cfg = ModelConfig(name="VisionModel", use_mmproj=True,
+                              mmproj_file=str(mgr.root_dir / "does-not-exist-mmproj.gguf"))
+        await mgr.update_config(mid, bad_cfg)
+
+        # Stale entry removed; launch args must NOT contain --mmproj.
+        assert mid not in mgr.mmproj_paths
+        argv = bad_cfg.to_launch_args(
+            model_p, 9001, mgr.default_args,
+            mmproj_full_path=mgr.mmproj_paths.get(mid),
+        )
+        assert "--mmproj" not in argv
+
+    async def test_scan_still_auto_pairs_single_sibling(self, tmp_path):
+        """Guards the _pair_mmproj refactor: scan() auto-pairs a single sibling."""
+        cfg = build_cfg_local(tmp_path)
+        mgr = ModelManager(cfg)
+        gb.write_gguf(mgr.root_dir / "sib-model.gguf", name="SibModel", max_ctx=4096)
+        mmproj_p = mgr.root_dir / "sib-model-mmproj.gguf"
+        gb.write_gguf(mmproj_p, name="SibProj", max_ctx=None)
+        mgr.scan()
+
+        # Single sibling mmproj is auto-paired and recorded in the config.
+        assert Path(mgr.mmproj_paths["sib-model.gguf"]) == mmproj_p
+        assert mgr.models["sib-model.gguf"].mmproj_file == "sib-model-mmproj.gguf"
+
+    async def test_filename_only_fallback_via_update_config(self, tmp_path):
+        """A bare filename in mmproj_file resolves via the model-dir/root fallback.
+
+        The target mmproj lives in a subdir (NOT a sibling), but its basename is
+        resolvable because we also place a copy at the root; update_config must pair
+        it and include --mmproj in the launch args.
+        """
+        mgr, mid, model_p, _ = _make_mmproj_manager(tmp_path)
+        # Precondition: scan() did NOT auto-pair (no sibling, two mmprojs total).
+        assert mid not in mgr.mmproj_paths
+
+        # Place a resolvable copy of the target at the root so the filename-only
+        # fallback (root lookup) can find it.
+        root_mmproj = mgr.root_dir / "vision-model-mmproj.gguf"
+        gb.write_gguf(root_mmproj, name="ClipProj", max_ctx=None)
+
+        # Set mmproj_file to JUST a filename (no directory component).
+        new_cfg = ModelConfig(name="VisionModel", use_mmproj=True,
+                              mmproj_file="vision-model-mmproj.gguf")
+        await mgr.update_config(mid, new_cfg)
+
+        # Paired via the root fallback and recorded in the dict.
+        assert Path(mgr.mmproj_paths[mid]) == root_mmproj
+
+        argv = new_cfg.to_launch_args(
+            model_p, 9001, mgr.default_args,
+            mmproj_full_path=mgr.mmproj_paths.get(mid),
+        )
+        assert "--mmproj" in argv
+        assert str(root_mmproj) in argv
+
+    async def test_auto_fill_persisted_to_sidecar(self, tmp_path):
+        """An auto-paired (empty) mmproj_file must be written to the sidecar.
+
+        Start from a model scan() did NOT auto-pair, call update_config with
+        mmproj_file left empty but where a valid pairing still resolves (via the
+        filename fallback against a root copy of the target), then RELOAD the
+        sidecar JSON and assert the saved value reflects the paired name — proving
+        save() ran AFTER the fill.
+        """
+        mgr, mid, model_p, _ = _make_mmproj_manager(tmp_path)
+        # Precondition: scan() did NOT auto-pair (no sibling; two mmprojs total).
+        assert mid not in mgr.mmproj_paths
+
+        sidecar = model_p.with_suffix(model_p.suffix + ".json")
+
+        # Provide a resolvable copy of the target at the root so an EMPTY mmproj_file
+        # still resolves through _pair_mmproj's filename fallback (root lookup).
+        root_mmproj = mgr.root_dir / "vision-model-mmproj.gguf"
+        gb.write_gguf(root_mmproj, name="ClipProj", max_ctx=None)
+
+        # Leave mmproj_file empty; update_config must auto-fill it from the pairing.
+        empty_cfg = ModelConfig(name="VisionModel", use_mmproj=True, mmproj_file="")
+        await mgr.update_config(mid, empty_cfg)
+
+        # The in-memory config was auto-filled BEFORE save().
+        assert empty_cfg.mmproj_file == "vision-model-mmproj.gguf"
+        # And the sidecar on disk now reflects the paired value (save ran after fill).
+        data = json.loads(sidecar.read_text())
+        assert data["mmproj_file"] == "vision-model-mmproj.gguf"
