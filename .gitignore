@@ -35,6 +35,8 @@ backends/README.md
 *~
 .DS_Store
 Thumbs.db
+# Personal multi-root VS Code workspace (machine-specific paths)
+*.code-workspace
 
 # Environment variables
 .env
@@ -46,6 +48,7 @@ Thumbs.db
 WindowsPowerShell/
 
 # Temporary files
+temp/
 *.tmp
 *.temp
 *.bak
@@ -53,6 +56,10 @@ WindowsPowerShell/
 
 # Log files
 *.log
+logs/
+
+# Personal ops tooling (machine-specific)
+restart.bat
 
 # States
 states/
