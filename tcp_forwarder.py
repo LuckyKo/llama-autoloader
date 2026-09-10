@@ -351,8 +351,15 @@ class RawTCPForwarder:
         # main loop — it CANNOT be acquired from this worker thread. Dict reads are atomic
         # under the GIL, so a plain read is safe here (matches how list_models snapshots).
         lm = self.model_manager.loaded.get(resolved_mid)
-        port = lm.port if (lm and lm.ready) else None
-        return port
+        if not (lm and lm.ready):
+            return None
+
+        # A piped request IS active usage of this model. Update last_used so the idle
+        # reaper does not unload a model that is still being served through the fast
+        # raw-TCP path. touch() only writes a float (atomic under the GIL), so it is
+        # safe to call from this worker thread without the manager's asyncio lock.
+        lm.touch()
+        return lm.port
 
     def _jit_load_and_wait(self, model_id: str) -> Optional[int]:
         """Trigger a JIT load of ``model_id`` and block until it is ready. Returns the

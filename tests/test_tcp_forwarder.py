@@ -7,7 +7,10 @@ constraints: do NOT run live tests).
 """
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
+import time
 from pathlib import Path
 
 # Ensure repo root is importable regardless of cwd (matches tests/conftest.py approach).
@@ -189,3 +192,104 @@ class TestReadMoreForModel:
         result = f._read_more_for_model(_FakeSock([body, b"EXTRA-TRAILING"]), headers, b"")
         assert len(result) <= len(body)
         assert f._extract_model(result) == "m1"
+
+
+# --------------------------------------------------------------------------- _resolve_target_port
+class _FakeLM:
+    """Minimal LoadedModel stand-in exposing only what _resolve_target_port reads."""
+
+    def __init__(self, port=9001, ready=True):
+        self.port = port
+        self.ready = ready
+        self.last_used = 0.0
+        self.touch_count = 0
+
+    def touch(self):
+        self.last_used = 1.0  # any change is enough to prove it was called
+        self.touch_count += 1
+
+
+class _FakeManager:
+    """Stands in for the model manager used by _resolve_target_port."""
+
+    def __init__(self, loaded, resolved_mid="qwen3"):
+        self.loaded = loaded
+        self._resolved = resolved_mid
+
+    async def resolve_model_id(self, model_id):
+        return self._resolved
+
+
+class TestResolveTargetPort:
+    """Regression: a piped request for an already-loaded model must refresh last_used.
+
+    Without this the idle reaper unloads a model that is still actively being served
+    through the raw-TCP fast path (the "recently used but idle-unloaded" bug).
+    """
+
+    def test_ready_model_returns_port_and_touches(self):
+        # _resolve_target_port schedules resolve_model_id onto the manager's main loop and
+        # blocks until it returns. In production this runs on a worker thread, so we must
+        # NOT call it from within that same loop (it would deadlock). We therefore run a
+        # dedicated event loop in a background thread and invoke the method from THIS
+        # thread — mirroring the real cross-thread usage.
+        lm = _FakeLM(port=9042, ready=True)
+        mgr = _FakeManager(loaded={"qwen3": lm})
+        f = RawTCPForwarder(listen_port=19999, internal_api_port=19998, model_manager=mgr)
+
+        loop_holder = {}
+
+        def _run_loop():
+            loop = asyncio.new_event_loop()
+            loop_holder["loop"] = loop
+            mgr._main_loop = loop  # what _resolve_target_port falls back to in worker threads
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=_run_loop, daemon=True)
+        t.start()
+        while "loop" not in loop_holder:  # wait for the loop to be up
+            time.sleep(0.01)
+
+        try:
+            port = f._resolve_target_port("qwen3")
+        finally:
+            loop_holder["loop"].call_soon_threadsafe(loop_holder["loop"].stop)
+            t.join(timeout=5)
+
+        assert port == 9042
+        assert lm.touch_count == 1
+
+    def test_not_ready_returns_none_and_does_not_touch(self):
+        lm = _FakeLM(port=9042, ready=False)
+        mgr = _FakeManager(loaded={"qwen3": lm})
+        f = RawTCPForwarder(listen_port=19999, internal_api_port=19998, model_manager=mgr)
+
+        loop_holder = {}
+
+        def _run_loop():
+            loop = asyncio.new_event_loop()
+            loop_holder["loop"] = loop
+            mgr._main_loop = loop
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=_run_loop, daemon=True)
+        t.start()
+        while "loop" not in loop_holder:
+            time.sleep(0.01)
+        try:
+            assert f._resolve_target_port("qwen3") is None
+        finally:
+            loop_holder["loop"].call_soon_threadsafe(loop_holder["loop"].stop)
+            t.join(timeout=5)
+        assert lm.touch_count == 0
+
+    def test_unknown_model_returns_none(self):
+        mgr = _FakeManager(loaded={}, resolved_mid=None)
+        f = RawTCPForwarder(listen_port=19999, internal_api_port=19998, model_manager=mgr)
+        assert f._resolve_target_port("nope") is None
