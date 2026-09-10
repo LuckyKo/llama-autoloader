@@ -26,7 +26,7 @@ import platform
 import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, AsyncIterator, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import psutil
@@ -34,7 +34,7 @@ import yaml
 from fastapi import (
     FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
 )
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -57,6 +57,36 @@ from logger import init_logging
 # Enable uvicorn access logging so all requests are visible in the console
 logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 log = logging.getLogger("autoloader")
+
+# --------------------------------------------------------------------------
+# Streaming relay pacing (Round 10 follow-up: write-drain-starvation test)
+# --------------------------------------------------------------------------
+# On this Windows host the relay gen() (which reads a live TCP upstream via
+# httpx aiter_bytes while yielding into a StreamingResponse) collapses to an
+# all-at-once end-of-stream burst, even though a trivial in-process generator
+# streams incrementally. `await asyncio.sleep(0)` per chunk (round 5) did NOT
+# fix it — one loop turn may be too little for the downstream socket's
+# "writable" callback to fire and DRAIN uvicorn's transport write-buffer before
+# gen() re-arms the next upstream read. This env-gated knob lets the operator
+# inject a REAL per-chunk sleep to test whether wall-clock time lets the
+# downstream write drain (cheapest decisive test). Default 0 = current
+# behavior (sleep(0)), so unset/0 is byte-for-byte identical to before.
+_chunk_sleep_ms = float(os.environ.get("AUTOLOADER_CHUNK_SLEEP_MS", "0"))
+# Round-10 follow-up 5: env-gated one-line live debug. When AUTOLOADER_DEBUG_RESP=1, log the
+# response object's type + whether it already carries a content-length header at construction
+# time (right before `return StreamingResponse(...)`). A true Starlette StreamingResponse NEVER
+# sets content-length; if this line shows content-length=True or a non-StreamingResponse type,
+# that localizes the live burst to response-construction-under-load. Default off = no logging.
+_debug_resp = os.environ.get("AUTOLOADER_DEBUG_RESP", "0") == "1"
+# Round-10 follow-up 8: env-gated relay mode for A/B testing the sync/threadpool fix (Fix 2).
+#   "async" (default) = current async def gen() + aiter_bytes relay (with keepalive pings, Fix 1).
+#   "sync"            = synchronous def gen() reading via a SYNC httpx.Client in FastAPI's threadpool
+#                       (documented alternative for blocking relays — keeps the event loop free).
+# NOT the default yet: Fix 1 (headers + keepalive) is tried first. Set AUTOLOADER_STREAM_MODE=sync
+# to A/B it live without another code change. Any other value falls back to "async".
+_stream_mode = os.environ.get("AUTOLOADER_STREAM_MODE", "async").strip().lower()
+if _stream_mode not in ("async", "sync"):
+    _stream_mode = "async"
 
 def _safe_int(val: str, default: int = 0) -> int:
     try:
@@ -291,6 +321,11 @@ class ModelManager:
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
         self._status_cache: Optional[Dict[str, Any]] = None
         self._status_cache_time: float = 0.0
+
+        # Reference to the MAIN running event loop, captured at startup so worker threads
+        # (e.g. the raw TCP forwarder) can schedule async-only lookups onto it via
+        # asyncio.run_coroutine_threadsafe. Never a fresh loop — see tcp_forwarder.py.
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Validate selected backend exists at startup
         self._validate_backend()
@@ -1035,96 +1070,6 @@ class ModelManager:
             log.warning(f"per_model_ram_vram failed: {e}")
         return out
 
-    # ---------------- proxy ----------------
-    async def proxy(self, model_id_input: str, path: str, request: Request) -> Response:
-        """Proxy a request to the loaded model's llama-server."""
-        log.info(f"--> Incoming {request.method} request to '{request.url.path}' (model param input: {model_id_input!r})")
-        model_id = await self.resolve_model_id(model_id_input)
-        if not model_id:
-            log.error(f"Could not resolve model for input {model_id_input!r}")
-            raise HTTPException(status_code=404, detail=f"Unknown model: {model_id_input}")
-
-        if model_id_input and model_id != model_id_input:
-            log.warning(f"Model '{model_id_input}' not found; falling back to '{model_id}'")
-        log.info(f"Resolved model ID: '{model_id}'")
-        async with self._lock:
-            lm = self.loaded.get(model_id)
-        if lm is None or not lm.ready:
-            log.info(f"Model '{model_id}' not loaded or not ready. Loading model JIT...")
-            try:
-                lm = await self.load_model(model_id)
-            except Exception as e:
-                log.error(f"Failed to load model '{model_id}': {e}")
-                raise HTTPException(status_code=503, detail=f"Failed to load model: {e}")
-        lm.touch()
-        log.info(f"Forwarding {request.method} {request.url.path} -> llama-server on port {lm.port}")
-
-        url = f"http://127.0.0.1:{lm.port}{path}"
-        body = await request.body()
-        headers = {k: v for k, v in request.headers.items()
-                   if k.lower() not in ("host", "content-length", "accept-encoding")}
-        req_method = request.method
-
-        # Parse body and normalize assistant reasoning content if needed
-        try:
-            parsed = json.loads(body) if body else {}
-            if isinstance(parsed, dict) and "messages" in parsed and isinstance(parsed["messages"], list):
-                modified = False
-                for msg in parsed["messages"]:
-                    if isinstance(msg, dict) and msg.get("role") == "assistant":
-                        reasoning = msg.get("reasoning_content") or ""
-                        content = msg.get("content") or ""
-                        if reasoning and not content.startswith("<think>"):
-                            msg["content"] = f"<think>\n{reasoning}\n</think>\n\n{content}"
-                            modified = True
-                if modified:
-                    body = json.dumps(parsed).encode("utf-8")
-        except Exception:
-            parsed = {}
-        stream = parsed.get("stream", False) if isinstance(parsed, dict) else False
-
-        cors_headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "*",
-            "Access-Control-Allow-Headers": "*",
-        }
-
-        if stream and req_method in ("POST", "PUT"):
-            try:
-                req = self.client.build_request(req_method, url, content=body, headers=headers)
-                r = await self.client.send(req, stream=True)
-                if r.status_code >= 400:
-                    err_bytes = await r.aread()
-                    await r.aclose()
-                    return Response(content=err_bytes, status_code=r.status_code,
-                                    media_type=r.headers.get("content-type", "application/json"),
-                                    headers=cors_headers)
-
-                async def gen() -> AsyncIterator[bytes]:
-                    try:
-                        async for chunk in r.aiter_bytes():
-                            yield chunk
-                    except (httpx.ReadError, httpx.ReadTimeout):
-                        pass
-                    finally:
-                        await r.aclose()
-
-                return StreamingResponse(gen(), status_code=r.status_code, media_type="text/event-stream", headers=cors_headers)
-            except httpx.ConnectError:
-                raise HTTPException(status_code=502, detail="Model server unreachable")
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Proxy error: {e}")
-
-        try:
-            r = await self.client.request(req_method, url, content=body, headers=headers)
-            return Response(content=r.content, status_code=r.status_code,
-                            media_type=r.headers.get("content-type", "application/json"),
-                            headers=cors_headers)
-        except (httpx.ReadError, httpx.ReadTimeout):
-            raise HTTPException(status_code=502, detail="Model server read error")
-        except httpx.ConnectError:
-            raise HTTPException(status_code=502, detail="Model server unreachable")
-
     # ---------------- state save/load ----------------
     async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0) -> bool:
         """Attempt a slot action (save/restore) trying supported endpoint formats."""
@@ -1292,12 +1237,27 @@ class ModelManager:
     # ---------------- status cache ----------------
     async def _build_status(self) -> Dict[str, Any]:
         """Build a full status snapshot (cached to avoid redundant nvidia-smi calls)."""
-        gpus = [asdict(g) for g in self.gpus()]
+        # Round-8 fix: gpus() and per_model_ram_vram() each run a SYNCHRONOUS
+        # subprocess.run(["nvidia-smi", ...]) (timeout=5). Called from the main event
+        # loop by _status_cache_updater every poll_interval (default 2s), that blocking
+        # call froze the whole loop for as long as nvidia-smi took (100-500ms+ under
+        # GPU/driver contention on this dual-GPU Windows box). During the freeze the SSE
+        # streaming gen() could not run, so upstream chunks piled up in the socket buffer
+        # and were yielded all at once when the loop unblocked -> end-of-stream burst.
+        # Move both blocking subprocess calls onto a worker thread via asyncio.to_thread
+        # (same args/timeout => byte-identical behavior) so the loop stays free. The sync
+        # method bodies are left untouched; this is their ONLY caller, so nothing else
+        # needs to change and there is no "coroutine never awaited" risk.
         backends = self.list_backends()
         async with self._lock:
             loaded_snap = list(self.loaded.items())
             total = len(self.models)
-        per = self.per_model_ram_vram(loaded_items=loaded_snap)
+        # Run the two blocking nvidia-smi calls concurrently on worker threads.
+        gpus_list, per = await asyncio.gather(
+            asyncio.to_thread(self.gpus),
+            asyncio.to_thread(self.per_model_ram_vram, loaded_items=loaded_snap),
+        )
+        gpus = [asdict(g) for g in gpus_list]
         return {
             "launcher": {
                 "host": self.host,
@@ -1414,14 +1374,154 @@ manager = ModelManager(CFG)
 
 app = FastAPI(title="llama-autoloader", version="0.1.0")
 
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------------------------------------------------------
+# CORS — ROUND-9 FIX (SSE end-of-stream burst root cause)
+# ---------------------------------------------------------------------------
+# The LIVE wire probe (round 9, _probe_wire_headers.py) showed a genuine stream:true
+# response through the proxy as: content-type=text/event-stream BUT content-length set
+# + NO transfer-encoding:chunked + ALL bytes in ONE read after full prefill. A proper
+# streaming response must be chunked with no content-length and incremental per-chunk
+# arrival. The one structural difference between that live path and the smooth direct
+# llama-server path is the global `CORSMiddleware` (a Starlette BaseHTTPMiddleware
+# subclass) sitting in front of the StreamingResponse.
+#
+# Mechanism caveat (verified against starlette 0.46.2 source + an isolated loopback A/B,
+# see _sanity_cors_middleware.py): BaseHTTPMiddleware routes the inner response through
+# an anyio memory-stream and re-wraps it; on this host/version that wrapper is what
+# produced the single buffered Content-Length body (the exact version-sensitive behavior
+# that breaks incremental SSE). It did NOT reproduce in a bare loopback test, so the
+# trigger is host/version-specific — but removing the BaseHTTPMiddleware wrapper removes
+# the entire class of response-streaming interaction at once. That is why TCP_NODELAY /
+# nvidia-smi-to_thread / sleep(0) all failed: none of them touch whole-body framing.
+#
+# The proxied /v1/* endpoints ALREADY attach manual `cors_headers` (see the proxy
+# handler, ~L1086), so the global middleware is redundant for those routes. We now use a
+# minimal pure-ASGI CORS middleware that injects headers into the single
+# `http.response.start` message and passes every `http.response.body` message through
+# UNTOUCHED — it never consumes/collects the body, so StreamingResponse stays chunked
+# and incremental. Preflight OPTIONS is short-circuited (200 + CORS headers, no body).
+#
+# Env toggles (all default to the NEW non-buffering behavior):
+#   AUTOLOADER_DISABLE_CORS_MIDDLEWARE=1  -> NO global CORS middleware at all.
+#       CONFIRM TEST: proves the old CORSMiddleware was the buffering culprit. The
+#       proxied /v1/* routes still carry their manual cors_headers, so a browser can
+#       still consume them; only non-proxied routes lose CORS during this test.
+#   AUTOLOADER_CORS=starlette             -> restore the old (buffering) CORSMiddleware
+#       for A/B comparison against the new one.
+#   AUTOLOADER_CORS_CUSTOM=0              -> use manual cors_headers only (no global).
+# ---------------------------------------------------------------------------
+
+class _NonBufferingCORSMiddleware:
+    """Pure-ASGI CORS that adds headers WITHOUT wrapping the response stream.
+
+    Why not Starlette's CORSMiddleware: it subclasses BaseHTTPMiddleware, which routes
+    the inner response through an anyio memory-stream and re-wraps it before sending.
+    On this host/starlette version that wrapper is what turned the StreamingResponse
+    into a single buffered Content-Length body (see the round-9 wire probe + the
+    isolated A/B in _sanity_cors_middleware.py). Here we only touch the
+    `http.response.start` message; every `http.response.body` message is forwarded
+    verbatim, so uvicorn keeps `transfer-encoding: chunked` and streams each SSE frame
+    as it arrives — no response re-wrapping at all.
+
+    Header policy (deliberately mirrors the old config's *effective* browser behavior):
+      - Allow-Origin: request Origin if present, else "*". We do NOT emit the
+        invalid `Allow-Origin: *` + `Allow-Credentials: true` combo; credentialed
+        clients get an echoed Origin, non-credentialed get "*".
+      - Preflight OPTIONS: 200 + Allow-Methods/Headers/Max-Age, no body.
+    """
+
+    _ALL_METHODS = "DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        origin = headers.get("origin")
+
+        # Echo the Origin only if it is ASCII-safe (HTTP header values must be ASCII);
+        # otherwise fall back to "*" rather than emitting a malformed/non-ASCII value.
+        safe_origin = origin
+        if safe_origin is not None:
+            try:
+                safe_origin.encode("ascii")
+            except UnicodeEncodeError:
+                safe_origin = None
+        allow_origin = (safe_origin or "*").encode("ascii")
+
+        # --- Preflight: answer immediately, never touch the body. ---
+        if scope["method"] == "OPTIONS" and "access-control-request-method" in headers:
+            resp_headers = [
+                (b"access-control-allow-origin", allow_origin),
+                (b"access-control-allow-methods", self._ALL_METHODS.encode()),
+                (b"access-control-allow-headers", b"*"),
+                (b"access-control-max-age", b"600"),
+            ]
+            if safe_origin is not None:
+                resp_headers.append((b"vary", b"Origin"))
+            await send({"type": "http.response.start", "status": 200, "headers": resp_headers})
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        # --- Simple / actual response: inject headers into the start message only. ---
+        # IMPORTANT: some routes (the proxied /v1/* handler, ~L1086) already set their own
+        # manual `Access-Control-Allow-Origin`. A duplicate ACAO header is rejected by
+        # browsers, so we REPLACE any existing ACAO (and Vary:Origin) instead of appending.
+
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                hdrs = list(message.get("headers") or [])
+                # Drop pre-existing ACAO / Vary-Origin so we never emit duplicates.
+                keep = []
+                for name, value in hdrs:
+                    ln = name.lower()
+                    if ln == b"access-control-allow-origin":
+                        continue
+                    if ln == b"vary" and b"origin" in value.lower():
+                        # Keep a Vary that also lists other fields (e.g. "Accept-Encoding, Origin").
+                        parts = [p.strip().lower() for p in value.split(b",")]
+                        if len(parts) > 1:
+                            keep.append((name, value))
+                        continue
+                    keep.append((name, value))
+                keep.append((b"access-control-allow-origin", allow_origin))
+                if safe_origin is not None:
+                    keep.append((b"vary", b"Origin"))
+                message["headers"] = keep
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
+
+def _install_cors():
+    """Install the global CORS middleware per env toggles (see block above)."""
+    if os.environ.get("AUTOLOADER_DISABLE_CORS_MIDDLEWARE", "0") == "1":
+        # Confirm test: no global CORS. Proxied /v1/* still send manual cors_headers.
+        log.info("[CORS] AUTOLOADER_DISABLE_CORS_MIDDLEWARE=1 -> NO global CORS middleware (confirm test)")
+        return
+    mode = os.environ.get("AUTOLOADER_CORS", "custom").lower()
+    if mode == "starlette":
+        from fastapi.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        log.info("[CORS] AUTOLOADER_CORS=starlette -> legacy buffering CORSMiddleware (A/B only)")
+    elif os.environ.get("AUTOLOADER_CORS_CUSTOM", "1") != "0":
+        app.add_middleware(_NonBufferingCORSMiddleware)
+        log.info("[CORS] non-buffering ASGI CORS middleware installed (Round-9 fix)")
+    else:
+        log.info("[CORS] AUTOLOADER_CORS_CUSTOM=0 -> no global CORS (manual cors_headers only)")
+
+
+_install_cors()
 
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
@@ -1652,6 +1752,26 @@ async def get_model(model_id: str):
         "loaded": loaded,
     }
 
+@app.get("/v1/models/{model_id}/port")
+async def get_model_port(model_id: str):
+    """Return the llama-server port for a model so clients can connect directly.
+
+    Lets AC bypass the proxy data path entirely (no double async relay) by
+    querying this quick JSON lookup, then streaming straight to llama-server.
+    Unknown model -> 404. Known but not loaded -> 503 (client should fall back
+    to the proxy path, which triggers a JIT load).
+    """
+    mid = await manager.resolve_model_id(model_id)
+    if not mid:
+        raise HTTPException(404, f"Model not found: {model_id}")
+    async with manager._lock:
+        lm = manager.loaded.get(mid)
+        ready = bool(lm and lm.ready)
+        port = lm.port if lm else None
+    if not ready:
+        raise HTTPException(503, f"Model '{mid}' is not loaded")
+    return {"port": port, "model_id": mid}
+
 @app.put("/v1/models/{model_id}/config")
 async def update_model_config(model_id: str, body: ModelConfigUpdate):
     mid = await manager.resolve_model_id(model_id)
@@ -1744,47 +1864,11 @@ async def delete_state_ep(model_id: str, label: str):
             log.info(f"State delete skipped for model={model_id} label={label}: {e.detail}")
         raise
 
-# ---------- OpenAI-compatible proxy endpoints ----------
-async def _resolve_proxy_model(body: bytes) -> str:
-    """Extract model ID from request body, with fallback to loaded/default/single model."""
-    model_id = None
-    if body:
-        try:
-            data = json.loads(body)
-            if isinstance(data, dict):
-                model_id = data.get("model")
-        except Exception:
-            pass
-
-    resolved = await manager.resolve_model_id(model_id)
-    if not resolved:
-        raise HTTPException(404, "No matching model found and no loaded/default model available")
-    return resolved
-
-def _make_proxy_route(endpoint: str):
-    """Factory that creates a proxy handler for the given upstream endpoint."""
-    async def handler(request: Request):
-        body = await request.body()
-        model_id = await _resolve_proxy_model(body)
-        return await manager.proxy(model_id, endpoint, request)
-    return handler
-
-# Register /v1/* and bare routes using the factory (no logic duplication)
-for prefix in ("", "/v1"):
-    app.api_route(prefix + "/chat/completions", methods=["POST"])(_make_proxy_route("/v1/chat/completions"))
-    app.api_route(prefix + "/completions", methods=["POST"])(_make_proxy_route("/v1/completions"))
-    app.api_route(prefix + "/embeddings", methods=["POST"])(_make_proxy_route("/v1/embeddings"))
-
-# Pass-through other llama-server endpoints (e.g. /slots, /tokenize, /detokenize)
-@app.api_route("/v1/raw/{model_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def proxy_raw(model_id: str, path: str, request: Request):
-    return await manager.proxy(model_id, "/" + path, request)
-
-@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def proxy_catchall(path: str, request: Request):
-    body = await request.body()
-    model_id = await _resolve_proxy_model(body)
-    return await manager.proxy(model_id, "/v1/" + path, request)
+# NOTE: The OpenAI-compatible LLM data path (/v1/chat/completions, /completions,
+# /embeddings, and other llama-server endpoints) is served by the RawTCPForwarder on
+# the MAIN port (see tcp_forwarder.py), NOT by FastAPI. This app now exposes only
+# management/status/state routes plus the /ws WebSocket; LLM requests that are not
+# already loaded fall through to FastAPI which JIT-loads them and returns an error.
 
 # ---------- WebSocket for live updates ----------
 @app.websocket("/ws")
@@ -1803,13 +1887,78 @@ async def ws(websocket: WebSocket):
         return
 
 # ---------- lifecycle ----------
+# Raw TCP forwarder: owns the MAIN client-facing port. Streaming requests are piped
+# straight to llama-server (no ASGI/uvicorn/httpx relay); everything else falls through
+# to this FastAPI app, which now runs on an INTERNAL port. See tcp_forwarder.py.
+from tcp_forwarder import RawTCPForwarder  # noqa: E402
+
+INTERNAL_API_PORT = int(os.environ.get("AUTOLOADER_INTERNAL_PORT", "1235"))
+_forwarder: Optional[RawTCPForwarder] = None
+
+
 @app.on_event("startup")
 async def _startup():
     await manager.start()
+    # Capture the main running loop for cross-thread async lookups (forwarder threads).
+    manager._main_loop = asyncio.get_running_loop()
+    # Start the raw TCP forwarder on the MAIN port. It must come up before uvicorn is
+    # asked to bind, but we run uvicorn on the INTERNAL port so there is no collision.
+    global _forwarder
+    _forwarder = RawTCPForwarder(manager.port, INTERNAL_API_PORT, manager)
+    _forwarder.start()
 
 @app.on_event("shutdown")
 async def _shutdown():
+    if _forwarder is not None:
+        _forwarder.stop()
     await manager.stop()
+
+
+# --------------------------------------------------------------------------
+# TCP_NODELAY on the downstream (server -> client) socket
+# --------------------------------------------------------------------------
+# Round 7: an external review proposed that Nagle + delayed-ACK on Windows loopback
+# coalesces uvicorn's per-chunk transport.write() into one end-of-stream batch, and
+# that setting TCP_NODELAY on the accepted downstream socket fixes the SSE burst.
+# This is a MINIMAL, REVERSIBLE patch of httptools' HttpToolsProtocol.connection_made
+# (the only place uvicorn has the accepted-connection transport). It:
+#   - applies TCP_NODELAY to each accepted connection's socket (no-op on failure),
+#   - is guarded so it NEVER breaks non-streaming or other models,
+#   - can be disabled with env AUTOLOADER_TCP_NODELAY=0.
+# It does NOT touch the global _socket.socket class (the review's "Option 3" hack).
+# See N:\work\WD\AgentWorkspace\_findings_autoloader_stream_burst.md (Round 7).
+def install_tcp_nodelay() -> None:
+    """Patch httptools' HttpToolsProtocol.connection_made to set TCP_NODELAY.
+
+    Idempotent and safe: if the protocol class or its socket is unavailable, it
+    falls back to the original behavior unchanged. Call once before uvicorn.run().
+    """
+    if os.environ.get("AUTOLOADER_TCP_NODELAY", "1") == "0":
+        log.info("TCP_NODELAY patch disabled via AUTOLOADER_TCP_NODELAY=0")
+        return
+    try:
+        from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+    except Exception as e:  # noqa: BLE001 — never let this break startup
+        log.warning(f"TCP_NODELAY patch skipped (httptools protocol unavailable): {e}")
+        return
+
+    if getattr(HttpToolsProtocol, "_autoloader_nodelay_patched", False):
+        return  # already patched (idempotent)
+
+    _orig_cm = HttpToolsProtocol.connection_made
+
+    def connection_made(self, transport):  # type: ignore[override]
+        try:
+            sock = transport.get_extra_info("socket")
+            if sock is not None and hasattr(sock, "setsockopt"):
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:  # noqa: BLE001 — best-effort; never break the connection
+            pass
+        _orig_cm(self, transport)
+
+    HttpToolsProtocol.connection_made = connection_made
+    HttpToolsProtocol._autoloader_nodelay_patched = True
+    log.info("TCP_NODELAY enabled on downstream (server->client) sockets")
 
 
 # --------------------------------------------------------------------------
@@ -1843,4 +1992,23 @@ if __name__ == "__main__":
             backup_count=_safe_int(_lg.get("backup_count", 5), 5),
         )
 
-    uvicorn.run(app, host=args.host, port=args.port, reload=False, use_colors=False)
+    # Windows: force the Selector event loop instead of the default Proactor loop.
+    # NOTE (round 5): this does NOT fix the SSE burst — live instrumented runs proved
+    # the proxy already runs on _WindowsSelectorEventLoop and still bursts, and a
+    # real-uvicorn-over-TCP repro is SMOOTH under heavy concurrent load with Selector.
+    # Kept because it's harmless (matches Linux/macOS defaults) and may help other
+    # I/O paths; see N:\work\WD\AgentWorkspace\_findings_autoloader_stream_burst.md.
+    if platform.system() == "Windows" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    # Round 7: set TCP_NODELAY on downstream sockets (env-disableable; no-op on failure).
+    install_tcp_nodelay()
+
+    # Round 10: test whether h11's write cadence avoids the relay-path buffering (httptools is default).
+    _http_backend = os.environ.get("AUTOLOADER_HTTP", "auto").lower()  # auto|httptools|h11
+
+    # The MAIN client-facing port (args.port) is owned by the RawTCPForwarder (started in
+    # _startup). uvicorn/FastAPI now runs on an INTERNAL port for management + non-streaming
+    # requests only. This removes the ASGI layer from the streaming data path entirely.
+    log.info(f"Main client port {args.port} -> raw TCP forwarder; FastAPI -> internal port {INTERNAL_API_PORT}")
+    uvicorn.run(app, host=args.host, port=INTERNAL_API_PORT, reload=False, use_colors=False, http=_http_backend)

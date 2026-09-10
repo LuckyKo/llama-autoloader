@@ -1,0 +1,30 @@
+# Isolated debug config for the autoloader. Launch from the REPO ROOT so the relative
+# paths (./backends, ./logs, ./states) resolve correctly:
+#   set AUTOLOADER_CONFIG=tests/config_debug.yaml && set AUTOLOADER_INTERNAL_PORT=1296 && python server.py
+# Uses offset ports (main 9126 / internal 1296 / llama-server base 9141) so it never
+# collides with the live loader (9124/1235) or LM Studio (1234). Safe for side-by-side debugging.
+gpu:
+  poll_interval_seconds: 300   # suppress nvidia-smi polling during debug (same as live)
+launcher:
+  base_port: 9141             # offset from live (9001+) so debug llama-server ports don't collide
+  host: 127.0.0.1
+  port: 9126                  # debug main port (live=9124, LM Studio=1234)
+llama_server:
+  backends_dir: ./backends
+  binary: llama-server
+  default_args: --no-webui --parallel 1 --jinja --cache-ram 16384 --kv-unified
+  default_n_gpu_layers: 999
+  selected_backend: llama.cpp-win-x86_64-nvidia-cuda12-avx2-0.3.0-custom-2
+logging:
+  backup_count: 5
+  enabled: true
+  filename: console_debug.log
+  level: INFO
+  log_dir: ./logs
+  max_bytes: 10485760
+models:
+  auto_save_state: false
+  idle_timeout_seconds: 3600
+  max_loaded_models: 1
+  root_dir: n:/work/stuff/Beta
+  save_state_dir: ./states
