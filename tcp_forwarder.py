@@ -71,6 +71,10 @@ _CORS_HEADERS = (
 # could hang). Cleared before the pipe phase; the AC fast path always carries a Content-Length.
 _READ_PHASE_TIMEOUT = 5.0
 
+# Sentinel label passed to _pipe_to_backend to mark the LLM->llama-server fast path (vs
+# "fastapi" for management traffic). The CORS-injection gate keys off this value.
+_LLAMA_SERVER_LABEL = "llama-server"
+
 
 def _inject_cors_headers(response_head: bytes) -> bytes:
     """Insert the CORS headers into an HTTP response head (status line + headers, up to and
@@ -205,14 +209,14 @@ class RawTCPForwarder:
                 if target_port:
                     # Model already loaded -> pipe directly. (No per-request log: this is the hot path.)
                     self._pipe_to_backend(client_sock, raw_headers,
-                                          body_prefix, target_port, "llama-server")
+                                          body_prefix, target_port, _LLAMA_SERVER_LABEL)
                     return
                 # Model not loaded -> JIT load it, wait for readiness, then pipe.
                 log.info(f"Model '{model_id}' not loaded; triggering JIT load...")
                 target_port = self._jit_load_and_wait(model_id)
                 if target_port:
                     self._pipe_to_backend(client_sock, raw_headers,
-                                          body_prefix, target_port, "llama-server")
+                                          body_prefix, target_port, _LLAMA_SERVER_LABEL)
                     return
                 # JIT load failed (unknown model / timeout / spawn error).
                 log.error(f"JIT load failed for '{model_id}' on {method} {path}")
@@ -514,9 +518,10 @@ class RawTCPForwarder:
         # CORS injection (LLM->llama-server fast path ONLY). llama-server sends no CORS headers,
         # so a cross-origin browser client (CWrite) is blocked. Inject the three headers into the
         # FIRST response head, then resume transparent byte piping. Management traffic to FastAPI
-        # is left untouched (label != "llama-server"). This does not change _bidirectional_pipe's
-        # core loop — it only prepends a header-only edit to the first backend->client chunk.
-        if label == "llama-server":
+        # is left untouched (label != _LLAMA_SERVER_LABEL). This does not change
+        # _bidirectional_pipe's core loop — it only prepends a header-only edit to the first
+        # backend->client chunk.
+        if label == _LLAMA_SERVER_LABEL:
             self._inject_cors_into_first_response(client_sock, target_sock)
 
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
@@ -615,13 +620,11 @@ class RawTCPForwarder:
         """
         response = (
             b"HTTP/1.1 204 No Content\r\n"
-            b"Access-Control-Allow-Origin: *\r\n"
-            b"Access-Control-Allow-Methods: *\r\n"
-            b"Access-Control-Allow-Headers: *\r\n"
-            b"Access-Control-Max-Age: 86400\r\n"
-            b"Content-Length: 0\r\n"
-            b"Connection: close\r\n"
-            b"\r\n"
+            + _CORS_HEADERS
+            + b"Access-Control-Max-Age: 86400\r\n"
+            + b"Content-Length: 0\r\n"
+            + b"Connection: close\r\n"
+            + b"\r\n"
         )
         try:
             sock.sendall(response)
