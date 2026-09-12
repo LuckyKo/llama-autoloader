@@ -55,6 +55,45 @@ _MODEL_SCAN_HARD_CAP = 1 << 30
 
 _MODEL_RE = re.compile(rb'"model"\s*:\s*"([^"]*)"')
 
+# CORS headers restored to the piped LLM response. Before the raw-TCP passthrough commit the
+# LLM path was the FastAPI/uvicorn proxy, which added exactly these three headers to every LLM
+# response. llama-server emits NO CORS headers of its own, so a cross-origin browser client
+# (CWrite: Vite on :3136 -> fetch() to 127.0.0.1:1234) had the response blocked by the browser
+# and saw nothing. We re-add them verbatim into the first backend response (see _pipe_to_backend).
+_CORS_HEADERS = (
+    b"Access-Control-Allow-Origin: *\r\n"
+    b"Access-Control-Allow-Methods: *\r\n"
+    b"Access-Control-Allow-Headers: *\r\n"
+)
+
+# Bound for a READ-phase socket timeout used ONLY when a request has no Content-Length (the
+# client may be waiting for our response before sending more body bytes, so an unbounded read
+# could hang). Cleared before the pipe phase; the AC fast path always carries a Content-Length.
+_READ_PHASE_TIMEOUT = 5.0
+
+
+def _inject_cors_headers(response_head: bytes) -> bytes:
+    """Insert the CORS headers into an HTTP response head (status line + headers, up to and
+    including the terminating ``\\r\\n\\r\\n``).
+
+    Header-only edit: the status line is left untouched, the backend's own headers keep their
+    original casing/order, and nothing after the blank line (the body) is ever touched — so
+    chunked / Content-Length framing is preserved. If the backend already sent an
+    ``Access-Control-Allow-Origin`` header (checked case-insensitively) we do NOT inject again.
+    Returns the head unchanged when there is no end-of-headers marker or the header is present.
+    """
+    if b"\r\n\r\n" not in response_head:
+        return response_head
+    for line in response_head.split(b"\r\n"):
+        if re.match(rb"^access-control-allow-origin\s*:", line, re.IGNORECASE):
+            return response_head  # already CORS-enabled by the backend; never double-inject
+    status_nl = response_head.find(b"\r\n")
+    if status_nl < 0:
+        return response_head  # malformed head (no status line terminator); leave as-is
+    insert_at = status_nl + 2  # right after the status line, before the rest of the headers
+    return response_head[:insert_at] + _CORS_HEADERS + response_head[insert_at:]
+
+
 # How long a worker thread blocks waiting for a JIT model load to become ready. Some models
 # take minutes; override with AUTOLOADER_JIT_LOAD_TIMEOUT (seconds).
 try:
@@ -132,6 +171,13 @@ class RawTCPForwarder:
             # are piped straight to llama-server. All other requests (management/status/state,
             # /ws, unknown paths) go to FastAPI.
             if self._is_llm_endpoint(path):
+                # OPTIONS preflight on an LLM endpoint: answer directly with a CORS-allowing
+                # response WITHOUT piping to llama-server. CWrite's current fetch is "simple" so
+                # no preflight fires today, but a future Authorization/custom-header change could
+                # trigger one; this keeps the loader as robust as the old uvicorn path.
+                if method == "OPTIONS":
+                    self._send_cors_preflight_response(client_sock)
+                    return
                 # Only POST (carries a `model` field in the body) is piped to llama-server. Any other
                 # method on an LLM path keeps its original fallthrough-to-FastAPI behaviour (e.g. a
                 # WebSocket upgrade or GET), which was never LLM generation traffic anyway.
@@ -224,6 +270,28 @@ class RawTCPForwarder:
             content_length = int(self._header_value(raw_headers, "content-length"))
         except (ValueError, TypeError):
             content_length = 0
+
+        # Expect: 100-continue — tell the client to go ahead BEFORE reading its body, or it will
+        # wait for our interim response and we would deadlock. Only sent when actually requested.
+        expect = self._header_value(raw_headers, "expect")
+        if expect is not None and "100-continue" in expect.lower():
+            try:
+                sock.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+            except OSError:
+                return None
+
+        # Bound the READ phase only when there is no Content-Length: a chunked / no-length client
+        # may be holding back body bytes until it sees our response, so an unbounded read could hang.
+        # A timeout here just stops us from blocking indefinitely; the pipe phase below restores
+        # blocking mode (no timeout). The AC fast path always carries a Content-Length, so this is
+        # a no-op for it.
+        bounded_read = content_length == 0
+        if bounded_read:
+            try:
+                sock.settimeout(_READ_PHASE_TIMEOUT)
+            except OSError:
+                pass
+
         if self._is_llm_endpoint(path):
             target = min(content_length, _BODY_PREFIX_LIMIT) if content_length else _BODY_PREFIX_LIMIT
         else:
@@ -231,11 +299,20 @@ class RawTCPForwarder:
         while len(body_prefix) < target:
             try:
                 chunk = sock.recv(4096)
+            except (socket.timeout, TimeoutError):
+                break  # bounded read phase timed out; stop waiting for more body bytes
             except OSError:
                 break
             if not chunk:
                 break
             body_prefix += chunk
+
+        # Restore blocking mode before the pipe phase (Windows select can't mix with settimeout).
+        if bounded_read:
+            try:
+                sock.settimeout(None)
+            except OSError:
+                pass
 
         return method, path, raw_headers, body_prefix
 
@@ -394,11 +471,19 @@ class RawTCPForwarder:
         return None
 
     # ------------------------------------------------------------------ piping
+    def _connect_backend(self, target_port: int) -> socket.socket:
+        """Open the connection to a backend on 127.0.0.1.
+
+        Factored out of _pipe_to_backend so tests can substitute a real connected socket pair
+        (a fake llama-server / FastAPI peer) without needing a live port.
+        """
+        return socket.create_connection(("127.0.0.1", target_port), timeout=10)
+
     def _pipe_to_backend(self, client_sock: socket.socket, raw_headers: bytes,
                           body_prefix: bytes, target_port: int, label: str) -> None:
         """Forward the request (reconstructed verbatim) to a backend and pipe bidirectionally."""
         try:
-            target_sock = socket.create_connection(("127.0.0.1", target_port), timeout=10)
+            target_sock = self._connect_backend(target_port)
         except Exception as e:  # noqa: BLE001
             log.error(f"Failed to connect to {label} on port {target_port}: {e}")
             self._send_error_response(client_sock, 502, f"{label} unreachable")
@@ -426,8 +511,51 @@ class RawTCPForwarder:
             except OSError:
                 pass
 
+        # CORS injection (LLM->llama-server fast path ONLY). llama-server sends no CORS headers,
+        # so a cross-origin browser client (CWrite) is blocked. Inject the three headers into the
+        # FIRST response head, then resume transparent byte piping. Management traffic to FastAPI
+        # is left untouched (label != "llama-server"). This does not change _bidirectional_pipe's
+        # core loop — it only prepends a header-only edit to the first backend->client chunk.
+        if label == "llama-server":
+            self._inject_cors_into_first_response(client_sock, target_sock)
+
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
         self._bidirectional_pipe(client_sock, target_sock)
+
+    def _inject_cors_into_first_response(self, client_sock: socket.socket,
+                                         target_sock: socket.socket) -> None:
+        """Buffer the first HTTP response head from the backend, inject CORS headers into it, and
+        forward it to the client. Any remaining buffered bytes are forwarded verbatim; everything
+        after that flows through _bidirectional_pipe untouched (header-only edit, body preserved).
+
+        A single recv() can return a PARTIAL head (no terminating \\r\\n\\r\\n yet), so we keep
+        reading until the head is complete. NO byte is ever dropped: if the backend closes before
+        the head completes (or errors) we forward whatever we buffered verbatim and let the pipe
+        take over; if the client goes away mid-send we stop (the pipe loop below notices).
+        """
+        buf = b""
+        while True:
+            try:
+                chunk = target_sock.recv(65536)
+            except OSError:
+                break  # backend closed/errored; forward what we have, then the pipe handles the rest
+            if not chunk:
+                break  # EOF before head completed — forward buffered bytes verbatim (no injection)
+            buf += chunk
+            if b"\r\n\r\n" in buf:
+                break
+        if not buf:
+            return  # nothing received yet; _bidirectional_pipe will deliver the response as-is
+        if b"\r\n\r\n" in buf:
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            payload = _inject_cors_headers(head + b"\r\n\r\n") + rest
+        else:
+            payload = buf  # incomplete head (backend closed early): forward verbatim, never drop bytes
+        try:
+            client_sock.sendall(payload)
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            # Client gone; the pipe loop below will notice and shut down cleanly.
+            pass
 
     def _bidirectional_pipe(self, sock_a: socket.socket, sock_b: socket.socket) -> None:
         """Pipe bytes between two blocking sockets until both directions are closed."""
@@ -476,6 +604,29 @@ class RawTCPForwarder:
                     sock.close()
                 except OSError:
                     pass
+
+    @staticmethod
+    def _send_cors_preflight_response(sock: socket.socket) -> None:
+        """Answer an OPTIONS preflight on an LLM endpoint with a CORS-allowing 204.
+
+        Sent directly (never piped to llama-server). Mirrors the old uvicorn path so a browser can
+        complete a preflight if CWrite ever adds an Authorization/custom header. Connection: close
+        since we do not keep this socket in the pipe loop.
+        """
+        response = (
+            b"HTTP/1.1 204 No Content\r\n"
+            b"Access-Control-Allow-Origin: *\r\n"
+            b"Access-Control-Allow-Methods: *\r\n"
+            b"Access-Control-Allow-Headers: *\r\n"
+            b"Access-Control-Max-Age: 86400\r\n"
+            b"Content-Length: 0\r\n"
+            b"Connection: close\r\n"
+            b"\r\n"
+        )
+        try:
+            sock.sendall(response)
+        except OSError:
+            pass
 
     @staticmethod
     def _send_error_response(sock: socket.socket, status_code: int, message: str) -> None:
