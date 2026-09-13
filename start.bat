@@ -64,7 +64,7 @@ if %TRIES% GEQ 20 (
     pause
     exit /b 1
 )
-echo [start]   port %BUSY% busy, retrying... (%TRIES%/20)
+echo [start]   port %BUSY% busy, retrying... (%TRIES% of 20)
 rem ping-sleep instead of timeout: timeout errors when stdin is redirected.
 ping -n 2 127.0.0.1 >nul
 goto waitports
@@ -115,21 +115,18 @@ exit /b 0
 :portbusy
 rem Sets BUSY=<port> if an autoloader port is still LISTENING.
 rem Covers the python ports (1234/1235) AND the llama-server base-port
-rem range (9001-9010). Exact match on "127.0.0.1:<port>" - do NOT relax
-rem to a substring findstr, that would also match :90011 etc.
+rem range (9001-9010). Uses findstr with a pattern that matches the
+rem exact "127.0.0.1:<port> " prefix (trailing space in netstat output
+rem prevents :9001 matching :90011 etc.).
 set "BUSY="
-for /f "tokens=2,5" %%B in ('netstat -ano ^| findstr "LISTENING"') do (
-    if /i "%%B"=="127.0.0.1:1234" set "BUSY=1234"
-    if /i "%%B"=="127.0.0.1:1235" set "BUSY=1235"
-    if /i "%%B"=="127.0.0.1:9001" set "BUSY=9001"
-    if /i "%%B"=="127.0.0.1:9002" set "BUSY=9002"
-    if /i "%%B"=="127.0.0.1:9003" set "BUSY=9003"
-    if /i "%%B"=="127.0.0.1:9004" set "BUSY=9004"
-    if /i "%%B"=="127.0.0.1:9005" set "BUSY=9005"
-    if /i "%%B"=="127.0.0.1:9006" set "BUSY=9006"
-    if /i "%%B"=="127.0.0.1:9007" set "BUSY=9007"
-    if /i "%%B"=="127.0.0.1:9008" set "BUSY=9008"
-    if /i "%%B"=="127.0.0.1:9009" set "BUSY=9009"
-    if /i "%%B"=="127.0.0.1:9010" set "BUSY=9010"
+for %%P in (1234 1235 9001 9002 9003 9004 9005 9006 9007 9008 9009 9010) do (
+    if not defined BUSY call :portcheck %%P
+)
+exit /b 0
+
+:portcheck
+rem %1 = port. Sets BUSY=%1 if 127.0.0.1:%1 is LISTENING.
+for /f "tokens=2" %%A in ('netstat -ano ^| findstr "LISTENING" ^| findstr "127.0.0.1:%1 "') do (
+    if not defined BUSY set "BUSY=%1"
 )
 exit /b 0
