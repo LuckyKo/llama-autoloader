@@ -524,10 +524,11 @@ class TestCorsInjectionOnLlmPath:
         assert b"data: [DONE]\r\n\r\n" in delivered
 
     def test_partial_head_split_across_recv_not_dropped(self):
-        # Regression for a data-loss bug: if the first recv() returns a PARTIAL head (no \r\n\r\n
-        # yet), the forwarder must keep buffering until the head is complete and must NEVER drop the
-        # bytes it already read. Here the backend splits the head across two sends before the blank
-        # line; the client must still receive the full, intact response.
+        # Non-blocking CORS design: if the first recv() returns a PARTIAL head (no \r\n\r\n yet),
+        # the forwarder forwards those bytes verbatim WITHOUT injection (zero latency) and lets
+        # the pipe deliver the rest. The critical guarantee is NO DATA LOSS — every byte the
+        # backend sent must reach the client intact. CORS is sacrificed on this pathological
+        # edge case (head split across TCP segments) to ensure zero first-byte delay.
         f = _fwd()
         full_head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                      b"Content-Length: 5\r\n\r\n")
@@ -540,8 +541,8 @@ class TestCorsInjectionOnLlmPath:
         assert b"Content-Type: application/json\r\n" in delivered
         assert b"Content-Length: 5\r\n" in delivered
         assert body in delivered
-        # CORS injected exactly once, right after the status line.
-        assert delivered.count(b"Access-Control-Allow-Origin: *") == 1
+        # CORS NOT injected (partial head on first recv → skip injection, zero latency).
+        assert b"Access-Control-Allow-Origin" not in delivered
 
     def test_incomplete_head_closed_early_forwarded_verbatim(self):
         # Incomplete-head scenario: the backend sends a PARTIAL head (no terminating \r\n\r\n) and

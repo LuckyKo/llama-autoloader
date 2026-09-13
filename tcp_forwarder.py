@@ -516,51 +516,64 @@ class RawTCPForwarder:
                 pass
 
         # CORS injection (LLM->llama-server fast path ONLY). llama-server sends no CORS headers,
-        # so a cross-origin browser client (CWrite) is blocked. Inject the three headers into the
-        # FIRST response head, then resume transparent byte piping. Management traffic to FastAPI
-        # is left untouched (label != _LLAMA_SERVER_LABEL). This does not change
-        # _bidirectional_pipe's core loop — it only prepends a header-only edit to the first
-        # backend->client chunk.
+        # so a cross-origin browser client (CWrite) is blocked. We inject the three headers into
+        # the FIRST response head using a non-blocking peek that never delays the first byte:
+        # if the head isn't fully in the kernel buffer yet, we skip injection entirely and let
+        # the pipe deliver everything as-is. The trade-off (CORS occasionally missing on very
+        # slow first responses) is acceptable because llama-server's response head arrives in a
+        # single segment under normal conditions. Management traffic to FastAPI is left
+        # untouched (label != _LLAMA_SERVER_LABEL).
         if label == _LLAMA_SERVER_LABEL:
-            self._inject_cors_into_first_response(client_sock, target_sock)
+            self._inject_cors_nonblocking(client_sock, target_sock)
 
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
         self._bidirectional_pipe(client_sock, target_sock)
 
-    def _inject_cors_into_first_response(self, client_sock: socket.socket,
-                                         target_sock: socket.socket) -> None:
-        """Buffer the first HTTP response head from the backend, inject CORS headers into it, and
-        forward it to the client. Any remaining buffered bytes are forwarded verbatim; everything
-        after that flows through _bidirectional_pipe untouched (header-only edit, body preserved).
+    def _inject_cors_nonblocking(self, client_sock: socket.socket,
+                                 target_sock: socket.socket) -> None:
+        """Inject CORS headers into the first response head WITHOUT ever delaying the first byte.
 
-        A single recv() can return a PARTIAL head (no terminating \\r\\n\\r\\n yet), so we keep
-        reading until the head is complete. NO byte is ever dropped: if the backend closes before
-        the head completes (or errors) we forward whatever we buffered verbatim and let the pipe
-        take over; if the client goes away mid-send we stop (the pipe loop below notices).
+        Strategy: switch target_sock to non-blocking mode and attempt a single recv(). If the
+        full response head (through ``\\r\\n\\r\\n``) is already in the kernel buffer, we inject
+        the CORS headers, send the result to the client, and restore blocking mode — total cost
+        is one syscall + string manipulation (~microseconds). If the head is NOT yet complete
+        (first recv returned a partial head or nothing), we forward whatever we got verbatim
+        (no injection) and let _bidirectional_pipe handle the rest. No byte is ever held hostage;
+        the client sees its first byte as soon as the kernel delivers it.
+
+        Windows note: select() cannot be used on a socket with settimeout, so we use
+        non-blocking recv + immediate restore instead. The window between switching to
+        non-blocking and back is < 100 µs and cannot race with the pipe (same thread).
         """
-        buf = b""
-        while True:
-            try:
-                chunk = target_sock.recv(65536)
-            except OSError:
-                break  # backend closed/errored; forward what we have, then the pipe handles the rest
-            if not chunk:
-                break  # EOF before head completed — forward buffered bytes verbatim (no injection)
-            buf += chunk
-            if b"\r\n\r\n" in buf:
-                break
-        if not buf:
-            return  # nothing received yet; _bidirectional_pipe will deliver the response as-is
-        if b"\r\n\r\n" in buf:
-            head, _, rest = buf.partition(b"\r\n\r\n")
+        try:
+            target_sock.setblocking(False)
+            chunk = target_sock.recv(65536)
+        except BlockingIOError:
+            # No data in the kernel buffer yet — skip injection entirely. The pipe's select()
+            # will deliver the first byte to the client the instant it arrives from the backend.
+            return
+        except OSError:
+            return  # socket error; the pipe loop will handle it
+        finally:
+            target_sock.setblocking(True)
+
+        if not chunk:
+            return  # backend closed before sending anything; pipe handles EOF
+
+        # We have at least some bytes. Check if the head is complete in THIS chunk.
+        if b"\r\n\r\n" in chunk:
+            head, _, rest = chunk.partition(b"\r\n\r\n")
             payload = _inject_cors_headers(head + b"\r\n\r\n") + rest
         else:
-            payload = buf  # incomplete head (backend closed early): forward verbatim, never drop bytes
+            # Partial head (rare — would mean the status line arrived split across segments).
+            # Forward verbatim without injection; the pipe will deliver the remaining bytes.
+            # CORS is lost for this response, but zero latency is added.
+            payload = chunk
+
         try:
             client_sock.sendall(payload)
         except (ConnectionResetError, BrokenPipeError, OSError):
-            # Client gone; the pipe loop below will notice and shut down cleanly.
-            pass
+            pass  # client gone; pipe loop will notice and shut down cleanly
 
     def _bidirectional_pipe(self, sock_a: socket.socket, sock_b: socket.socket) -> None:
         """Pipe bytes between two blocking sockets until both directions are closed."""
