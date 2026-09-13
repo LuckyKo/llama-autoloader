@@ -2,15 +2,29 @@
 rem ============================================================
 rem  start.bat - fresh launch of llama-autoloader.
 rem
+rem  MEANT TO BE RUN INTERACTIVELY (double-click, or from a manual cmd
+rem  window). It launches the server in the FOREGROUND and blocks until
+rem  you close it. Do NOT run it from an automated pipeline / async shell
+rem  with a timeout - it will be killed mid-run and leave orphaned
+rem  llama-server.exe children behind (which this script then has to
+rem  clean up on the next launch).
+rem
 rem  1. Kills stale python processes LISTENING on 1234 (forwarder)
 rem     and 1235 (internal FastAPI). Refuses to kill anything that
 rem     is NOT a python process (safety guard).
-rem  2. Waits until both ports are actually free before relaunching.
-rem     taskkill is async, and uvicorn binds 1235 FIRST - launching
-rem     too early dies with "Address already in use" and the
-rem     forwarder on 1234 never comes up.
-rem  3. Deletes __pycache__ (stale .pyc protection).
-rem  4. Launches:  python server.py --port 1234
+rem  2. Kills any orphaned llama-server.exe child processes. When the
+rem     parent python is killed, its llama-server.exe children become
+rem     orphans and keep holding base_port (9001) - this blocks clean
+rem     restarts. We kill by image name: on this dedicated dev box the
+rem     only llama-server.exe instances are the autoloader's own children
+rem     (spawned from ./backends/), so a blanket kill is safe here.
+rem  3. Waits until BOTH the python ports (1234/1235) AND the base-port
+rem     range (9001-9010) are actually free before relaunching. taskkill
+rem     is async, and uvicorn binds 1235 FIRST - launching too early dies
+rem     with "Address already in use" and the forwarder on 1234 never
+rem     comes up.
+rem  4. Deletes __pycache__ (stale .pyc protection).
+rem  5. Launches:  python server.py --port 1234
 rem
 rem  Port match = netstat local-address column compared EXACTLY
 rem  against "127.0.0.1:<port>". A plain findstr ":1234 " ALSO
@@ -30,14 +44,23 @@ if defined FOREIGN (
     exit /b 1
 )
 
-echo [start] Waiting for ports 1234 and 1235 to be free ...
+rem Kill orphaned llama-server.exe children. If the parent python was killed,
+rem its llama-server.exe subprocesses become orphans and keep holding base_port
+rem (9001). We kill by image name: on this dedicated dev box the only
+rem llama-server.exe instances are the autoloader's own children (spawned from
+rem ./backends/), so a blanket kill is safe here. If you ever run another
+rem llama-server.exe for unrelated work, scope this down to base-port PIDs.
+echo [start] Killing orphaned llama-server.exe processes ...
+taskkill /F /IM llama-server.exe >nul 2>&1
+
+echo [start] Waiting for ports 1234, 1235 and base port range (9001-9010) to be free ...
 set /a TRIES=0
 :waitports
 call :portbusy
 if not defined BUSY goto portsfree
 set /a TRIES+=1
 if %TRIES% GEQ 20 (
-    echo [start] ERROR: port %BUSY% still busy after ~20s. Aborting.
+    echo [start] ERROR: port %BUSY% still busy after ~40s (20 retries). Aborting.
     pause
     exit /b 1
 )
@@ -90,10 +113,23 @@ if /i "%KP_IMG:~0,6%"=="python" (
 exit /b 0
 
 :portbusy
-rem Sets BUSY=1234/1235 if either autoloader port is still LISTENING.
+rem Sets BUSY=<port> if an autoloader port is still LISTENING.
+rem Covers the python ports (1234/1235) AND the llama-server base-port
+rem range (9001-9010). Exact match on "127.0.0.1:<port>" - do NOT relax
+rem to a substring findstr, that would also match :90011 etc.
 set "BUSY="
 for /f "tokens=2,5" %%B in ('netstat -ano ^| findstr "LISTENING"') do (
     if /i "%%B"=="127.0.0.1:1234" set "BUSY=1234"
     if /i "%%B"=="127.0.0.1:1235" set "BUSY=1235"
+    if /i "%%B"=="127.0.0.1:9001" set "BUSY=9001"
+    if /i "%%B"=="127.0.0.1:9002" set "BUSY=9002"
+    if /i "%%B"=="127.0.0.1:9003" set "BUSY=9003"
+    if /i "%%B"=="127.0.0.1:9004" set "BUSY=9004"
+    if /i "%%B"=="127.0.0.1:9005" set "BUSY=9005"
+    if /i "%%B"=="127.0.0.1:9006" set "BUSY=9006"
+    if /i "%%B"=="127.0.0.1:9007" set "BUSY=9007"
+    if /i "%%B"=="127.0.0.1:9008" set "BUSY=9008"
+    if /i "%%B"=="127.0.0.1:9009" set "BUSY=9009"
+    if /i "%%B"=="127.0.0.1:9010" set "BUSY=9010"
 )
 exit /b 0
