@@ -36,6 +36,7 @@ import re
 import select
 import socket
 import threading
+import time
 from typing import Dict, Optional, Tuple
 
 log = logging.getLogger("autoloader")
@@ -75,27 +76,39 @@ _READ_PHASE_TIMEOUT = 5.0
 # "fastapi" for management traffic). The CORS-injection gate keys off this value.
 _LLAMA_SERVER_LABEL = "llama-server"
 
+# TTFB threshold (seconds) below which we classify a response as a prompt-cache hit.
+# Override with AUTOLOADER_CACHE_HIT_THRESHOLD. Well-separated from real misses (50s+).
+try:
+    _CACHE_HIT_THRESHOLD = float(os.environ.get("AUTOLOADER_CACHE_HIT_THRESHOLD", "5"))
+except ValueError:
+    _CACHE_HIT_THRESHOLD = 5.0
 
-def _inject_cors_headers(response_head: bytes) -> bytes:
-    """Insert the CORS headers into an HTTP response head (status line + headers, up to and
-    including the terminating ``\\r\\n\\r\\n``).
 
-    Header-only edit: the status line is left untouched, the backend's own headers keep their
-    original casing/order, and nothing after the blank line (the body) is ever touched — so
-    chunked / Content-Length framing is preserved. If the backend already sent an
-    ``Access-Control-Allow-Origin`` header (checked case-insensitively) we do NOT inject again.
-    Returns the head unchanged when there is no end-of-headers marker or the header is present.
+def _inject_cors_headers(response_head: bytes, extra_headers: bytes = b"") -> bytes:
+    """Insert CORS headers (and optional ``extra_headers``) into an HTTP response head.
+
+    The edit is header-only: the status line is left untouched, the backend's own headers keep
+    their original casing/order, and nothing after the blank line (the body) is ever touched — so
+    chunked / Content-Length framing is preserved. Both injections land at the same point, right
+    after the status line, with CORS first and ``extra_headers`` immediately after it.
+
+    The CORS block is skipped if the backend already sent an ``Access-Control-Allow-Origin``
+    header (checked case-insensitively) — but ``extra_headers`` (e.g. the RFC 9211 Cache-Status
+    line, which llama-server never emits) is injected regardless, at the same insertion point.
+    Returns the head unchanged when there is no end-of-headers marker or no status-line terminator.
     """
     if b"\r\n\r\n" not in response_head:
         return response_head
-    for line in response_head.split(b"\r\n"):
-        if re.match(rb"^access-control-allow-origin\s*:", line, re.IGNORECASE):
-            return response_head  # already CORS-enabled by the backend; never double-inject
+    cors_already = any(
+        re.match(rb"^access-control-allow-origin\s*:", line, re.IGNORECASE)
+        for line in response_head.split(b"\r\n")
+    )
     status_nl = response_head.find(b"\r\n")
     if status_nl < 0:
         return response_head  # malformed head (no status line terminator); leave as-is
     insert_at = status_nl + 2  # right after the status line, before the rest of the headers
-    return response_head[:insert_at] + _CORS_HEADERS + response_head[insert_at:]
+    cors = b"" if cors_already else _CORS_HEADERS  # never double-inject CORS
+    return response_head[:insert_at] + cors + extra_headers + response_head[insert_at:]
 
 
 # How long a worker thread blocks waiting for a JIT model load to become ready. Some models
@@ -507,6 +520,10 @@ class RawTCPForwarder:
             self._send_error_response(client_sock, 502, f"{label} unreachable")
             return
 
+        # TTFB origin: the instant the full request is handed to the backend. Used by the LLM
+        # fast path to classify the response as a prompt-cache hit vs miss (RFC 9211 Cache-Status).
+        t_request_sent = time.monotonic()
+
         # Disable Nagle on both data sockets so SSE frames are not coalesced into delayed-ACK
         # batches (the exact class of buffering this forwarder exists to avoid). Best-effort.
         for s in (client_sock, target_sock):
@@ -522,40 +539,51 @@ class RawTCPForwarder:
         # the pipe deliver everything as-is. The trade-off (CORS occasionally missing on very
         # slow first responses) is acceptable because llama-server's response head arrives in a
         # single segment under normal conditions. Management traffic to FastAPI is left
-        # untouched (label != _LLAMA_SERVER_LABEL).
+        # untouched (label != _LLAMA_SERVER_LABEL). The LLM path also passes the TTFB origin so the
+        # same non-blocking window can emit an RFC 9211 Cache-Status hit/miss header.
         if label == _LLAMA_SERVER_LABEL:
-            self._inject_cors_nonblocking(client_sock, target_sock)
+            self._inject_cors_nonblocking(client_sock, target_sock, t_request_sent=t_request_sent)
 
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
         self._bidirectional_pipe(client_sock, target_sock)
 
     def _inject_cors_nonblocking(self, client_sock: socket.socket,
-                                 target_sock: socket.socket) -> None:
-        """Inject CORS headers into the first response head WITHOUT ever delaying the first byte.
+                                 target_sock: socket.socket,
+                                 t_request_sent: float | None = None) -> None:
+        """Inject CORS headers (and an RFC 9211 Cache-Status header) into the first response head.
 
-        Strategy: switch target_sock to non-blocking mode and attempt a single recv(). If the
-        full response head (through ``\\r\\n\\r\\n``) is already in the kernel buffer, we inject
-        the CORS headers, send the result to the client, and restore blocking mode — total cost
-        is one syscall + string manipulation (~microseconds). If the head is NOT yet complete
-        (first recv returned a partial head or nothing), we forward whatever we got verbatim
-        (no injection) and let _bidirectional_pipe handle the rest. No byte is ever held hostage;
-        the client sees its first byte as soon as the kernel delivers it.
+        Strategy: use select() with a short timeout to wait for the backend's first bytes.
+        Warm-cache responses arrive in <10 ms; cold prompt eval takes >300 ms. A 100 ms select
+        timeout cleanly separates the two without adding perceptible latency. If data arrives
+        within the window, we recv the head, inject CORS + Cache-Status, and forward. If select
+        times out (cold miss), we skip injection — the pipe delivers the first byte the instant
+        it arrives from the backend, and AC records the call as cache-status "unknown".
 
-        Windows note: select() cannot be used on a socket with settimeout, so we use
-        non-blocking recv + immediate restore instead. The window between switching to
-        non-blocking and back is < 100 µs and cannot race with the pipe (same thread).
+        ``t_request_sent=None`` disables Cache-Status entirely (backward compat); CORS still runs.
+
+        The socket remains in blocking mode throughout (select() works fine on blocking sockets;
+        the earlier non-blocking approach was a Windows-specific workaround that is no longer
+        needed since we use select with an explicit timeout instead of relying on EWOULDBLOCK).
         """
+        # Wait up to 2 s for the backend's first bytes. Warm-cache hits (a few new tokens to
+        # eval) have a total TTFB of ~300-800 ms including HTTP parsing, slot assignment, and
+        # prompt eval. Cold misses (full reprocess of thousands of tokens) take 5 s to minutes.
+        # 2 s cleanly separates the two with generous margin on both sides.
         try:
-            target_sock.setblocking(False)
-            chunk = target_sock.recv(65536)
-        except BlockingIOError:
-            # No data in the kernel buffer yet — skip injection entirely. The pipe's select()
-            # will deliver the first byte to the client the instant it arrives from the backend.
+            ready, _, _ = select.select([target_sock], [], [], 2.0)
+        except (OSError, ValueError):
+            return  # socket error or already closed; pipe loop will handle it
+
+        if not ready:
+            # No data within 2 s — cold prompt eval in progress (full reprocess of a large
+            # context). Skip injection entirely; the pipe delivers the first byte the instant
+            # it arrives. Cache-Status is absent → AC records "unknown".
             return
+
+        try:
+            chunk = target_sock.recv(65536)
         except OSError:
             return  # socket error; the pipe loop will handle it
-        finally:
-            target_sock.setblocking(True)
 
         if not chunk:
             return  # backend closed before sending anything; pipe handles EOF
@@ -563,7 +591,8 @@ class RawTCPForwarder:
         # We have at least some bytes. Check if the head is complete in THIS chunk.
         if b"\r\n\r\n" in chunk:
             head, _, rest = chunk.partition(b"\r\n\r\n")
-            payload = _inject_cors_headers(head + b"\r\n\r\n") + rest
+            extra_headers = self._cache_status_header(t_request_sent)
+            payload = _inject_cors_headers(head + b"\r\n\r\n", extra_headers=extra_headers) + rest
         else:
             # Partial head (rare — would mean the status line arrived split across segments).
             # Forward verbatim without injection; the pipe will deliver the remaining bytes.
@@ -574,6 +603,23 @@ class RawTCPForwarder:
             client_sock.sendall(payload)
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass  # client gone; pipe loop will notice and shut down cleanly
+
+    @staticmethod
+    def _cache_status_header(t_request_sent: float | None) -> bytes:
+        """Build the RFC 9211 ``Cache-Status`` header bytes from a measured TTFB.
+
+        Returns b"" when ``t_request_sent`` is None (no measurement available — e.g. the request
+        was never timestamped), so callers can pass the result straight to _inject_cors_headers as
+        ``extra_headers``. Otherwise: TTFB < threshold -> a cache HIT (KV was warm, only a few new
+        tokens to eval); TTFB >= threshold -> a forward MISS with the measured time in the detail
+        (full/partial reprocess). The strict ``<`` keeps the boundary deterministic.
+        """
+        if t_request_sent is None:
+            return b""
+        ttfb = time.monotonic() - t_request_sent
+        if ttfb < _CACHE_HIT_THRESHOLD:
+            return b"Cache-Status: autoloader; hit\r\n"
+        return f"Cache-Status: autoloader; fwd=miss; detail=ttfb-{ttfb:.1f}s\r\n".encode()
 
     def _bidirectional_pipe(self, sock_a: socket.socket, sock_b: socket.socket) -> None:
         """Pipe bytes between two blocking sockets until both directions are closed."""
