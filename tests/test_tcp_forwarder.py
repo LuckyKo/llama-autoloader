@@ -19,7 +19,8 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tcp_forwarder import RawTCPForwarder  # noqa: E402
+import tcp_forwarder  # noqa: E402
+from tcp_forwarder import RawTCPForwarder, _inject_cors_headers  # noqa: E402
 
 
 def _fwd():
@@ -440,6 +441,31 @@ def _client_side(fwd, backend_bytes, *, label="llama-server",
     return delivered, b""
 
 
+def _send_and_read(fwd, backend_bytes, *, read_timeout=3.0):
+    """Drive ONLY the non-blocking injection window and return what the client receives.
+
+    Unlike _client_side (which runs the full pipe), this calls _inject_cors_nonblocking directly
+    on a socketpair so we can control the exact backend bytes. The client side is closed afterwards
+    to let the forwarder's sendall see EOF cleanly. Used for the empty-recv / cold-path cases where
+    there is no pipe to fall back on.
+    """
+    fwd._running = True
+    client, client_fwd = _socket_pair()     # "client" side of the response
+    backend, backend_fwd = _socket_pair()    # fake llama-server -> forwarder
+    try:
+        if backend_bytes:
+            backend.sendall(backend_bytes)
+        fwd._inject_cors_nonblocking(client_fwd, backend_fwd)
+        delivered = _recv_until_closed(client, read_timeout)
+    finally:
+        for s in (client, client_fwd, backend, backend_fwd):
+            try:
+                s.close()
+            except OSError:
+                pass
+    return delivered
+
+
 # --------------------------------------------------------------------------- _inject_cors_headers (pure)
 class TestInjectCorsHeaders:
     def test_inserts_after_status_line(self):
@@ -477,6 +503,30 @@ class TestInjectCorsHeaders:
         res = _inject_cors_headers(head)
         # Everything after the (now shifted) blank line must still be empty / unchanged.
         assert res.endswith(b"\r\n\r\n")
+
+    def test_extra_headers_injected_after_cors(self):
+        head = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+        extra = b"X-Extra: 1\r\n"
+        res = _inject_cors_headers(head, extra_headers=extra)
+        # CORS first, then the extra header, both right after the status line.
+        assert res.startswith(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n")
+        assert b"X-Extra: 1\r\n" in res
+        # Ordering: CORS before the extra header, both before the original header.
+        assert res.index(b"Access-Control-Allow-Origin") < res.index(b"X-Extra")
+        assert res.index(b"X-Extra") < res.index(b"Content-Type")
+
+    def test_extra_headers_injected_when_cors_skipped(self):
+        # Backend already sends CORS -> CORS must NOT be doubled, but extra headers still land.
+        head = b"HTTP/1.1 200 OK\r\naccess-control-allow-origin: *\r\nContent-Length: 5\r\n\r\n"
+        extra = b"X-Extra: 1\r\n"
+        res = _inject_cors_headers(head, extra_headers=extra)
+        assert res.count(b"access-control-allow-origin") == 1  # original only, no double-inject
+        assert res.count(b"Access-Control-Allow-Origin: *") == 0  # we did not add our own CORS
+        assert b"X-Extra: 1\r\n" in res
+        # Extra header sits right after the status line (same insert_at as CORS would).
+        assert res.startswith(b"HTTP/1.1 200 OK\r\nX-Extra: 1\r\n")
+
+
 
 
 # --------------------------------------------------------------------------- CORS injection on the LLM fast path (real sockets)
@@ -554,6 +604,110 @@ class TestCorsInjectionOnLlmPath:
         # The exact bytes the backend sent arrive intact and are NOT modified (no CORS injected).
         assert delivered == partial_head
         assert b"Access-Control-Allow-Origin" not in delivered
+
+
+# --------------------------------------------------------------------------- CORS-only injection on the LLM fast path (real sockets)
+class TestCorsOnlyInjectionOnLlmPath:
+    """The non-blocking injection window now emits CORS ONLY — no TTFB measurement and no
+    RFC 9211 Cache-Status header. Prompt-cache hit/miss is classified authoritatively by AC from
+    llama.cpp's ``cached_tokens`` in the usage object, so the forwarder no longer injects any
+    cache-status line."""
+
+    def test_warm_path_injects_cors_but_no_cache_status(self):
+        # Warm path: complete head already buffered -> CORS injected and the bytes AFTER the head
+        # marker (``rest``) are preserved. Crucially, NO Cache-Status header is appended — the
+        # forwarder only splices CORS now.
+        f = _fwd()
+        head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 16\r\n\r\n")
+        body = b'{"choices": []}\r\n'   # bytes beyond the head marker that must survive
+        delivered = _send_and_read(f, head + body)
+        # CORS injected exactly once (warm hit).
+        assert delivered.count(b"Access-Control-Allow-Origin: *") == 1
+        # Cache-Status is GONE — no cache-status line of any kind.
+        assert b"Cache-Status" not in delivered
+        # Original head preserved and body (the ``rest`` after \r\n\r\n) NOT lost.
+        assert b"Content-Type: application/json\r\n" in delivered
+        assert body in delivered
+
+    def test_warm_path_full_pipe_no_cache_status(self):
+        # End-to-end via the full fast path: CORS lands exactly once and NO Cache-Status is added.
+        f = _fwd()
+        backend_resp = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                        b"Content-Length: 16\r\n\r\n") + b'{"choices": []}\r\n'
+        delivered, _ = _client_side(f, backend_resp)
+        assert delivered.count(b"Access-Control-Allow-Origin: *") == 1
+        assert b"Cache-Status" not in delivered
+
+    def test_partial_head_no_injection(self):
+        # Partial head on first recv -> NO injection of any kind (CORS absent). Nothing dropped.
+        f = _fwd()
+        full_head = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: 5\r\n\r\n")
+        body = b"hello"
+        fragment1 = full_head[:20]
+        fragment2 = full_head[20:]
+        delivered, _ = _client_side(f, fragment1, extra_backend=fragment2 + body)
+        assert b"Cache-Status" not in delivered
+        assert b"Access-Control-Allow-Origin" not in delivered
+        # Nothing dropped.
+        assert body in delivered
+
+    def test_empty_recv_no_injection(self):
+        # Backend closes before sending anything -> empty recv -> no injection at all.
+        f = _fwd()
+        delivered = _send_and_read(f, b"")
+        assert delivered == b""
+
+    def test_backend_already_cors_no_double_inject(self):
+        # Backend already sends CORS -> our CORS is skipped (no double-inject), and no Cache-Status.
+        f = _fwd()
+        backend_resp = (b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n"
+                        b"Content-Length: 5\r\n\r\n") + b"hello"
+        delivered, _ = _client_side(f, backend_resp)
+        # Exactly one Access-Control-Allow-Origin (the backend's), no duplicate from us.
+        assert delivered.count(b"Access-Control-Allow-Origin: *") == 1
+        assert b"Cache-Status" not in delivered
+
+    def test_cold_path_no_blocking_wait_and_socket_stays_blocking(self):
+        """Regression: a COLD miss (no bytes buffered yet) must add ZERO latency.
+
+        The old implementation used ``select(..., 2.0)`` and burned the full 2 s waiting for a
+        cold prompt-eval before giving up. The fix is a pure poll (timeout 0.0): it returns
+        immediately with whatever is already buffered, so an empty buffer -> instant skip.
+
+        We use a REAL loopback pair (not socketpair) because Windows socketpair() uses overlapped
+        I/O and ignores setblocking/timeout — only a genuine connected socket lets us observe the
+        "nothing ready" state deterministically. With nothing sent, select(0.0) returns empty in
+        microseconds; the old 2.0-timeout code would take ~2 s here, so elapsed < 1.0 s is a
+        robust discriminator between the two implementations.
+
+        Also asserts the socket is still in BLOCKING mode afterwards (the pipe's Windows select
+        requires blocking sockets — see _pipe_to_backend), i.e. no setblocking toggle leaked.
+        """
+        f = _fwd()
+        client, backend_fwd, listen_sock = _loopback_client()
+        try:
+            t0 = time.monotonic()
+            f._inject_cors_nonblocking(client, backend_fwd)
+            elapsed = time.monotonic() - t0
+            # Zero-wait poll: returns immediately. Old 2.0-timeout code would be ~2 s here.
+            assert elapsed < 1.0, f"cold path added {elapsed:.3f}s of wait (should be ~0)"
+            # No injection happened -> nothing was forwarded to the client.
+            client.settimeout(0.2)
+            try:
+                assert client.recv(65536) == b"", "cold path must not forward any bytes to the client"
+            except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError):
+                pass  # nothing sent / closed -> still "no bytes delivered"
+            # Socket stays blocking (the pipe's Windows select requires blocking sockets).
+            assert backend_fwd.getblocking() is True, "socket must remain blocking after the cold-path skip"
+        finally:
+            for s in (client, backend_fwd, listen_sock):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
 
 
 # --------------------------------------------------------------------------- AC fast path unchanged (only CORS added)
