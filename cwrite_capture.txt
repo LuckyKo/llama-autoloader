@@ -1,0 +1,22 @@
+
+===== REQUEST from ('127.0.0.1', 49162) (549 bytes) @ 00:04:35 =====
+--- HEADERS ---
+OPTIONS /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:9999
+Connection: keep-alive
+Accept: */*
+Access-Control-Request-Method: POST
+Access-Control-Request-Headers: content-type
+Origin: http://localhost:3136
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: cross-site
+Sec-Fetch-Dest: empty
+Referer: http://localhost:3136/
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: en-US,en;q=0.9,ro;q=0.8
+dnt: 1
+sec-gpc: 1
+
+
+--- BODY (0B) first 2000 chars ---

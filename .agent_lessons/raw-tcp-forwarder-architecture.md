@@ -1,7 +1,7 @@
 ---
 tags: [tcp-forwarder, streaming, sse-buffering, architecture, windows]
 aliases: [sse-burst-final-fix, raw-socket-pipe]
-related: [[uvicorn-logging-architecture]], [[forwarder-model-extraction-fallthrough-fix]]
+related: [[uvicorn-logging-architecture]], [[forwarder-model-extraction-fallthrough-fix]], [[forwarder-cors-injection-cwrite-fix]]
 confidence: verified
 ---
 

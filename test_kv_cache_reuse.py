@@ -1,19 +1,24 @@
+# WARNING: Run this test in SYNCHRONOUS mode (not async/background).
+# The test takes several minutes (model load + 3 turns + save/restore + step 7).
+# Running it async causes the agent running on AC to interfere with the test
+# If you are an AI agent: use shell_cmd with timeout=600 and do set async_mode=false.
+
 """Test KV cache reuse after slot restore with our patched llama-server.
 
-This tests the specific fix in server-context.cpp lines 3358-3365:
-After restoring slot state, resending the SAME prompt should use the restored
-KV cache instead of forcing full reprocess (the old buggy behavior).
+Simulates real AC usage: model is unloaded (LRU eviction), reloaded, and
+slot state is restored. The next prompt (with appended content) should use
+the restored KV cache via LCP matching, with only the suffix + re-eval
+tokens processed instead of a full reprocess.
 
 Flow:
   1. Load model
   2. Send large prompt (~8k tokens) — baseline timing
-  3. Save slot state  
-  4. Unload model
+  3. Save slot state
+  4. Unload model (simulates LRU eviction / model switch)
   5. Reload model (new process)
-  6. Restore slot state
-  7. Send EXACT SAME prompt again — should be fully cached now with our fix
-     Before fix: ~8k tokens reprocessed in ~100s+
-     After fix: near-zero processing time, all tokens cached
+  6. Restore slot state (loads KV + tokens from disk)
+  7. Send same prompt + appended content (simulates AC's next message)
+     Expect: most tokens cached via LCP, only suffix + re-eval processed
 """
 
 import json
@@ -21,8 +26,8 @@ import sys
 import time
 import urllib.request
 
-BASE = "http://127.0.0.1:9124"  # autoloader port from config.yaml
-MODEL = "Qwen3-4B-Instruct-2507-Q6_K.gguf"  # Smaller Qwen3 model, no GPU-specific config
+BASE = "http://127.0.0.1:1234"  # autoloader port from config.yaml
+MODEL = "Qwen3.8-27B-Ablit"  # Smaller Qwen3 model, no GPU-specific config
 PROMPT_REPEATS = 200  # ~8k tokens
 HTTP_TIMEOUT = 600
 
@@ -70,17 +75,42 @@ def build_large_prompt(n_repeats: int = PROMPT_REPEATS) -> str:
 
 def main():
     large_text = build_large_prompt()
+
+    # Build a multi-turn conversation history (mirrors real AC usage where
+    # multiple turns accumulate before a model switch / LRU eviction happens).
+    # We do 3 turns to build up realistic context.
+    history: list[dict] = []
+    turn_texts = [
+        large_text,
+        "Summarize the key points from the text above in one sentence.",
+        "Now explain what 'transformers' means in the context of that summary.",
+    ]
+
     messages = [{"role": "user", "content": large_text}]
 
-    # Step 0: Unload model to ensure clean state
+    # Step 0: Unload ALL models to ensure clean state
+    # (The target model may not be the one currently loaded; with max_loaded_models=1,
+    #  any other loaded model will block our load and cause a 503.)
     print("=" * 60)
     print("STEP 0: Ensuring clean state...")
     print("=" * 60)
     try:
-        api(f"/v1/models/{MODEL}/unload", "POST")
-        print("  Model unloaded")
+        models = api("/v1/models", "GET")
+        loaded = [m for m in models.get("data", []) if m.get("loaded")]
+        if not loaded:
+            print("  No models loaded, clean state confirmed")
+        for m in loaded:
+            mid = m["id"]
+            print(f"  Unloading: {mid}")
+            try:
+                api(f"/v1/models/{mid}/unload", "POST")
+            except Exception as e:
+                print(f"    Note: unload failed ({e})")
+        # Brief pause to let the autoloader fully release the slot
+        import time as _t
+        _t.sleep(2)
     except Exception as e:
-        print(f"  Note: Model not loaded or already unloaded ({e})")
+        print(f"  Warning: Could not query model list ({e}), proceeding anyway")
 
     # Step 1: Load model
     print("\n" + "=" * 60)
@@ -100,28 +130,48 @@ def main():
     except Exception as e:
         print(f"  WARNING: Failed to reset slot ({e})")
 
-    # Step 2: Send large prompt — baseline (first time, no cache)
+    # Step 2: Build multi-turn history (mirrors AC's accumulated conversation)
     print("\n" + "=" * 60)
-    print("STEP 2: Sending large prompt (~8k tokens) — BASELINE...")
+    print("STEP 2: Building multi-turn history (3 turns)...")
     print("=" * 60)
-    t0 = time.time()
-    res_step2 = chat(port, messages, max_tokens=30)
-    t1 = time.time()
-    
-    usage = res_step2["usage"]
-    timings = res_step2.get("timings", {})
-    cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-    prompt_n = timings.get("prompt_n", 0)
-    prompt_ms = timings.get("prompt_ms", 0)
-    
-    print(f"  Prompt tokens: {usage['prompt_tokens']}")
-    print(f"  Cached tokens: {cached}, Processed: {prompt_n}")
-    print(f"  Prompt eval time: {prompt_ms:.1f} ms ({prompt_ms/max(prompt_n,1):.2f} ms/tok)")
-    print(f"  Wall time: {t1-t0:.2f}s")
-    
-    baseline_prompt_tokens = usage['prompt_tokens']
-    baseline_processed = prompt_n
+    last_res = None
+    for i, turn_text in enumerate(turn_texts):
+        # Build messages with full history up to this turn
+        if i == 0:
+            msgs = [{"role": "user", "content": turn_text}]
+        else:
+            msgs = history + [{"role": "user", "content": turn_text}]
+
+        t0 = time.time()
+        last_res = chat(port, msgs, max_tokens=30)
+        t1 = time.time()
+
+        usage = last_res["usage"]
+        timings = last_res.get("timings", {})
+        cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        prompt_n = timings.get("prompt_n", 0)
+        prompt_ms = timings.get("prompt_ms", 0)
+        msg_obj = last_res["choices"][0]["message"]
+        assistant_msg = msg_obj.get("content", "") or ""
+        reasoning_msg = msg_obj.get("reasoning_content", "") or ""
+
+        asst_obj = {"role": "assistant", "content": assistant_msg}
+        if reasoning_msg:
+            asst_obj["reasoning_content"] = reasoning_msg
+
+        print(f"  Turn {i+1}: prompt={usage['prompt_tokens']} tok, "
+              f"cached={cached}, processed={prompt_n}, "
+              f"eval={prompt_ms:.0f}ms, wall={t1-t0:.1f}s")
+
+        # Append to history: user turn + assistant response (with reasoning_content field)
+        history.append({"role": "user", "content": turn_text})
+        history.append(asst_obj)
+
+    baseline_prompt_tokens = last_res["usage"]["prompt_tokens"]
+    baseline_processed = timings.get("prompt_n", 0)
     baseline_ms = prompt_ms
+    print(f"\n  History built: {len(history)} messages, "
+          f"last prompt={baseline_prompt_tokens} tokens")
 
     # Step 3: Save slot state
     print("\n" + "=" * 60)
@@ -167,14 +217,19 @@ def main():
         print(f"  ERROR: Restore reported {n_restored} tokens (expected > 0)")
         sys.exit(1)
 
-    # Step 7: CRITICAL TEST — Send EXACT SAME prompt again
-    # With our fix: should be fully cached (prompt_n ~= 0 or very small delta)
-    # Without fix: full reprocess (~8k tokens, ~100s+)
+    # Step 7: CRITICAL TEST — Send next turn with full history (mirrors AC)
+    # In real AC, after a state restore the next request includes the full
+    # conversation history plus new user input. The tokenized prompt matches
+    # slot.prompt.tokens (which includes all prior turns + generated tokens),
+    # so LCP should give us a high n_past and only the new turn is processed.
     print("\n" + "=" * 60)
-    print("STEP 7: CRITICAL TEST — Resending SAME prompt after restore...")
+    print("STEP 7: CRITICAL TEST — Next turn after restore (full history)...")
     print("=" * 60)
+    followup = "What is the capital of France? Answer in one word."
+    # Full history + new user message (exactly what AC sends)
+    messages_step7 = history + [{"role": "user", "content": followup}]
     t0 = time.time()
-    res_step7 = chat(port2, messages, max_tokens=30)
+    res_step7 = chat(port2, messages_step7, max_tokens=30)
     t1 = time.time()
     
     usage = res_step7["usage"]
@@ -198,16 +253,18 @@ def main():
     print(f"    Processed: {prompt_n} tokens in {prompt_ms:.1f} ms")
     print(f"    Cached: {cached} tokens")
 
-    # With our fix: processed should be very small (< 5% of baseline), time similarly small
-    # Without fix: processed ~= baseline_processed, time ~= baseline_ms
-    if prompt_n < baseline_processed * 0.1:
-        print(f"\n  ✅ FIX WORKING! Only {prompt_n} tokens reprocessed vs {baseline_processed} baseline")
+    # With our fix: most of the original prompt is cached (LCP match), only the
+    # appended suffix + re-eval tokens are processed. Expect < 20% of baseline.
+    # Without fix: full reprocess ~= baseline_processed or more.
+    if prompt_n < baseline_processed * 0.2:
+        print(f"\n  [SUCCESS] FIX WORKING! Only {prompt_n} tokens reprocessed vs {baseline_processed} baseline")
         print(f"     Speedup: {baseline_ms/max(prompt_ms,1):.1f}x faster")
-    elif cached >= baseline_prompt_tokens * 0.9:
-        print(f"\n  ✅ FIX WORKING! {cached}/{baseline_prompt_tokens} tokens cached")
+        print(f"     (Expected: ~suffix tokens + up to 16 re-eval tokens)")
+    elif cached >= baseline_prompt_tokens * 0.8:
+        print(f"\n  [SUCCESS] FIX WORKING! {cached}/{baseline_prompt_tokens} original tokens cached")
     else:
-        print(f"\n  ❌ FIX NOT WORKING — Full reprocess detected!")
-        print(f"     Expected <{int(baseline_processed*0.1)} tokens processed, got {prompt_n}")
+        print(f"\n  [FAILED] FIX NOT WORKING -- Full reprocess detected!")
+        print(f"     Expected <{int(baseline_processed*0.2)} tokens processed, got {prompt_n}")
         sys.exit(1)
 
     # Cleanup
@@ -230,7 +287,7 @@ def main():
             print(f"  Note: Failed to remove {state_file} ({e})")
 
     print("\n" + "=" * 60)
-    print("TEST PASSED ✅")
+    print("TEST PASSED")
     print("=" * 60)
 
 

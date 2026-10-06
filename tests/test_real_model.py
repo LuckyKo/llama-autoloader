@@ -20,6 +20,7 @@ never touched.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import urllib.request
@@ -38,6 +39,11 @@ log = logging.getLogger(__name__)
 MODEL_ID = "Qwen2.5-0.5B-Instruct-Q8_0.gguf"
 _ROOT_DIR = Path("N:/work/stuff/Beta")
 _BACKENDS_DIR = Path(__file__).resolve().parent.parent / "backends"
+
+# Our freshly-built multi-GPU CUDA backend (vanilla llama.cpp, 2x RTX 5060 Ti).
+# Pinned explicitly because the "first scanned backend" fallback would otherwise
+# pick the alphabetically-first CPU-patched backend instead of this one.
+CUSTOM_BACKEND = "llama.cpp-win-x86_64-nvidia-cuda12-avx2-local"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +122,12 @@ def real_model_manager(isolated_manager):
     # Repoint at the real model tree + backend binaries (read-only use).
     mgr.root_dir = _ROOT_DIR.resolve()
     mgr.backends_dir = _BACKENDS_DIR.resolve()
+    # Force our custom multi-GPU CUDA backend (priority-2 resolution path), so we
+    # don't accidentally exercise the alphabetically-first CPU-patched backend.
+    assert (_BACKENDS_DIR / CUSTOM_BACKEND / "llama-server.exe").is_file(), (
+        f"custom backend binary missing: {_BACKENDS_DIR / CUSTOM_BACKEND / 'llama-server.exe'}"
+    )
+    mgr.selected_backend = CUSTOM_BACKEND
     # Small context keeps the 0.5B CPU/CUDA load well under the readiness timeout.
     mgr.default_args = "--no-webui --parallel 1 --jinja"
 
@@ -168,8 +180,11 @@ def _apply_test_overrides(mgr) -> None:
     """Apply test-specific overrides to the model config AFTER startup scan.
 
     The sidecar for this model contains LM-Studio-specific args ("-dev cuda1")
-    and n_gpu_layers=999 that are incompatible with the CPU-patched backend.
-    We strip those so the real llama-server.exe can start cleanly on CPU.
+    that our vanilla CUDA backend doesn't understand, so we strip them. We then
+    push ALL layers onto the GPUs (n_gpu_layers=999) so the round-trip exercises
+    the real multi-GPU CUDA path: llama.cpp's default split mode is 'layer', which
+    spreads layers across every visible GPU (here both RTX 5060 Ti) using the
+    built-in internal allreduce — no NCCL required on Windows.
     """
     cfg = mgr.models.get(MODEL_ID)
     if cfg is None:
@@ -179,8 +194,8 @@ def _apply_test_overrides(mgr) -> None:
         cfg.ctx_size = 4096
     # Strip GPU-specific sidecar args that vanilla llama.cpp doesn't understand.
     cfg.args = ""
-    # CPU-only: no GPU offload (the CPU-patched backend has no CUDA).
-    cfg.n_gpu_layers = 0
+    # Offload all layers to the GPUs (both visible CUDA devices, 'layer' split).
+    cfg.n_gpu_layers = 999
 
 
 def _load_via_api(client, model_id: str = MODEL_ID):
@@ -272,17 +287,27 @@ class TestRealModelLoad:
         mgr = server.manager
         _apply_test_overrides(mgr)
         try:
-            _load_via_api(real_client)
+            port, _pid = _load_via_api(real_client)
 
-            # Tiny chat/completion through the proxy (real inference on CPU/CUDA).
-            r = real_client.post("/v1/chat/completions", json={
+            # The LLM data path is now served by the RawTCPForwarder on the MAIN port, NOT by
+            # FastAPI (the old /v1/chat/completions proxy route was removed). So this round-trip
+            # targets the llama-server child DIRECTLY on its own port — still real inference,
+            # and it confirms the loaded backend actually serves completions.
+            payload = {
                 "model": MODEL_ID,
                 "messages": [{"role": "user", "content": "Say hello in one word."}],
                 "max_tokens": 16,
                 "stream": False,
-            })
-            assert r.status_code == 200, f"completion proxy failed: {r.text[:500]}"
-            data = r.json()
+            }
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                assert resp.status == 200
+                data = json.loads(resp.read().decode("utf-8"))
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
             assert isinstance(content, str) and content.strip(), (
                 f"expected non-empty generated content, got {content!r} from {str(data)[:500]}"
