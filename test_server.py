@@ -300,12 +300,36 @@ class TestListStates:
     @pytest.mark.asyncio
     async def test_lists_existing_states(self, manager):
         labels = await manager.list_states("model-a.gguf")
-        # list_states extracts label as p.stem.split(".", 1)[1]
-        # For file "model-a.gguf.default.bin", stem="model-a.gguf.default"
-        # split(".",1) → ["model-a", "gguf.default"] → label="gguf.default"
+        # label is derived by stripping the known "{mid_clean}." prefix from p.stem,
+        # so the number of dots in the model id doesn't matter
         assert len(labels) == 2
-        assert "gguf.default" in labels
-        assert "gguf.convo1" in labels
+        assert "default" in labels
+        assert "convo1" in labels
+
+    @pytest.mark.asyncio
+    async def test_dotted_model_name(self, manager, tmp_model_dir):
+        # Regression: model ids with embedded dots (e.g. "Qwen3.8-...") used to
+        # mangle the label via split(".", 1)[1] → "8-27B-..." instead of "default"
+        dotted = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        # Register the model in root_dir and re-scan so resolve_model_id hits
+        # the exact-match branch (without it, resolution falls back to the
+        # default-marked model-b.gguf and this test would be vacuous)
+        (tmp_model_dir / dotted).write_bytes(b"GGUF_HEADER" * 50)
+        manager.scan()
+        assert await manager.resolve_model_id(dotted) == dotted
+        (manager.save_state_dir / f"{dotted}.default.bin").write_bytes(b"state")
+        labels = await manager.list_states(dotted)
+        assert labels == ["default"]
+
+    @pytest.mark.asyncio
+    async def test_dotted_label(self, manager, tmp_model_dir):
+        # A label containing a dot must survive intact (not truncated at the dot)
+        dotted = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        (tmp_model_dir / dotted).write_bytes(b"GGUF_HEADER" * 50)
+        manager.scan()
+        (manager.save_state_dir / f"{dotted}.v1.2.bin").write_bytes(b"state")
+        labels = await manager.list_states(dotted)
+        assert labels == ["v1.2"]
 
     @pytest.mark.asyncio
     async def test_empty_states(self, manager):

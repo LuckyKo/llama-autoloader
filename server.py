@@ -1172,7 +1172,7 @@ class ModelManager:
         mid_clean = self._sanitize_model_id(model_id)
         out = []
         for p in self.save_state_dir.glob(f"{mid_clean}.*.bin"):
-            label = p.stem.split(".", 1)[1]
+            label = p.stem[len(mid_clean) + 1:]   # Strip the known model-id prefix and its trailing dot.
             out.append(label)
         return out
 
