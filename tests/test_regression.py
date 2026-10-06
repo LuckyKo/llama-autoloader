@@ -466,7 +466,9 @@ class TestState:
         (mgr.save_state_dir / "m.gguf.default.bin").write_bytes(b"1")
         (mgr.save_state_dir / "m.gguf.convo1.bin").write_bytes(b"2")
         labels = await mgr.list_states("m.gguf")
-        assert set(labels) == {"gguf.default", "gguf.convo1"}
+        # list_states strips the "<model_id>." prefix, so labels are the bare slot
+        # names (server.list_states; commit 68e79bc "fix(state): list_states label mangled").
+        assert set(labels) == {"default", "convo1"}
 
     async def test_list_states_empty(self, mgr):
         assert await mgr.list_states("m.gguf") == []

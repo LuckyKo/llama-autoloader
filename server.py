@@ -44,6 +44,11 @@ import uvicorn
 # bind to our capturing stdout/stderr streams and land in the log file.
 from logger import init_logging
 
+# Strata "bridge card" engine-specific launch seam (see strata_adapter.py). _launch_llama
+# reproduces today's llama-server argv byte-for-byte (env/cwd are None); _launch_strata
+# builds the Strata serve argv + derived config + scrubbed env.
+from strata_adapter import _launch_llama, _launch_strata
+
 # --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
@@ -184,6 +189,19 @@ class ModelConfig:
     estimated_vram_mb: int = 0      # hint; 0 = unknown
     tags: List[str] = field(default_factory=list)
     gguf_name: str = ""             # embedded name from GGUF metadata
+    # --- Strata "bridge card" fields (defaulted; llama cards ignore them) ---
+    engine: str = "llama"           # "llama" (default) | "strata"
+    strata_config: str = ""         # absolute path to the Strata engine config (strata only)
+    min_free_vram_mib: int = 0      # 0 = off; >0 → --min-free-vram-mib (VRAM 503 safety net)
+    extra_args: List[str] = field(default_factory=list)  # appended verbatim to the serve argv
+
+    @property
+    def is_strata(self) -> bool:
+        return (self.engine or "llama") == "strata"
+
+    @property
+    def is_llama(self) -> bool:
+        return (self.engine or "llama") == "llama"
 
     @classmethod
     def default_for(cls, gguf_path: Path) -> "ModelConfig":
@@ -203,6 +221,10 @@ class ModelConfig:
             estimated_vram_mb=0,
             tags=[],
             gguf_name="",
+            engine="llama",
+            strata_config="",
+            min_free_vram_mib=0,
+            extra_args=[],
         )
 
     @classmethod
@@ -224,6 +246,24 @@ class ModelConfig:
     def save(self, gguf_path: Path) -> None:
         sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
         sidecar.write_text(json.dumps(asdict(self), indent=2))
+
+    def save_strata_card(self, card_path: Path) -> None:
+        """Write the editable card-overlay fields to a Strata card file.
+
+        Persists only the fields a user can edit in the WebUI; ``engine`` and
+        ``strata_config`` are derived at scan time and must NOT be written back
+        (keeps ``save`` gguf-only and unchanged).
+        """
+        card = {
+            "name": self.name,
+            "description": self.description,
+            "pinned": self.pinned,
+            "default": self.default,
+            "tags": self.tags,
+            "min_free_vram_mib": self.min_free_vram_mib,
+            "extra_args": self.extra_args,
+        }
+        card_path.write_text(json.dumps(card, indent=2))
 
     def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None, slot_save_dir: Optional[Path] = None, model_id: Optional[str] = None) -> List[str]:
         """Build argv for llama-server."""
@@ -311,6 +351,9 @@ class ModelManager:
         self.gguf_paths: Dict[str, Path] = {}         # id -> path
         self.mmproj_paths: Dict[str, Path] = {}       # id -> mmproj path
         self.loaded: Dict[str, LoadedModel] = {}      # id -> loaded instance
+        # Strata "bridge card" support: {} => feature fully inert (no strata: section).
+        self.strata_cfg = cfg.get("strata") or {}
+        self.temp_dir = Path(__file__).resolve().parent / "temp"
         self._lock = asyncio.Lock()
         self._loading_tasks: Dict[str, asyncio.Task] = {}
         self._stop = False
@@ -386,6 +429,17 @@ class ModelManager:
             raise ValueError("Config missing 'llama_server' section")
         if not ls.get("binary"):
             raise ValueError("Config 'llama_server.binary' is required")
+
+        # strata section (optional). A bad Strata config must NEVER stop the llama
+        # path from booting, so these are warnings only (not raises).
+        strata = cfg.get("strata")
+        if strata:
+            if not strata.get("venv_python"):
+                log.warning("strata.venv_python is missing; Strata bridge cards will not launch")
+            if not strata.get("serve_script"):
+                log.warning("strata.serve_script is missing; Strata bridge cards will not launch")
+            if strata.get("enabled") and strata.get("configs_dir") and not Path(strata["configs_dir"]).is_dir():
+                log.warning(f"strata.configs_dir {strata['configs_dir']} is not a directory; Strata cards disabled")
 
     # ---------------- backend discovery & resolution ----------------
     def list_backends(self) -> List[Dict[str, Any]]:
@@ -518,6 +572,50 @@ class ModelManager:
 
         return paired_mmproj
 
+    def _scan_strata_cards(self) -> None:
+        """Additive: register Strata engine configs as bridge cards. Never touches gguf entries.
+
+        Inert when there is no ``strata:`` section (or it is disabled). Idempotent across
+        rescans: a gguf card of the same id wins (inserted earlier in ``scan()``), and strata
+        ids are only added where free.
+        """
+        sc = self.strata_cfg
+        if not sc.get("enabled") or not sc.get("configs_dir"):
+            return
+        cfg_dir = Path(sc["configs_dir"])
+        if not cfg_dir.is_dir():
+            log.warning(f"strata.configs_dir {cfg_dir} is not a directory; Strata cards disabled")
+            return
+        cards_dir = Path(sc.get("cards_dir", "./strata_cards"))
+        for p in sorted(cfg_dir.glob("*.json")):
+            if p.name.endswith(".shared-settings.json"):
+                continue
+            try:
+                data = json.loads(p.read_text(encoding="utf-8-sig"))
+            except Exception as e:
+                log.warning(f"Skipping strata config {p}: {e}")
+                continue
+            if not isinstance(data, dict) or "exe" not in data:
+                continue                                   # not an engine config
+            mid = p.stem
+            if mid in self.models:
+                continue                                   # a llama/gguf card of the same id wins
+            base = ModelConfig.default_for(p)
+            base.engine = "strata"
+            base.strata_config = str(p)
+            base.name = data.get("model_name") or mid
+            base.auto_save_state = False                   # slot save/restore is llama-only
+            card = cards_dir / f"{mid}.json"
+            if card.exists():
+                try:
+                    for k, v in json.loads(card.read_text(encoding="utf-8-sig")).items():
+                        if hasattr(base, k):
+                            setattr(base, k, v)
+                except Exception as e:
+                    log.warning(f"Bad strata card {card}: {e}")
+            self.models[mid] = base
+            log.info(f"Discovered Strata bridge card: {mid} -> {p}")
+
     def scan(self) -> List[str]:
         """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
         all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
@@ -578,6 +676,10 @@ class ModelManager:
                     cfg.max_ctx_size = max_ctx
             except Exception as e:
                 log.debug(f"Failed to read GGUF metadata for {mid}: {e}")
+        # Additive Strata bridge-card pass (inert with no strata: section). Runs AFTER the
+        # gguf metadata loop; strata ids never enter self.gguf_paths, so _read_gguf_metadata
+        # is never called on a JSON file (R5).
+        self._scan_strata_cards()
         log.info(f"Scan complete: {len(self.models)} models found (filtered {len(mmproj_paths)} mmproj vision modules)")
         return list(self.models.keys())
 
@@ -631,7 +733,8 @@ class ModelManager:
         for mid, cfg in snapshots:
             loaded = loaded_snap.get(mid)
             size_mb = sizes_snap.get(mid, 0.0)
-            resolved_bin = self.resolve_binary(cfg)
+            # Strata cards have no llama binary; surface an empty resolved_binary for them.
+            resolved_bin = self.resolve_binary(cfg) if cfg.is_llama else ""
             mmproj_p = mmproj_snap.get(mid)
             has_mmproj = mmproj_p is not None and mmproj_p.exists()
             out.append({
@@ -643,6 +746,8 @@ class ModelManager:
                 "pinned": cfg.pinned,
                 "auto_save_state": cfg.auto_save_state or self.default_auto_save_state,
                 "backend": cfg.backend,
+                "engine": cfg.engine or "llama",
+                "strata_config": cfg.strata_config,
                 "resolved_binary": resolved_bin,
                 "has_mmproj": has_mmproj,
                 "use_mmproj": cfg.use_mmproj,
@@ -706,7 +811,9 @@ class ModelManager:
         async with self._lock:
             if mid not in self.models:
                 raise KeyError(model_id_or_alias)
-            path = self.gguf_paths[mid]
+            cfg = self.models[mid]
+            is_strata = cfg.is_strata
+            path = None if is_strata else self.gguf_paths[mid]
             # Uniqueness guard: `name` is now the retrieval key, so it must stay
             # unique (case-insensitive). Reject a name already used by ANOTHER model.
             if new_cfg.name:
@@ -720,14 +827,22 @@ class ModelManager:
                             f"'{other_cfg.name}' (model ID '{other_mid}'); names must be unique (they are the retrieval key)."
                         )
 
-        # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
-        # mmproj_file is written to the sidecar (matches scan() behavior).
-        mmprojs = self._list_mmproj_files()
-        paired = self._pair_mmproj(path, new_cfg, mmprojs)
-        if paired is not None and not new_cfg.mmproj_file:
-            new_cfg.mmproj_file = paired.name
+        paired = None
+        if is_strata:
+            # Strata bridge cards have no gguf path / mmproj pairing; persist only the
+            # editable card-overlay fields to cards_dir (engine/strata_config are derived).
+            save_path = Path(self.strata_cfg.get("cards_dir", "./strata_cards")) / f"{self._sanitize_model_id(mid)}.json"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(new_cfg.save_strata_card, save_path)
+        else:
+            # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
+            # mmproj_file is written to the sidecar (matches scan() behavior).
+            mmprojs = self._list_mmproj_files()
+            paired = self._pair_mmproj(path, new_cfg, mmprojs)
+            if paired is not None and not new_cfg.mmproj_file:
+                new_cfg.mmproj_file = paired.name
+            await asyncio.to_thread(new_cfg.save, path)
 
-        await asyncio.to_thread(new_cfg.save, path)
         async with self._lock:
             self.models[mid] = new_cfg
             if mid in self.loaded:
@@ -756,6 +871,19 @@ class ModelManager:
     @staticmethod
     def _sanitize_label(label: str) -> str:
         return ModelManager.sanitize_safe_string(label)
+
+    def _require_llama_engine(self, cfg) -> None:
+        """405 gate for llama-only operations (state save/restore, vision toggle).
+
+        Only blocks a *known* non-llama card; an unknown id (cfg is None) falls through
+        to the normal downstream 404/500 handling, matching the original inline behaviour.
+        """
+        if cfg is not None and not cfg.is_llama:
+            raise HTTPException(405, "Operation not supported for this engine")
+
+    def _strata_derived_path(self, model_id: str) -> Path:
+        """Deterministic path of the derived Strata config (write at launch, unlink at unload)."""
+        return self.temp_dir / "strata" / f"{self._sanitize_model_id(model_id)}.json"
 
     # ---------------- process lifecycle & port allocation ----------------
     def _is_port_available(self, port: int) -> bool:
@@ -848,22 +976,28 @@ class ModelManager:
                     await self._unload_unlocked(model_id)
                 await self._evict_lru_if_needed(model_id)
                 cfg = self.models[model_id]
-                path = self.gguf_paths[model_id]
                 port = self._allocate_port()
-                binary_path = self.resolve_binary(cfg)
-                mmproj_p = self.mmproj_paths.get(model_id)
-                argv = [binary_path] + cfg.to_launch_args(path, port, self.default_args, mmproj_full_path=mmproj_p, slot_save_dir=self.save_state_dir, model_id=model_id)
+                # Engine dispatch: Strata bridge cards build their own argv/cwd/env; the
+                # llama path is byte-identical to before (env/cwd are None → inherit).
+                if cfg.is_strata:
+                    artifact = Path(cfg.strata_config)
+                    argv, cwd, env = _launch_strata(self, cfg, model_id, port)
+                else:
+                    artifact = self.gguf_paths[model_id]
+                    argv, cwd, env = _launch_llama(self, cfg, model_id, artifact, port)
 
-                log.info(f"Launching llama-server ({binary_path}) for {model_id} on port {port}")
+                log.info(f"Launching {cfg.engine or 'llama'} for {model_id} on port {port}")
                 log.info("argv: " + " ".join(argv))
 
-                # Spawn process
+                # Spawn process (env/cwd are None for llama → inherit, byte-identical).
                 if platform.system() == "Windows":
                     proc = subprocess.Popen(
                         argv,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                        env=env,
+                        cwd=cwd,
                     )
                 else:
                     proc = subprocess.Popen(
@@ -871,11 +1005,13 @@ class ModelManager:
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
+                        env=env,
+                        cwd=cwd,
                     )
 
                 lm = LoadedModel(
                     model_id=model_id,
-                    gguf_path=path,
+                    gguf_path=artifact,
                     config=cfg,
                     port=port,
                     process=proc,
@@ -886,8 +1022,11 @@ class ModelManager:
                 self._start_log_thread(model_id, proc)
                 self._status_cache = None  # Force status cache rebuild after load
 
-            # Wait until ready OUTSIDE the lock!
-            ready = await self._wait_until_ready(port, proc=proc)
+            # Wait until ready OUTSIDE the lock! Strata first loads are slow (multi-GPU);
+            # use the longer strata ready-timeout for them, and the original 120s for llama.
+            ready = await self._wait_until_ready(port, proc=proc, timeout=(
+                self.strata_cfg.get("ready_timeout_seconds", 600)
+                if cfg.is_strata else 120.0))
             lm.ready = ready
             if not ready:
                 log.error(f"Model {model_id} failed to become ready")
@@ -898,8 +1037,10 @@ class ModelManager:
             log.info(f"Model {model_id} ready on port {port}")
             lm.touch()
 
-            # Auto-restore session state if enabled and cached auto state exists
-            if cfg.auto_save_state or self.default_auto_save_state:
+            # Auto-restore session state if enabled and cached auto state exists.
+            # Slot save/restore is llama-only: a strata card must never trigger it, even
+            # if the global default_auto_save_state is True.
+            if (cfg.auto_save_state or self.default_auto_save_state) and cfg.is_llama:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 if state_path.exists():
@@ -946,8 +1087,9 @@ class ModelManager:
         self._status_cache = None  # Force status cache rebuild on next request
         log.info(f"Unloading {model_id} (port {lm.port})")
 
-        # Auto-save session state if enabled
-        if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state):
+        # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
+        # card must never trigger it (even if the global default_auto_save_state is True).
+        if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state) and lm.config.is_llama:
             try:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
@@ -991,6 +1133,15 @@ class ModelManager:
                     pass
 
         await asyncio.to_thread(_kill_proc)
+
+        # Strata only: remove the derived config we wrote at launch. The path is
+        # deterministic, so this also covers LRU-evict, force-reload, and timeout-failure
+        # unloads (all route through here). The user's Strata JSON is never touched.
+        if lm.config.is_strata:
+            try:
+                self._strata_derived_path(model_id).unlink(missing_ok=True)
+            except Exception as e:
+                log.warning(f"Failed to delete derived strata config for {model_id}: {e}")
 
     async def unload_model(self, model_id_input: str):
         mid = await self.resolve_model_id(model_id_input)
@@ -1792,6 +1943,7 @@ async def toggle_vision_ep(model_id: str):
     if not mid:
         raise HTTPException(404, "Unknown model")
     cfg = await manager.get_config(mid)
+    manager._require_llama_engine(cfg)
     cfg.use_mmproj = not cfg.use_mmproj
     await manager.update_config(mid, cfg)
     return {"id": mid, "use_mmproj": cfg.use_mmproj, "mmproj_file": cfg.mmproj_file}
@@ -1826,6 +1978,9 @@ async def unload_all_ep():
 # ---------- state save / load ----------
 @app.post("/v1/models/{model_id}/state/save")
 async def save_state_ep(model_id: str, body: StateLabel):
+    mid = await manager.resolve_model_id(model_id)
+    cfg = await manager.get_config(mid) if mid else None
+    manager._require_llama_engine(cfg)
     try:
         p = await manager.save_state(model_id, body.label)
         size = p.stat().st_size
@@ -1838,6 +1993,9 @@ async def save_state_ep(model_id: str, body: StateLabel):
 
 @app.post("/v1/models/{model_id}/state/load")
 async def load_state_ep(model_id: str, body: StateLabel):
+    mid = await manager.resolve_model_id(model_id)
+    cfg = await manager.get_config(mid) if mid else None
+    manager._require_llama_engine(cfg)
     try:
         p = await manager.load_state(model_id, body.label)
         log.info(f"State restored for model={model_id} label={body.label} path={p.name}")
