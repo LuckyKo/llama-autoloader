@@ -51,6 +51,7 @@
         <option value="loaded">Loaded Only</option>
         <option value="offline">Offline Only</option>
       </select>
+      <button id="btn-add-strata">+ Add Strata</button>
     </div>
     <div class="right">JIT auto-loads models on API request. Click <b>Edit</b> to change launch flags.</div>
   </div>
@@ -78,7 +79,8 @@ Extensions:
   POST /v1/models/{id}/state/load              {"label":"default"} restore slot 0
   GET  /v1/models/{id}/state                   list saved labels
   DELETE /v1/models/{id}/state/{label}         delete saved label
-  POST /v1/scan                                rescan root dir for *.gguf
+  POST /v1/scan                                rescan root dir for *.gguf + Strata cards
+  POST /v1/models/strata                       add a Strata bridge card {"strata_config": "path.json"}
   POST /v1/unload_all                          unload everything
   POST /v1/raw/{id}/{path}                     raw pass-through to llama-server
   WS   /ws                                     live status stream (1 Hz)
@@ -167,17 +169,17 @@ Example cURL:
       <label>Description</label>
       <textarea id="f-desc"></textarea>
     </div>
-    <div class="form-row">
+    <div class="form-row" data-llama-only>
       <label>Backend Override (force specific llama-server build)</label>
       <select id="f-backend" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--fg);padding:8px 10px;border-radius:8px;font-family:var(--mono);font-size:12px;">
         <option value="">(Use Global Default)</option>
       </select>
     </div>
-    <div class="form-row">
+    <div class="form-row" data-llama-only>
       <label>Extra args (appended to llama-server CLI)</label>
       <textarea id="f-args"></textarea>
     </div>
-    <div class="form-row">
+    <div class="form-row" data-llama-only>
       <div class="row2">
         <div>
           <label id="f-ctx-label">ctx_size</label>
@@ -191,7 +193,7 @@ Example cURL:
     </div>
     <div class="form-row">
       <div class="row2">
-        <div>
+        <div data-llama-only>
           <label>estimated_vram_mb</label>
           <input id="f-vram" type="number" placeholder="0" />
         </div>
@@ -201,9 +203,21 @@ Example cURL:
         </div>
       </div>
     </div>
-    <div class="form-row">
+    <div class="form-row" data-llama-only>
       <label>Associated Vision Module (mmproj filename)</label>
       <input id="f-mmproj-file" placeholder="e.g. mmproj-model.gguf" />
+    </div>
+    <div class="form-row" data-strata-only>
+      <div class="row2">
+        <div>
+          <label>min_free_vram_mib</label>
+          <input id="f-min-free-vram-mib" type="number" min="0" placeholder="0" />
+        </div>
+        <div>
+          <label>extra_args (space sep, appended to Strata argv)</label>
+          <input id="f-extra-args" />
+        </div>
+      </div>
     </div>
     <div class="form-row">
       <label>
@@ -214,11 +228,11 @@ Example cURL:
         <input type="checkbox" id="f-pinned" style="width:auto;margin-right:6px;vertical-align:middle;" />
         pinned (never auto-unloaded)
       </label>
-      <label>
+      <label data-llama-only>
         <input type="checkbox" id="f-autosave" style="width:auto;margin-right:6px;vertical-align:middle;" />
         auto-save/restore session state on switch
       </label>
-      <label>
+      <label data-llama-only>
         <input type="checkbox" id="f-use-mmproj" style="width:auto;margin-right:6px;vertical-align:middle;" />
         enable Vision projector (--mmproj)
       </label>
@@ -226,6 +240,25 @@ Example cURL:
     <div class="btn-row" style="justify-content:flex-end;">
       <button id="modal-cancel">Cancel</button>
       <button class="primary" id="modal-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Strata bridge card modal -->
+<div class="modal-overlay" id="strata-add-overlay">
+  <div class="modal">
+    <h2>Add Strata bridge card</h2>
+    <div class="form-row">
+      <label>Strata engine config (path to JSON with an "exe" key)</label>
+      <input id="sa-config" placeholder="e.g. C:\Strata\codivai.json" />
+    </div>
+    <div class="form-row">
+      <label>Name (optional)</label>
+      <input id="sa-name" />
+    </div>
+    <div class="btn-row" style="justify-content:flex-end;">
+      <button id="sa-cancel">Cancel</button>
+      <button class="primary" id="sa-add">Add</button>
     </div>
   </div>
 </div>

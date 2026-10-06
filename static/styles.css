@@ -129,6 +129,12 @@ button.danger:hover { background: var(--red); border-color: var(--red); color: w
 .form-row textarea { min-height: 60px; resize: vertical; }
 .form-row .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
+/* Strata bridge-card gating in the edit modal. Inert for llama cards
+   (the overlay only gets the .strata class for strata engines). */
+[data-strata-only] { display: none; }
+.strata [data-llama-only] { display: none; }
+.strata [data-strata-only] { display: block; }
+
 .tag { display: inline-block; background: var(--bg3); border: 1px solid var(--border);
        padding: 2px 8px; border-radius: 999px; font-size: 10px; color: var(--muted);
        margin-right: 4px; font-family: var(--mono); }

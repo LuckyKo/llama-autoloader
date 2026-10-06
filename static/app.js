@@ -122,7 +122,7 @@ function buildButtonRowHTML(m) {
     <button data-act="edit" ${act ? 'disabled' : ''}>Edit</button>
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
-    <button data-act="states">States</button>
+    ${m.engine !== 'strata' ? '<button data-act="states">States</button>' : ''}
   `;
 }
 
@@ -139,7 +139,9 @@ function updateButtonRow(card, m) {
   // covers load/unload swaps AND vision-button create/remove cleanly.
   const currentLoaded = !!btnRow.querySelector('button[data-act="unload"]');
   const currentHasVision = !!btnRow.querySelector('button[data-act="toggle-vision"]');
-  if (currentLoaded !== !!m.loaded || currentHasVision !== !!m.has_mmproj) {
+  const currentHasStates = !!btnRow.querySelector('button[data-act="states"]');
+  if (currentLoaded !== !!m.loaded || currentHasVision !== !!m.has_mmproj ||
+      currentHasStates !== (m.engine !== 'strata')) {
     btnRow.innerHTML = buildButtonRowHTML(m);
     return;
   }
@@ -184,7 +186,8 @@ function tagsRowHTML(m) {
     + (m.default ? '<span class="tag">default</span>' : '')
     + (m.pinned ? '<span class="tag">pinned</span>' : '')
     + (m.auto_save_state ? '<span class="tag">autosave</span>' : '')
-    + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '');
+    + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '')
+    + (m.engine === 'strata' ? '<span class="tag">Strata</span>' : '');
 }
 
 function renderModels() {
@@ -231,10 +234,20 @@ function renderModels() {
 
     // Extra-args display, computed once and shared by both render paths.
     const parts = [];
-    if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
-    if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
-    if (m.args) parts.push(m.args);
+    if (m.engine === 'strata') {
+      if (m.min_free_vram_mib > 0) parts.push(`--min-free-vram-mib ${m.min_free_vram_mib}`);
+      if (m.extra_args && m.extra_args.length) parts.push(m.extra_args.join(' '));
+    } else {
+      if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
+      if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
+      if (m.args) parts.push(m.args);
+    }
     const argsDisplay = parts.join(' ');
+
+    // Meta line: strata cards show the (truncated) engine-config path instead of size_mb.
+    const metaMid = m.engine === 'strata' && m.strata_config
+      ? (m.strata_config.length > 60 ? '…' + m.strata_config.slice(-59) : m.strata_config)
+      : fmtBytes(m.size_mb);
 
     if (!card) {
       // Build brand new card element
@@ -248,7 +261,7 @@ function renderModels() {
         <div class="model-head">
           <div>
             <div class="model-name">${name}</div>
-            <div class="model-meta">${id} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
+            <div class="model-meta">${id} · ${esc(metaMid)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
             <div class="tags-row" style="margin-top:6px;">${tagsRowHTML(m)}</div>
           </div>
           <div class="status-wrap">${statusBadge(m.loaded, m.ready)}</div>
@@ -265,6 +278,7 @@ function renderModels() {
 
         <div class="btn-row">${buildButtonRowHTML(m)}</div>`;
 
+      if (m.engine === 'strata') card.querySelector('[data-stat="ctx"]').remove();
       grid.appendChild(card);
     } else {
       // In-place DOM update without tearing down node
@@ -275,7 +289,7 @@ function renderModels() {
 
       const metaEl = card.querySelector('.model-meta');
       if (metaEl) {
-        metaEl.innerHTML = `${esc(m.id)} · ${fmtBytes(m.size_mb)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
+        metaEl.innerHTML = `${esc(m.id)} · ${esc(metaMid)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
       }
 
       const tagsRow = card.querySelector('.tags-row');
@@ -303,6 +317,8 @@ function renderModels() {
         if (ramEl) ramEl.innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
         if (ctxEl) ctxEl.innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
         if (uptimeEl) uptimeEl.innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
+        // Strata has no ctx. ctxEl is null once removed → guarded (repeat renders).
+        if (m.engine === 'strata' && ctxEl) ctxEl.remove();
       }
 
       // Update button row in-place to avoid flickering from innerHTML rebuild
@@ -433,6 +449,12 @@ function openEditModal(id) {
   $('f-pinned').checked = !!m.pinned;
   $('f-autosave').checked = !!m.auto_save_state;
   $('f-use-mmproj').checked = !!m.use_mmproj;
+  // Strata cards: gate the form (CSS via .strata) and populate the strata-only inputs.
+  $('modal-overlay').classList.toggle('strata', m.engine === 'strata');
+  if (m.engine === 'strata') {
+    document.getElementById('f-min-free-vram-mib').value = m.min_free_vram_mib || 0;
+    document.getElementById('f-extra-args').value = (m.extra_args || []).join(' ');
+  }
   $('modal-overlay').classList.add('active');
 }
 
@@ -459,7 +481,14 @@ $('modal-save').onclick = async () => {
   };
 
   const currentModel = modelsCache.find(x => x.id === editingId);
-  if (currentModel && currentModel.max_ctx_size && body.ctx_size > currentModel.max_ctx_size) {
+  const isStrata = !!(currentModel && currentModel.engine === 'strata');
+  if (isStrata) {
+    body.min_free_vram_mib = parseInt(document.getElementById('f-min-free-vram-mib').value, 10) || 0;
+    body.extra_args = document.getElementById('f-extra-args').value.split(/\s+/).filter(Boolean);
+    // Llama-only keys must not leak into the strata card file.
+    ['ctx_size', 'n_gpu_layers', 'estimated_vram_mb', 'args', 'mmproj_file',
+     'use_mmproj', 'backend', 'auto_save_state'].forEach(k => delete body[k]);
+  } else if (currentModel && currentModel.max_ctx_size && body.ctx_size > currentModel.max_ctx_size) {
     body.ctx_size = currentModel.max_ctx_size;
     showToast(`Capped ctx_size to model max (${currentModel.max_ctx_size.toLocaleString()})`, 'info');
   }
@@ -593,6 +622,12 @@ async function refreshAll() {
       estimated_vram_mb: d.estimated_vram_mb,
       args: d.args,
       gguf_name: d.gguf_name,
+      // Strata bridge-card fields (defaulted for llama cards).
+      engine: d.engine || 'llama',
+      strata_config: d.strata_config || '',
+      resolved_binary: d.resolved_binary || '',
+      min_free_vram_mib: d.min_free_vram_mib || 0,
+      extra_args: d.extra_args || [],
     }));
     statusCache = st;
     renderBackendSelectors(st);
@@ -606,6 +641,39 @@ async function refreshAll() {
     showToast('Refresh failed: ' + e.message, 'error');
   }
 }
+
+// ---------- Add Strata bridge card ----------
+$('btn-add-strata').onclick = () => {
+  $('sa-config').value = '';
+  $('sa-name').value = '';
+  $('strata-add-overlay').classList.add('active');
+};
+
+$('sa-cancel').onclick = () => $('strata-add-overlay').classList.remove('active');
+
+$('sa-add').onclick = async () => {
+  const cfgPath = $('sa-config').value.trim();
+  if (!cfgPath) {
+    showToast('Strata config path is required', 'error');
+    return;
+  }
+  const btn = $('sa-add');
+  btn.disabled = true;
+  try {
+    const res = await apiJSON('/v1/models/strata', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({strata_config: cfgPath, name: $('sa-name').value.trim() || undefined})
+    });
+    $('strata-add-overlay').classList.remove('active');
+    showToast(`Added Strata card ${res.id}`, 'success');
+    await refreshAll();
+  } catch (e) {
+    // 400 (invalid config) / 409 (id collision) surface here via e.message
+    showToast('Add failed: ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 $('btn-rescan').onclick = async () => {
   try {

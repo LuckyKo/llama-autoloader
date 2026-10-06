@@ -1,5 +1,6 @@
 {
   "forwarder-cors-injection-cwrite-fix.md": 1,
   "raw-tcp-forwarder-architecture.md": 1,
-  "update_config-two-lock-name-race.md": 1
+  "update_config-two-lock-name-race.md": 1,
+  "plan-review-backend-api-mismatch.md": 2
 }

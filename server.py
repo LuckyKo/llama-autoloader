@@ -262,6 +262,8 @@ class ModelConfig:
             "tags": self.tags,
             "min_free_vram_mib": self.min_free_vram_mib,
             "extra_args": self.extra_args,
+            # Self-describing: lets each card file record its engine config path.
+            "strata_config": self.strata_config,
         }
         card_path.write_text(json.dumps(card, indent=2))
 
@@ -572,49 +574,83 @@ class ModelManager:
 
         return paired_mmproj
 
+    def _make_strata_config(self, cfg_path: Path, card_path: Optional[Path]) -> Optional[ModelConfig]:
+        """Build a Strata bridge-card ModelConfig from an engine config (single source of truth).
+
+        Returns None when ``cfg_path`` is not a valid Strata engine config (missing, unparseable,
+        or no ``exe`` key). The card overlay (if any) is applied FIRST, then engine /
+        strata_config / auto_save_state are forced so a hand-edited card can never flip the
+        engine or override the config path.
+        """
+        if not cfg_path.is_file():
+            return None
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        except Exception as e:
+            log.warning(f"Skipping strata config {cfg_path}: {e}")
+            return None
+        if not isinstance(data, dict) or "exe" not in data:
+            return None                                   # not an engine config
+        base = ModelConfig.default_for(cfg_path)
+        if card_path is not None and card_path.exists():
+            try:
+                for k, v in json.loads(card_path.read_text(encoding="utf-8-sig")).items():
+                    if hasattr(base, k):
+                        setattr(base, k, v)
+            except Exception as e:
+                log.warning(f"Bad strata card {card_path}: {e}")
+        # Force AFTER the overlay: a card file must not be able to re-engine the card.
+        base.engine = "strata"
+        base.strata_config = str(cfg_path)
+        base.auto_save_state = False                       # slot save/restore is llama-only
+        base.name = data.get("model_name") or base.name or cfg_path.stem
+        return base
+
     def _scan_strata_cards(self) -> None:
         """Additive: register Strata engine configs as bridge cards. Never touches gguf entries.
 
         Inert when there is no ``strata:`` section (or it is disabled). Idempotent across
         rescans: a gguf card of the same id wins (inserted earlier in ``scan()``), and strata
-        ids are only added where free.
+        ids are only added where free. No auto-seed: card files are only ever READ here
+        (created by the ``POST /v1/models/strata`` endpoint), so a discovered card vanishes
+        when its config file is deleted while a user-added card persists.
         """
         sc = self.strata_cfg
-        if not sc.get("enabled") or not sc.get("configs_dir"):
-            return
-        cfg_dir = Path(sc["configs_dir"])
-        if not cfg_dir.is_dir():
-            log.warning(f"strata.configs_dir {cfg_dir} is not a directory; Strata cards disabled")
+        if not sc.get("enabled"):
             return
         cards_dir = Path(sc.get("cards_dir", "./strata_cards"))
-        for p in sorted(cfg_dir.glob("*.json")):
-            if p.name.endswith(".shared-settings.json"):
-                continue
-            try:
-                data = json.loads(p.read_text(encoding="utf-8-sig"))
-            except Exception as e:
-                log.warning(f"Skipping strata config {p}: {e}")
-                continue
-            if not isinstance(data, dict) or "exe" not in data:
-                continue                                   # not an engine config
-            mid = p.stem
-            if mid in self.models:
-                continue                                   # a llama/gguf card of the same id wins
-            base = ModelConfig.default_for(p)
-            base.engine = "strata"
-            base.strata_config = str(p)
-            base.name = data.get("model_name") or mid
-            base.auto_save_state = False                   # slot save/restore is llama-only
-            card = cards_dir / f"{mid}.json"
-            if card.exists():
+        # Loop 1 — discovered cards from configs_dir (only if configured).
+        cfg_dir = sc.get("configs_dir")
+        if cfg_dir:
+            cfg_dir = Path(cfg_dir)
+            if cfg_dir.is_dir():
+                for p in sorted(cfg_dir.glob("*.json")):
+                    if p.name.endswith(".shared-settings.json"):
+                        continue
+                    cfg = self._make_strata_config(p, cards_dir / f"{p.stem}.json")
+                    if cfg and p.stem not in self.models:
+                        self.models[p.stem] = cfg
+                        log.info(f"Discovered Strata bridge card: {p.stem} -> {p}")
+            else:
+                log.warning(f"strata.configs_dir {cfg_dir} is not a directory; Strata cards disabled")
+        # Loop 2 — user-added cards from strata_cards/ (persist across rescans).
+        if cards_dir.is_dir():
+            for card in sorted(cards_dir.glob("*.json")):
+                if card.name.endswith(".shared-settings.json"):
+                    continue
                 try:
-                    for k, v in json.loads(card.read_text(encoding="utf-8-sig")).items():
-                        if hasattr(base, k):
-                            setattr(base, k, v)
+                    strata_config = (json.loads(card.read_text(encoding="utf-8-sig")) or {}).get("strata_config")
                 except Exception as e:
                     log.warning(f"Bad strata card {card}: {e}")
-            self.models[mid] = base
-            log.info(f"Discovered Strata bridge card: {mid} -> {p}")
+                    continue
+                if not strata_config:
+                    log.warning(f"Strata card {card} has no strata_config; skipping")
+                    continue
+                cfg = self._make_strata_config(Path(strata_config), card)
+                mid = self._sanitize_model_id(Path(strata_config).stem)
+                if cfg and mid not in self.models:
+                    self.models[mid] = cfg
+                    log.info(f"Loaded Strata bridge card: {mid} -> {card}")
 
     def scan(self) -> List[str]:
         """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
@@ -748,6 +784,8 @@ class ModelManager:
                 "backend": cfg.backend,
                 "engine": cfg.engine or "llama",
                 "strata_config": cfg.strata_config,
+                "min_free_vram_mib": cfg.min_free_vram_mib,
+                "extra_args": cfg.extra_args,
                 "resolved_binary": resolved_bin,
                 "has_mmproj": has_mmproj,
                 "use_mmproj": cfg.use_mmproj,
@@ -980,6 +1018,8 @@ class ModelManager:
                 # Engine dispatch: Strata bridge cards build their own argv/cwd/env; the
                 # llama path is byte-identical to before (env/cwd are None → inherit).
                 if cfg.is_strata:
+                    if not Path(cfg.strata_config).is_file():
+                        raise HTTPException(400, f"Strata config file missing: {cfg.strata_config}")
                     artifact = Path(cfg.strata_config)
                     argv, cwd, env = _launch_strata(self, cfg, model_id, port)
                 else:
@@ -1693,6 +1733,14 @@ class ModelConfigUpdate(BaseModel):
     estimated_vram_mb: Optional[int] = None
     tags: Optional[List[str]] = None
     gguf_name: Optional[str] = None
+    # Strata bridge-card fields (llama cards ignore them). strata_config is
+    # intentionally ABSENT from this schema: it is read-only and derived at scan time.
+    min_free_vram_mib: Optional[int] = None
+    extra_args: Optional[List[str]] = None
+
+class StrataCardCreate(BaseModel):
+    strata_config: str
+    name: Optional[str] = None
 
 class SelectBackendPayload(BaseModel):
     backend: str = ""
@@ -1885,6 +1933,13 @@ async def list_models():
             "estimated_vram_mb": m["estimated_vram_mb"],
             "args": m["args"],
             "gguf_name": m["gguf_name"],
+            # Strata bridge-card fields (defaulted for llama cards). Pass-through only —
+            # required by the WebUI field whitelist (F1); the llama payload shape is unchanged.
+            "engine": m["engine"],
+            "strata_config": m["strata_config"],
+            "resolved_binary": m["resolved_binary"],
+            "min_free_vram_mib": m["min_free_vram_mib"],
+            "extra_args": m["extra_args"],
         })
     return {"object": "list", "data": data}
 
@@ -1948,6 +2003,36 @@ async def toggle_vision_ep(model_id: str):
     await manager.update_config(mid, cfg)
     return {"id": mid, "use_mmproj": cfg.use_mmproj, "mmproj_file": cfg.mmproj_file}
 
+@app.post("/v1/models/strata")
+async def add_strata_card_ep(body: StrataCardCreate):
+    """Register a Strata bridge card from an engine config.
+
+    Validates the config (is_file + parses to dict + has ``exe``), writes
+    ``strata_cards/<mid>.json`` (self-describing via ``strata_config``), and registers
+    the card. 400 on invalid config, 409 on id collision.
+
+    NOTE: assumes a single-instance server. The lock is deliberately split (card-file
+    write outside the lock, registration inside) to avoid holding it during disk I/O; a
+    concurrent same-id add is benign because the card-file write is idempotent.
+    """
+    cfg_path = Path(body.strata_config)
+    cfg = await asyncio.to_thread(manager._make_strata_config, cfg_path, None)
+    if cfg is None:
+        raise HTTPException(400, f"not a valid Strata engine config: {body.strata_config}")
+    mid = manager._sanitize_model_id(cfg_path.stem)
+    async with manager._lock:
+        if mid in manager.models:
+            raise HTTPException(409, f"Model id '{mid}' already exists")
+    if body.name:
+        cfg.name = body.name
+    cards_dir = Path(manager.strata_cfg.get("cards_dir", "./strata_cards"))
+    cards_dir.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(cfg.save_strata_card, cards_dir / f"{mid}.json")
+    async with manager._lock:
+        manager.models[mid] = cfg
+    log.info(f"Added Strata bridge card: {mid} -> {cfg_path}")
+    return {"id": mid}
+
 @app.post("/v1/scan")
 async def rescan():
     async with manager._lock:
@@ -1960,6 +2045,8 @@ async def load_model_ep(model_id: str):
     try:
         lm = await manager.load_model(model_id, force=False)
         return {"id": model_id, "port": lm.port, "pid": lm.pid, "ready": lm.ready}
+    except HTTPException:
+        raise
     except KeyError as e:
         raise HTTPException(404, str(e))
     except Exception as e:

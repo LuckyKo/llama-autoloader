@@ -18,7 +18,9 @@ import json
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
+import server
 from server import ModelManager, ModelConfig
 from strata_adapter import derive_config, _launch_llama, _launch_strata
 
@@ -320,6 +322,7 @@ async def test_update_config_strata_writes_card(tmp_path):
     data = json.loads(card_path.read_text())
     assert data["pinned"] is True
     assert data["name"] == "C updated"
+    assert data["strata_config"] == str(src)   # self-describing card
     assert "engine" not in data
     # user's strata JSON untouched
     assert _sha256(src) == src_hash
@@ -353,9 +356,11 @@ def test_save_strata_card_only_editable_fields(tmp_path):
         "tags": ["strata", "coder"],
         "min_free_vram_mib": 40960,
         "extra_args": ["--foo", "bar"],
+        # Self-describing card: the engine config path is recorded so a rescan can
+        # re-register a user-added card without configs_dir.
+        "strata_config": "C:\\strata\\my-card.json",
     }
-    assert "engine" not in data
-    assert "strata_config" not in data
+    assert "engine" not in data   # engine is derived at scan time, never written
 
 
 def test_save_gguf_sidecar_unchanged(tmp_path):
@@ -370,3 +375,165 @@ def test_save_gguf_sidecar_unchanged(tmp_path):
     assert data["name"] == "X"
     assert "engine" in data      # asdict carries every field (gguf sidecar is full config)
     assert "ctx_size" in data
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/models/strata (WebUI add flow) — endpoint driven directly so the
+# status codes are asserted without the TestClient portal loop.
+# ---------------------------------------------------------------------------
+
+def _use_manager(monkeypatch, mgr: ModelManager) -> None:
+    """Point the module-level global the endpoint closes over at ``mgr``."""
+    monkeypatch.setattr(server, "manager", mgr)
+
+
+async def test_add_strata_card_registers_and_persists_across_scan(tmp_path, monkeypatch):
+    """Add → card file written → rescan keeps it (user-added cards persist)."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    strata_dir = tmp_path / "strata"; strata_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    # Engine config OUTSIDE configs_dir: only the card file can re-register it.
+    extra = tmp_path / "extra"; extra.mkdir()
+    src = _write_engine_config(extra, "added", {"exe": "s.exe", "model_name": "Added Model"})
+    mgr = _strata_manager(tmp_path, models_dir, strata_dir, cards_dir)
+    mgr.scan()
+    assert "added" not in mgr.models
+    _use_manager(monkeypatch, mgr)
+
+    res = await server.add_strata_card_ep(server.StrataCardCreate(strata_config=str(src)))
+    assert res == {"id": "added"}
+    card = json.loads((cards_dir / "added.json").read_text(encoding="utf-8"))
+    assert card["strata_config"] == str(src)
+    assert card["name"] == "Added Model"        # defaults to the engine's model_name
+
+    mgr.scan()
+    cfg = mgr.models["added"]
+    assert cfg.engine == "strata"
+    assert cfg.strata_config == str(src)
+    assert cfg.name == "Added Model"
+
+    payload = {p["id"]: p for p in await mgr.list_models()}["added"]
+    assert payload["engine"] == "strata"
+    assert payload["strata_config"] == str(src)
+    assert payload["min_free_vram_mib"] == 0
+    assert payload["extra_args"] == []
+    assert payload["resolved_binary"] == ""     # no llama binary for strata
+
+
+async def test_add_strata_card_name_override(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    strata_dir = tmp_path / "strata"; strata_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    extra = tmp_path / "extra"; extra.mkdir()
+    src = _write_engine_config(extra, "custom", {"exe": "s.exe", "model_name": "From Config"})
+    mgr = _strata_manager(tmp_path, models_dir, strata_dir, cards_dir)
+    _use_manager(monkeypatch, mgr)
+
+    res = await server.add_strata_card_ep(
+        server.StrataCardCreate(strata_config=str(src), name="User Chosen"))
+    assert res == {"id": "custom"}
+    assert mgr.models["custom"].name == "User Chosen"
+    card = json.loads((cards_dir / "custom.json").read_text(encoding="utf-8"))
+    assert card["name"] == "User Chosen"
+
+
+def test_discovered_card_leaves_no_orphan_file(tmp_path):
+    """No auto-seed: deleting a configs_dir entry removes the card AND writes no file."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    strata_dir = tmp_path / "strata"; strata_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    src = _write_engine_config(strata_dir, "disc", {"exe": "s.exe"})
+    mgr = _strata_manager(tmp_path, models_dir, strata_dir, cards_dir)
+    mgr.scan()
+    assert "disc" in mgr.models
+    assert not (cards_dir / "disc.json").exists(), "scan must not auto-seed card files"
+
+    src.unlink()
+    mgr.scan()
+    assert "disc" not in mgr.models
+
+
+def test_card_overlay_cannot_flip_engine(tmp_path):
+    """Overlay is applied FIRST; engine/strata_config/auto_save_state are forced after."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    strata_dir = tmp_path / "strata"; strata_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    src = _write_engine_config(strata_dir, "flip", {"exe": "s.exe", "model_name": "F"})
+    (cards_dir / "flip.json").write_text(json.dumps({
+        "engine": "llama",
+        "strata_config": "D:\\bogus\\flip.json",
+        "auto_save_state": True,
+        "pinned": True,
+    }), encoding="utf-8")
+    mgr = _strata_manager(tmp_path, models_dir, strata_dir, cards_dir)
+    mgr.scan()
+    cfg = mgr.models["flip"]
+    assert cfg.engine == "strata"
+    assert cfg.strata_config == str(src)
+    assert cfg.auto_save_state is False
+    assert cfg.pinned is True           # editable overlay fields still apply
+
+
+async def test_add_strata_card_invalid_config_400(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    strata_dir = tmp_path / "strata"; strata_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    extra = tmp_path / "extra"; extra.mkdir()
+    no_exe = _write_engine_config(extra, "bad", {"model_name": "NoExe"})
+    mgr = _strata_manager(tmp_path, models_dir, strata_dir, cards_dir)
+    _use_manager(monkeypatch, mgr)
+
+    with pytest.raises(HTTPException) as ei_no_exe:
+        await server.add_strata_card_ep(server.StrataCardCreate(strata_config=str(no_exe)))
+    assert ei_no_exe.value.status_code == 400
+    assert not (cards_dir / "bad.json").exists()
+
+    with pytest.raises(HTTPException) as ei_missing:
+        await server.add_strata_card_ep(
+            server.StrataCardCreate(strata_config=str(extra / "nope.json")))
+    assert ei_missing.value.status_code == 400
+    assert "bad" not in mgr.models and "nope" not in mgr.models
+
+
+async def test_add_strata_card_id_collision_409(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    strata_dir = tmp_path / "strata"; strata_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    src = _write_engine_config(strata_dir, "dup", {"exe": "s.exe"})
+    mgr = _strata_manager(tmp_path, models_dir, strata_dir, cards_dir)
+    mgr.scan()
+    assert "dup" in mgr.models           # discovered first
+    _use_manager(monkeypatch, mgr)
+
+    with pytest.raises(HTTPException) as ei:
+        await server.add_strata_card_ep(server.StrataCardCreate(strata_config=str(src)))
+    assert ei.value.status_code == 409
+    assert mgr.models["dup"].strata_config == str(src)   # untouched
+
+
+async def test_list_models_llama_payload_gains_only_defaulted_fields(tmp_path):
+    """Byte-identical llama: the payload gains engine/strata_config/min_free_vram_mib/extra_args
+    at their defaults; every other key is unchanged."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    (models_dir / "model-a.gguf").write_bytes(b"GGUF_HEADER")
+    cfg = _make_cfg({"models": {"root_dir": str(models_dir),
+                                "save_state_dir": str(models_dir / "states")}})
+    mgr = ModelManager(cfg)
+    mgr.scan()
+    payload = (await mgr.list_models())[0]
+
+    assert set(payload) == {
+        "id", "name", "description", "tags", "default", "pinned", "auto_save_state",
+        "backend", "engine", "strata_config", "min_free_vram_mib", "extra_args",
+        "resolved_binary", "has_mmproj", "use_mmproj", "mmproj_file", "ctx_size",
+        "max_ctx_size", "n_gpu_layers", "estimated_vram_mb", "args", "gguf_name",
+        "size_mb", "loaded", "ready", "port", "pid", "last_used", "state_path",
+    }
+    assert payload["engine"] == "llama"
+    assert payload["strata_config"] == ""
+    assert payload["min_free_vram_mib"] == 0
+    assert payload["extra_args"] == []
+    # untouched llama behaviour
+    assert payload["ctx_size"] == 8192
+    assert payload["n_gpu_layers"] == 999
+    assert payload["has_mmproj"] is False
