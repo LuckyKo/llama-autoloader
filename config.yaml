@@ -1,3 +1,35 @@
+# External "bridge" engines. Each entry is a launch spec for an OpenAI-compatible
+# engine the autoloader can JIT-load/unload alongside llama.cpp cards. Adding a new
+# engine is a pure config change — no code edits. `engine == "llama"` cards never use
+# this section (they keep their own byte-identical llama-server launch).
+#
+# Placeholders available in `argv` / overlays: {engine} {model_id} {port} {host}
+#   {derived_config} {interpreter} {serve_script}
+engines:
+  strata:
+    enabled: true
+    label: Strata
+    interpreter: N:/work/WD/Strata/.venv/Scripts/python.exe
+    serve_script: N:/work/WD/Strata/serve/server.py
+    cwd: N:/work/WD/Strata
+    # argv (required) — the launch template; {placeholders} are substituted at load.
+    argv: ["{interpreter}", "{serve_script}", "--engine", "{engine}",
+           "--config", "{derived_config}", "--port", "{port}", "--host", "127.0.0.1"]
+    config_overlay:
+      cors_origins: ["*"]
+      lazy_load: false
+      idle_unload_s: 0
+    config_overlay_dynamic:
+      aliases: ["{model_id}"]
+    # Scrubbed vars are DELETED from the child env, not blanked (empty STRATA_API_KEY = exit 2).
+    env_scrub: [STRATA_API_KEY, STRATA_ALLOWED_HOSTS]
+    min_free_vram_flag: --min-free-vram-mib
+    ready_timeout_seconds: 600
+    # A *.json is treated as a Strata engine config iff it has this key.
+    config_key: exe
+    # Optional discovery dir: every <config_key>-bearing *.json here becomes a bridge card.
+    configs_dir: N:/work/WD/Strata
+
 gpu:
   poll_interval_seconds: 5
 launcher:

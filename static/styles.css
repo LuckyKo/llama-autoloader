@@ -114,6 +114,8 @@ button.danger:hover { background: var(--red); border-color: var(--red); color: w
 .modal { background: var(--bg2); border: 1px solid var(--border);
          border-radius: var(--radius); padding: 22px; width: 560px; max-width: 95vw;
          max-height: 85vh; overflow: auto; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
+/* The model editor carries the full launch config; 560px is too cramped for it. */
+.modal.wide { width: 900px; }
 .modal h2 { margin: 0 0 14px; font-size: 16px; font-weight: 600; }
 .form-row { margin-bottom: 12px; }
 .form-row label { display: block; font-size: 11px; color: var(--muted);
@@ -129,11 +131,11 @@ button.danger:hover { background: var(--red); border-color: var(--red); color: w
 .form-row textarea { min-height: 60px; resize: vertical; }
 .form-row .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
-/* Strata bridge-card gating in the edit modal. Inert for llama cards
-   (the overlay only gets the .strata class for strata engines). */
-[data-strata-only] { display: none; }
-.strata [data-llama-only] { display: none; }
-.strata [data-strata-only] { display: block; }
+/* Bridge-card gating in the edit modal. Inert for llama cards (the overlay only gets
+   the .bridge class for bridge engines). */
+[data-engine-only] { display: none; }
+.bridge [data-llama-only] { display: none; }
+.bridge [data-engine-only] { display: block; }
 
 .tag { display: inline-block; background: var(--bg3); border: 1px solid var(--border);
        padding: 2px 8px; border-radius: 999px; font-size: 10px; color: var(--muted);

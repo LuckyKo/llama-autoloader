@@ -51,7 +51,7 @@
         <option value="loaded">Loaded Only</option>
         <option value="offline">Offline Only</option>
       </select>
-      <button id="btn-add-strata">+ Add Strata</button>
+      <button id="btn-add-engine">+ Add Engine</button>
     </div>
     <div class="right">JIT auto-loads models on API request. Click <b>Edit</b> to change launch flags.</div>
   </div>
@@ -79,8 +79,10 @@ Extensions:
   POST /v1/models/{id}/state/load              {"label":"default"} restore slot 0
   GET  /v1/models/{id}/state                   list saved labels
   DELETE /v1/models/{id}/state/{label}         delete saved label
-  POST /v1/scan                                rescan root dir for *.gguf + Strata cards
-  POST /v1/models/strata                       add a Strata bridge card {"strata_config": "path.json"}
+  POST /v1/scan                                rescan root dir for *.gguf + engine bridge cards
+  GET  /v1/engines                             configured engines + why one is unusable
+  POST /v1/models/engine                       add a bridge card {"engine": "strata", "engine_config": "path.json"}
+  POST /v1/models/strata                       DEPRECATED alias of the above (engine "strata" only)
   POST /v1/unload_all                          unload everything
   POST /v1/raw/{id}/{path}                     raw pass-through to llama-server
   WS   /ws                                     live status stream (1 Hz)
@@ -159,7 +161,7 @@ Example cURL:
 
 <!-- Edit modal -->
 <div class="modal-overlay" id="modal-overlay">
-  <div class="modal">
+  <div class="modal wide">
     <h2>Edit model config</h2>
     <div class="form-row">
       <label>Name</label>
@@ -207,17 +209,21 @@ Example cURL:
       <label>Associated Vision Module (mmproj filename)</label>
       <input id="f-mmproj-file" placeholder="e.g. mmproj-model.gguf" />
     </div>
-    <div class="form-row" data-strata-only>
+    <div class="form-row" data-engine-only>
       <div class="row2">
+        <div>
+          <label>Engine config (path to JSON)</label>
+          <input id="f-engine-config" placeholder="e.g. N:\work\WD\Strata\strata-coder-iq1_m.json" />
+        </div>
         <div>
           <label>min_free_vram_mib</label>
           <input id="f-min-free-vram-mib" type="number" min="0" placeholder="0" />
         </div>
-        <div>
-          <label>extra_args (space sep, appended to Strata argv)</label>
-          <input id="f-extra-args" />
-        </div>
       </div>
+    </div>
+    <div class="form-row" data-engine-only>
+      <label>extra_args (space-separated, appended after the engine's argv template)</label>
+      <textarea id="f-extra-args" placeholder="--spec 4 --kv int8"></textarea>
     </div>
     <div class="form-row">
       <label>
@@ -244,21 +250,33 @@ Example cURL:
   </div>
 </div>
 
-<!-- Add Strata bridge card modal -->
-<div class="modal-overlay" id="strata-add-overlay">
+<!-- Add engine bridge card modal -->
+<div class="modal-overlay" id="engine-add-overlay">
   <div class="modal">
-    <h2>Add Strata bridge card</h2>
+    <h2>Add engine bridge card</h2>
     <div class="form-row">
-      <label>Strata engine config (path to JSON with an "exe" key)</label>
-      <input id="sa-config" placeholder="e.g. C:\Strata\codivai.json" />
+      <label>Engine</label>
+      <!-- Populated from GET /v1/engines; engines with an error are shown but disabled
+           so the reason is visible instead of the option silently vanishing. -->
+      <select id="ea-engine"></select>
+    </div>
+    <div class="form-row">
+      <label>Engine config (path to JSON)</label>
+      <input id="ea-config" placeholder="e.g. C:\Strata\codivai.json" />
     </div>
     <div class="form-row">
       <label>Name (optional)</label>
-      <input id="sa-name" />
+      <input id="ea-name" />
+    </div>
+    <!-- Mirrors the server's 400 message for the selected engine, so the reason an
+         engine is unusable is visible before the user tries to add a card. -->
+    <div class="form-row" id="ea-error-row" style="display:none;">
+      <label>Engine problem</label>
+      <div id="ea-error" style="color:var(--red);font-size:11px;"></div>
     </div>
     <div class="btn-row" style="justify-content:flex-end;">
-      <button id="sa-cancel">Cancel</button>
-      <button class="primary" id="sa-add">Add</button>
+      <button id="ea-cancel">Cancel</button>
+      <button class="primary" id="ea-add">Add</button>
     </div>
   </div>
 </div>

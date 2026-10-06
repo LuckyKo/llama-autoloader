@@ -465,11 +465,12 @@ class RawTCPForwarder:
             log.error(f"JIT load for {model_id!r} skipped: no running main event loop")
             return None
 
-        # Strata bridge cards can take minutes to load; use the longer strata ready-timeout
-        # when the target card is strata (llama keeps the default _JIT_LOAD_TIMEOUT).
+        # Bridge cards can take minutes to load; ready_timeout_for() returns the engine's
+        # value for those and the llama default otherwise (single source of truth with
+        # the load path in server.py, so the two cannot drift apart).
         mc = self.model_manager.models.get(model_id)
-        timeout = (self.model_manager.strata_cfg.get("ready_timeout_seconds", 600)
-                   if (mc and mc.is_strata) else _JIT_LOAD_TIMEOUT)
+        timeout = (self.model_manager.ready_timeout_for(model_id)
+                   if (mc and mc.is_bridge) else _JIT_LOAD_TIMEOUT)
         future = asyncio.run_coroutine_threadsafe(
             self.model_manager.load_model(model_id), main_loop
         )

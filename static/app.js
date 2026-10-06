@@ -122,7 +122,7 @@ function buildButtonRowHTML(m) {
     <button data-act="edit" ${act ? 'disabled' : ''}>Edit</button>
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
-    ${m.engine !== 'strata' ? '<button data-act="states">States</button>' : ''}
+    ${m.engine !== 'llama' ? '<button data-act="states">States</button>' : ''}
   `;
 }
 
@@ -141,7 +141,7 @@ function updateButtonRow(card, m) {
   const currentHasVision = !!btnRow.querySelector('button[data-act="toggle-vision"]');
   const currentHasStates = !!btnRow.querySelector('button[data-act="states"]');
   if (currentLoaded !== !!m.loaded || currentHasVision !== !!m.has_mmproj ||
-      currentHasStates !== (m.engine !== 'strata')) {
+      currentHasStates !== (m.engine !== 'llama')) {
     btnRow.innerHTML = buildButtonRowHTML(m);
     return;
   }
@@ -187,7 +187,8 @@ function tagsRowHTML(m) {
     + (m.pinned ? '<span class="tag">pinned</span>' : '')
     + (m.auto_save_state ? '<span class="tag">autosave</span>' : '')
     + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '')
-    + (m.engine === 'strata' ? '<span class="tag">Strata</span>' : '');
+    // Bridge cards carry an engine badge; llama is the default and gets none.
+    + (m.engine && m.engine !== 'llama' ? `<span class="tag">${esc(m.engine)}</span>` : '');
 }
 
 function renderModels() {
@@ -233,8 +234,9 @@ function renderModels() {
     let card = existingCards.get(m.id);
 
     // Extra-args display, computed once and shared by both render paths.
+    // Bridge engines get min-free-vram + free-form extra_args; llama gets its flags.
     const parts = [];
-    if (m.engine === 'strata') {
+    if (m.engine !== 'llama') {
       if (m.min_free_vram_mib > 0) parts.push(`--min-free-vram-mib ${m.min_free_vram_mib}`);
       if (m.extra_args && m.extra_args.length) parts.push(m.extra_args.join(' '));
     } else {
@@ -244,9 +246,9 @@ function renderModels() {
     }
     const argsDisplay = parts.join(' ');
 
-    // Meta line: strata cards show the (truncated) engine-config path instead of size_mb.
-    const metaMid = m.engine === 'strata' && m.strata_config
-      ? (m.strata_config.length > 60 ? '…' + m.strata_config.slice(-59) : m.strata_config)
+    // Meta line: bridge cards show the (truncated) engine-config path instead of size_mb.
+    const metaMid = m.engine !== 'llama' && m.engine_config
+      ? (m.engine_config.length > 60 ? '…' + m.engine_config.slice(-59) : m.engine_config)
       : fmtBytes(m.size_mb);
 
     if (!card) {
@@ -278,7 +280,8 @@ function renderModels() {
 
         <div class="btn-row">${buildButtonRowHTML(m)}</div>`;
 
-      if (m.engine === 'strata') card.querySelector('[data-stat="ctx"]').remove();
+      // Only llama reports ctx; the row is meaningless for a bridge engine.
+      if (m.engine !== 'llama') card.querySelector('[data-stat="ctx"]').remove();
       grid.appendChild(card);
     } else {
       // In-place DOM update without tearing down node
@@ -317,8 +320,8 @@ function renderModels() {
         if (ramEl) ramEl.innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
         if (ctxEl) ctxEl.innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
         if (uptimeEl) uptimeEl.innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
-        // Strata has no ctx. ctxEl is null once removed → guarded (repeat renders).
-        if (m.engine === 'strata' && ctxEl) ctxEl.remove();
+        // Bridge engines have no ctx. ctxEl is null once removed → guarded (repeat renders).
+        if (m.engine !== 'llama' && ctxEl) ctxEl.remove();
       }
 
       // Update button row in-place to avoid flickering from innerHTML rebuild
@@ -449,11 +452,14 @@ function openEditModal(id) {
   $('f-pinned').checked = !!m.pinned;
   $('f-autosave').checked = !!m.auto_save_state;
   $('f-use-mmproj').checked = !!m.use_mmproj;
-  // Strata cards: gate the form (CSS via .strata) and populate the strata-only inputs.
-  $('modal-overlay').classList.toggle('strata', m.engine === 'strata');
-  if (m.engine === 'strata') {
-    document.getElementById('f-min-free-vram-mib').value = m.min_free_vram_mib || 0;
-    document.getElementById('f-extra-args').value = (m.extra_args || []).join(' ');
+  // Bridge cards: gate the form (CSS via .bridge) and populate the engine-only inputs.
+  // NOTE: the engine-config path is editable and IS read back on save — it used to be
+  // displayed-only, so the path could never be corrected from the WebUI (E27).
+  $('modal-overlay').classList.toggle('bridge', m.engine !== 'llama');
+  if (m.engine !== 'llama') {
+    $('f-engine-config').value = m.engine_config || '';
+    $('f-min-free-vram-mib').value = m.min_free_vram_mib || 0;
+    $('f-extra-args').value = (m.extra_args || []).join(' ');
   }
   $('modal-overlay').classList.add('active');
 }
@@ -481,11 +487,14 @@ $('modal-save').onclick = async () => {
   };
 
   const currentModel = modelsCache.find(x => x.id === editingId);
-  const isStrata = !!(currentModel && currentModel.engine === 'strata');
-  if (isStrata) {
-    body.min_free_vram_mib = parseInt(document.getElementById('f-min-free-vram-mib').value, 10) || 0;
-    body.extra_args = document.getElementById('f-extra-args').value.split(/\s+/).filter(Boolean);
-    // Llama-only keys must not leak into the strata card file.
+  const isBridge = !!(currentModel && currentModel.engine && currentModel.engine !== 'llama');
+  if (isBridge) {
+    // The engine-config path is now writable (E27): it used to have an input but no
+    // reader, so edits were silently discarded and a wrong path was unfixable in the UI.
+    body.engine_config = $('f-engine-config').value.trim();
+    body.min_free_vram_mib = parseInt($('f-min-free-vram-mib').value, 10) || 0;
+    body.extra_args = $('f-extra-args').value.split(/\s+/).filter(Boolean);
+    // Llama-only keys must not leak into a bridge card file.
     ['ctx_size', 'n_gpu_layers', 'estimated_vram_mb', 'args', 'mmproj_file',
      'use_mmproj', 'backend', 'auto_save_state'].forEach(k => delete body[k]);
   } else if (currentModel && currentModel.max_ctx_size && body.ctx_size > currentModel.max_ctx_size) {
@@ -622,9 +631,9 @@ async function refreshAll() {
       estimated_vram_mb: d.estimated_vram_mb,
       args: d.args,
       gguf_name: d.gguf_name,
-      // Strata bridge-card fields (defaulted for llama cards).
+      // Bridge-card fields (defaulted for llama cards).
       engine: d.engine || 'llama',
-      strata_config: d.strata_config || '',
+      engine_config: d.engine_config || '',
       resolved_binary: d.resolved_binary || '',
       min_free_vram_mib: d.min_free_vram_mib || 0,
       extra_args: d.extra_args || [],
@@ -642,33 +651,74 @@ async function refreshAll() {
   }
 }
 
-// ---------- Add Strata bridge card ----------
-$('btn-add-strata').onclick = () => {
-  $('sa-config').value = '';
-  $('sa-name').value = '';
-  $('strata-add-overlay').classList.add('active');
-};
-
-$('sa-cancel').onclick = () => $('strata-add-overlay').classList.remove('active');
-
-$('sa-add').onclick = async () => {
-  const cfgPath = $('sa-config').value.trim();
-  if (!cfgPath) {
-    showToast('Strata config path is required', 'error');
+// ---------- Add engine bridge card ----------
+// The engine dropdown is fed by GET /v1/engines, so a second engine needs no UI change.
+// Engines that failed boot validation are listed but disabled, with the reason inline —
+// hiding them would make a config typo look like "no engines configured".
+async function loadEngineOptions() {
+  const sel = $('ea-engine');
+  $('ea-error-row').style.display = 'none';  // cleared up front; set below if needed
+  let engines = [];
+  try {
+    engines = await apiJSON('/v1/engines');
+  } catch (e) {
+    sel.innerHTML = '<option value="">(could not load engines)</option>';
+    $('ea-error-row').style.display = 'block';
+    $('ea-error').textContent = 'Could not load engines: ' + e.message;
     return;
   }
-  const btn = $('sa-add');
+  if (!engines.length) {
+    sel.innerHTML = '<option value="">(no engines configured)</option>';
+    return;
+  }
+  sel.innerHTML = engines.map(en => {
+    const label = en.error ? `${en.label} — ${en.error}` : en.label;
+    // ready=false means the server would reject the add with a 400; disable it so the
+    // user reads why here instead of hitting an opaque failure on submit.
+    return `<option value="${esc(en.name)}"${en.ready ? '' : ' disabled'}>${esc(label)}</option>`;
+  }).join('');
+  const firstReady = engines.find(en => en.ready);
+  if (firstReady) sel.value = firstReady.name;
+  // Spell out the problems below the dropdown. Disabled options cannot be clicked, so
+  // without this the reason would only exist inside an unselectable <option> label.
+  const problems = engines.filter(en => !en.ready);
+  $('ea-error-row').style.display = problems.length ? 'block' : 'none';
+  $('ea-error').textContent = problems.map(en => `${en.name}: ${en.error}`).join(' · ');
+}
+
+$('btn-add-engine').onclick = () => {
+  $('ea-config').value = '';
+  $('ea-name').value = '';
+  $('engine-add-overlay').classList.add('active');
+  loadEngineOptions();
+};
+
+$('ea-cancel').onclick = () => $('engine-add-overlay').classList.remove('active');
+
+$('ea-add').onclick = async () => {
+  const engine = $('ea-engine').value;
+  const cfgPath = $('ea-config').value.trim();
+  if (!engine) {
+    showToast('Pick an engine first', 'error');
+    return;
+  }
+  if (!cfgPath) {
+    showToast('Engine config path is required', 'error');
+    return;
+  }
+  const btn = $('ea-add');
   btn.disabled = true;
   try {
-    const res = await apiJSON('/v1/models/strata', {
+    const res = await apiJSON('/v1/models/engine', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({strata_config: cfgPath, name: $('sa-name').value.trim() || undefined})
+      body: JSON.stringify({engine, engine_config: cfgPath, name: $('ea-name').value.trim() || undefined})
     });
-    $('strata-add-overlay').classList.remove('active');
-    showToast(`Added Strata card ${res.id}`, 'success');
+    $('engine-add-overlay').classList.remove('active');
+    showToast(`Added ${engine} card ${res.id}`, 'success');
     await refreshAll();
   } catch (e) {
-    // 400 (invalid config) / 409 (id collision) surface here via e.message
+    // 400 (unknown/misconfigured engine, invalid config) / 409 (id collision) surface
+    // here via e.message
     showToast('Add failed: ' + e.message, 'error');
   } finally {
     btn.disabled = false;
