@@ -383,6 +383,7 @@ class ModelManager:
         self.save_state_dir.mkdir(parents=True, exist_ok=True)
         self.idle_timeout = cfg["models"].get("idle_timeout_seconds", 300)
         self.max_loaded_models = cfg["models"].get("max_loaded_models", 1)
+        self.save_state_max_keep = cfg["models"].get("save_state_max_keep", 5)
         self.default_auto_save_state = cfg["models"].get("auto_save_state", False)
         self.binary = cfg["llama_server"]["binary"]
         self.backends_dir = Path(cfg["llama_server"].get("backends_dir", "./backends")).resolve()
@@ -523,6 +524,9 @@ class ModelManager:
         max_loaded = models.get("max_loaded_models", 1)
         if not isinstance(max_loaded, int) or max_loaded < 1:
             raise ValueError(f"Config 'models.max_loaded_models' must be >= 1, got {max_loaded!r}")
+        save_state_max_keep = models.get("save_state_max_keep", 5)
+        if not isinstance(save_state_max_keep, int) or save_state_max_keep < 1:
+            raise ValueError(f"Config 'models.save_state_max_keep' must be >= 1, got {save_state_max_keep!r}")
 
         # gpu section
         gpu = cfg.get("gpu", {})
@@ -1549,9 +1553,10 @@ class ModelManager:
         """Delete old state files for a model, keeping only the latest N files.
 
         Cleanup is per-model (not per-agent), so all agents sharing the same model
-        share the state file pool. Keeps max 5 most recent state files by mtime.
+        share the state file pool. Keeps the latest N (models.save_state_max_keep,
+        default 5) state files by mtime.
         """
-        max_states = max(1, 5)  # Ensure minimum of 1 file kept
+        max_states = max(1, self.save_state_max_keep)  # Ensure minimum of 1 file kept
         mid_clean = self._sanitize_model_id(model_id_input)
 
         if not mid_clean:
@@ -1971,6 +1976,7 @@ async def get_settings():
     return {
         "idle_timeout_seconds": manager.idle_timeout,
         "max_loaded_models": manager.max_loaded_models,
+        "save_state_max_keep": manager.save_state_max_keep,
         "auto_save_state": manager.default_auto_save_state,
         "poll_interval_seconds": manager._poll_interval,
         "base_port": manager.base_port,
@@ -1993,6 +1999,10 @@ async def update_settings(request: Request):
         v = body["max_loaded_models"]
         if not isinstance(v, int) or v < 1:
             errors.append("'max_loaded_models' must be >= 1")
+    if "save_state_max_keep" in body:
+        v = body["save_state_max_keep"]
+        if not isinstance(v, int) or v < 1:
+            errors.append("'save_state_max_keep' must be >= 1")
     if "poll_interval_seconds" in body:
         v = body["poll_interval_seconds"]
         if not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
@@ -2016,6 +2026,9 @@ async def update_settings(request: Request):
     if "max_loaded_models" in body:
         manager.max_loaded_models = body["max_loaded_models"]
         changed.append("max_loaded_models")
+    if "save_state_max_keep" in body:
+        manager.save_state_max_keep = body["save_state_max_keep"]
+        changed.append("save_state_max_keep")
     if "auto_save_state" in body:
         manager.default_auto_save_state = body["auto_save_state"]
         changed.append("auto_save_state")
@@ -2040,6 +2053,8 @@ async def update_settings(request: Request):
             cfg["models"]["idle_timeout_seconds"] = body["idle_timeout_seconds"]
         if "max_loaded_models" in body:
             cfg["models"]["max_loaded_models"] = body["max_loaded_models"]
+        if "save_state_max_keep" in body:
+            cfg["models"]["save_state_max_keep"] = body["save_state_max_keep"]
         if "auto_save_state" in body:
             cfg["models"]["auto_save_state"] = body["auto_save_state"]
         if "poll_interval_seconds" in body:

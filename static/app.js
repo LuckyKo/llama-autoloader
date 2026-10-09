@@ -800,6 +800,7 @@ async function loadSettings() {
     const s = await apiJSON('/v1/settings');
     $('s-idle').value = s.idle_timeout_seconds ?? '';
     $('s-max-loaded').value = s.max_loaded_models ?? '';
+    $('s-save-state-max-keep').value = s.save_state_max_keep ?? '';
     $('s-poll').value = s.poll_interval_seconds ?? '';
     $('s-base-port').value = s.base_port ?? '';
     $('s-default-args').value = s.default_args || '';
@@ -816,6 +817,7 @@ async function loadSettings() {
 async function saveSettings() {
   const idle = Number($('s-idle').value);
   const maxLoaded = Number($('s-max-loaded').value);
+  const saveStateMaxKeep = Number($('s-save-state-max-keep').value);
   const poll = Number($('s-poll').value);
   const basePort = Number($('s-base-port').value);
 
@@ -825,6 +827,10 @@ async function saveSettings() {
   }
   if (isNaN(maxLoaded) || maxLoaded < 1 || !Number.isInteger(maxLoaded)) {
     showToast('Max loaded models must be an integer ≥ 1', 'error');
+    return;
+  }
+  if (isNaN(saveStateMaxKeep) || saveStateMaxKeep < 1 || !Number.isInteger(saveStateMaxKeep)) {
+    showToast('Max state files to keep must be an integer ≥ 1', 'error');
     return;
   }
   if (isNaN(poll) || poll <= 0) {
@@ -839,6 +845,7 @@ async function saveSettings() {
   const body = {
     idle_timeout_seconds: idle,
     max_loaded_models: maxLoaded,
+    save_state_max_keep: saveStateMaxKeep,
     poll_interval_seconds: poll,
     base_port: basePort,
     default_args: $('s-default-args').value,

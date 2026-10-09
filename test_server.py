@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import struct
 import time
 from pathlib import Path
@@ -338,6 +339,65 @@ class TestListStates:
 
 
 # ---------------------------------------------------------------------------
+# _cleanup_old_states()
+# ---------------------------------------------------------------------------
+
+class TestCleanupOldStates:
+    def _make_state_files(self, state_dir, model_id, count, base_mtime):
+        """Create `count` state files with distinct mtimes, oldest→newest."""
+        paths = []
+        for i in range(count):
+            p = state_dir / f"{model_id}.state{i}.bin"
+            p.write_bytes(b"state")
+            t = base_mtime + i * 100
+            os.utime(p, (t, t))
+            paths.append(p)
+        return paths
+
+    def _remaining(self, state_dir, model_id):
+        return sorted(
+            p.name for p in state_dir.iterdir()
+            if p.name.startswith(f"{model_id}.") and p.name.endswith(".bin")
+        )
+
+    @pytest.mark.asyncio
+    async def test_keeps_newest_by_mtime(self, manager):
+        # 6 state files, max_keep=3 → exactly the 3 newest survive
+        paths = self._make_state_files(manager.save_state_dir, "model-c.gguf", 6, 1_000_000)
+        manager.save_state_max_keep = 3
+        await manager._cleanup_old_states("model-c.gguf")
+        assert self._remaining(manager.save_state_dir, "model-c.gguf") == [
+            paths[3].name, paths[4].name, paths[5].name,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_max_keep_one(self, manager):
+        paths = self._make_state_files(manager.save_state_dir, "model-c.gguf", 4, 2_000_000)
+        manager.save_state_max_keep = 1
+        await manager._cleanup_old_states("model-c.gguf")
+        assert self._remaining(manager.save_state_dir, "model-c.gguf") == [paths[-1].name]
+
+    @pytest.mark.asyncio
+    async def test_live_read_after_construction(self, manager):
+        # Constructed with the default (5); changing the attr AFTER construction
+        # must take effect — proves cleanup reads the instance attr, not a frozen constant.
+        assert manager.save_state_max_keep == 5
+        paths = self._make_state_files(manager.save_state_dir, "model-c.gguf", 6, 3_000_000)
+        manager.save_state_max_keep = 2
+        await manager._cleanup_old_states("model-c.gguf")
+        assert self._remaining(manager.save_state_dir, "model-c.gguf") == [
+            paths[4].name, paths[5].name,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_noop_when_under_limit(self, manager):
+        paths = self._make_state_files(manager.save_state_dir, "model-c.gguf", 3, 4_000_000)
+        manager.save_state_max_keep = 5
+        await manager._cleanup_old_states("model-c.gguf")
+        assert self._remaining(manager.save_state_dir, "model-c.gguf") == [p.name for p in paths]
+
+
+# ---------------------------------------------------------------------------
 # _evict_lru_if_needed()
 # ---------------------------------------------------------------------------
 
@@ -515,6 +575,23 @@ class TestConfigValidation:
         cfg = _make_cfg()
         cfg["launcher"]["port"] = 70000
         with pytest.raises(ValueError, match="port"):
+            ModelManager.validate_config(cfg)
+
+    def test_save_state_max_keep_valid(self):
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_keep"] = 3
+        assert ModelManager.validate_config(cfg) is None
+
+    def test_save_state_max_keep_zero(self):
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_keep"] = 0
+        with pytest.raises(ValueError, match="save_state_max_keep"):
+            ModelManager.validate_config(cfg)
+
+    def test_save_state_max_keep_not_int(self):
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_keep"] = "5"
+        with pytest.raises(ValueError, match="save_state_max_keep"):
             ModelManager.validate_config(cfg)
 
 
