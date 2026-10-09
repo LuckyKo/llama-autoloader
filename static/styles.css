@@ -31,8 +31,8 @@ header {
   position: sticky; top: 0; z-index: 10; flex-wrap: wrap; gap: 12px;
 }
 .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 16px; letter-spacing: -0.02em; }
-.brand .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent);
-              box-shadow: 0 0 16px var(--accent); }
+.brand .dot { width: 28px; height: 28px; border-radius: 7px;
+              background: url('/static/icon.png') center/contain no-repeat; }
 .brand .accent { color: var(--accent2); }
 .launcher-info { font-family: var(--mono); color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .launcher-info b { color: var(--fg); }
