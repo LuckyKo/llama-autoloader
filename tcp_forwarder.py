@@ -127,6 +127,43 @@ class RawTCPForwarder:
         self._server_sock: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Thread-safe registry of in-flight llama-server upstream pipes, keyed by target port.
+        # Used by cancel_active() to perform a soft (connection-close) interrupt without unloading.
+        self._active_conns: Dict[int, set] = {}
+        self._active_lock = threading.Lock()
+
+    def cancel_active(self, port: int) -> int:
+        """Best-effort cancel of in-flight requests bound to ``port``.
+
+        Closes the underlying upstream (and client) sockets. For a recent llama-server build this
+        causes generation to stop ("srv stop: cancel task"), while leaving the resident model loaded.
+        Returns the number of connections cancelled.
+        """
+        with self._active_lock:
+            pairs = list(self._active_conns.pop(port, ()))
+        for client_sock, target_sock in pairs:
+            for s in (target_sock, client_sock):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        return len(pairs)
+
+    def _register_active(self, port: int, client_sock: socket.socket, target_sock: socket.socket) -> None:
+        with self._active_lock:
+            self._active_conns.setdefault(port, set()).add((client_sock, target_sock))
+
+    def _unregister_active(self, port: int, client_sock: socket.socket, target_sock: socket.socket) -> None:
+        with self._active_lock:
+            conns = self._active_conns.get(port)
+            if conns:
+                conns.discard((client_sock, target_sock))
+                if not conns:
+                    self._active_conns.pop(port, None)
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -538,7 +575,14 @@ class RawTCPForwarder:
             self._inject_cors_nonblocking(client_sock, target_sock)
 
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
-        self._bidirectional_pipe(client_sock, target_sock)
+        tracking = label == _LLAMA_SERVER_LABEL
+        if tracking:
+            self._register_active(target_port, client_sock, target_sock)
+        try:
+            self._bidirectional_pipe(client_sock, target_sock)
+        finally:
+            if tracking:
+                self._unregister_active(target_port, client_sock, target_sock)
 
     def _inject_cors_nonblocking(self, client_sock: socket.socket,
                                  target_sock: socket.socket) -> None:

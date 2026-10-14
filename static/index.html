@@ -76,6 +76,7 @@ Extensions:
   GET  /v1/status                              launcher + GPU + RAM + per-model usage
   PUT  /v1/models/{id}/config                  update sidecar config JSON
   POST /v1/models/{id}/load                    JIT-load a model
+  POST /v1/models/{id}/interrupt              cancel in-flight generation (soft; ?hard=true to kill+unload)
   POST /v1/models/{id}/unload                  unload
   POST /v1/models/{id}/state/save              {"label":"default"} save slot 0
   POST /v1/models/{id}/state/load              {"label":"default"} restore slot 0

@@ -195,6 +195,23 @@ Get detailed information about a specific model.
 **Error Responses:**
 - `404 Not Found`: Model ID not recognized.
 
+#### `GET /v1/models/{model_id}/port`
+
+Return the raw TCP port of a model's resident `llama-server` so a client can bypass the
+autoloader's proxy data path. Useful for direct binary/large streaming access.
+
+**Response Schema:**
+```json
+{
+  "port": 9001,
+  "model_id": "model.gguf"
+}
+```
+
+**Error Responses:**
+- `404 Not Found`: Model ID not recognized.
+- `503 Service Unavailable`: Model known but not currently loaded.
+
 #### `PUT /v1/models/{model_id}/config`
 
 Update a model's configuration. Accepts partial updates.
@@ -235,6 +252,33 @@ Unload a model. Forces the llama-server process to terminate.
   "unloaded": true
 }
 ```
+
+#### `POST /v1/models/{model_id}/interrupt`
+
+Best-effort in-flight generation cancel for an active (loaded + ready) model.
+
+Soft mode (default) closes the active upstream socket(s) to the resident `llama-server`.
+Recent builds stop generating when the client connection drops and keep the model loaded;
+older builds/states may continue. Returns HTTP 200 with `"status": "not-loaded"` when the
+model is not currently loaded (not an error).
+
+**Query Parameters:**
+- `hard` (boolean, default `false`) — when `true`, kill and unload the resident process to
+  guarantee the GPU stops (costs a fresh JIT load next time).
+
+**Response Schema:**
+```json
+{
+  "status": "interrupted",
+  "model_id": "model.gguf",
+  "mode": "soft",
+  "cancelled_requests": 1
+}
+```
+
+**Error Responses:**
+- `404 Not Found`: Model ID not recognized.
+- `500 Internal Server Error`: Hard interrupt (unload) failed.
 
 #### `POST /v1/models/{model_id}/vision/toggle`
 
@@ -336,6 +380,19 @@ List all saved states for a model. Scans `save_state_dir` for files matching `{s
 }
 ```
 
+#### `DELETE /v1/models/{model_id}/state/{label}`
+
+Delete a saved state file for the given label.
+
+**Response Schema:**
+```json
+{ "id": "model.gguf", "label": "mystate", "deleted": true }
+```
+
+**Error Responses:**
+- `404 Not Found`: Model or state label not found.
+- `500 Internal Server Error`: Delete failed.
+
 ### OpenAI-Compatible Proxy Endpoints
 
 These endpoints forward requests to the loaded model's llama-server.
@@ -379,6 +436,42 @@ curl "http://127.0.0.1:9001/slots/0?action=save&filename=test.bin"
 ```
 
 ### Other Endpoints
+
+#### `GET /v1/engines`
+
+List configured bridge engines with readiness status and errors.
+
+#### `POST /v1/models/engine`
+
+Register a bridge card for any configured engine.
+Request body: `{ "engine": "...", "engine_config": "/path/to/config.json", "name": "optional display name" }`.
+Returns `{"id": "<model_id>"}`.
+
+**Error Responses:**
+- `400 Bad Request`: Unknown/misconfigured engine or invalid engine config.
+- `409 Conflict`: Model id already exists.
+
+#### `POST /v1/models/strata`
+
+**Deprecated** alias of `POST /v1/models/engine` with `engine="strata"`.
+Request body: `{ "strata_config": "/path/to/config.json", "name": "optional" }`.
+
+#### `GET /v1/models/{model_id}/port`
+
+Return the raw TCP port of a resident `llama-server` (see also interrupt above location).
+
+**Response Schema:**
+```json
+{ "port": 9001, "model_id": "model.gguf" }
+```
+
+**Error Responses:**
+- `404 Not Found`: Model ID not recognized.
+- `503 Service Unavailable`: Model known but not loaded.
+
+#### `POST|GET|... /v1/raw/{model_id}/{path}`
+
+Pass-through any request to a loaded model's resident `llama-server`.
 
 #### `GET /`
 

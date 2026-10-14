@@ -263,6 +263,14 @@ curl -X PUT http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/config \
 
 **Updatable fields:** `name`, `description`, `args`, `ctx_size`, `n_gpu_layers`, `default`, `pinned`, `auto_save_state`, `backend`, `use_mmproj`, `mmproj_file`, `estimated_vram_mb`, `tags`
 
+#### `GET /v1/models/{model_id}/port`
+
+Get the raw TCP port of a loaded model's `llama-server` (bypass the autoloader data path). Returns 503 when known but not loaded.
+
+```bash
+curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/port
+```
+
 ---
 
 ### Model Loading / Unloading
@@ -291,6 +299,15 @@ Unload a model and terminate its `llama-server` process.
 
 ```bash
 curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/unload
+```
+
+#### `POST /v1/models/{model_id}/interrupt`
+
+Cancel in-flight generation without unloading the model. Soft by default; add `?hard=true` to kill+unload.
+
+```bash
+curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt
+curl -X POST 'http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt?hard=true'
 ```
 
 #### `POST /v1/unload_all`
@@ -370,6 +387,14 @@ curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state
 }
 ```
 
+#### `DELETE /v1/models/{model_id}/state/{label}`
+
+Delete a saved state label for a model.
+
+```bash
+curl -X DELETE http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/my-session
+```
+
 ---
 
 ### Backend Management
@@ -420,6 +445,32 @@ Pass `{"backend": ""}` to reset to auto-detect.
 2. Global `selected_backend` (set via this endpoint or `config.yaml`)
 3. First available build scanned from `backends/`
 4. Fallback `binary` value from `config.yaml`
+
+---
+
+### Bridge Engines (Engine Cards)
+
+#### `GET /v1/engines`
+
+List configured bridge engines with readiness status.
+
+```bash
+curl http://127.0.0.1:9123/v1/engines
+```
+
+#### `POST /v1/models/engine`
+
+Register a bridge card for any configured engine.
+
+```bash
+curl -X POST http://127.0.0.1:9123/v1/models/engine \
+  -H 'Content-Type: application/json' \
+  -d '{"engine":"strata","engine_config":"N:/work/WD/Strata/coder-iq3_xxs.json"}'
+```
+
+#### `POST /v1/models/strata`
+
+**Deprecated** alias of `POST /v1/models/engine` with `engine="strata"`.
 
 ---
 
@@ -493,6 +544,24 @@ curl http://127.0.0.1:9123/v1/status
     }
   ]
 }
+```
+
+---
+
+### Runtime Settings
+
+#### `GET /v1/settings`
+
+Get current runtime settings.
+
+#### `PUT /v1/settings`
+
+Partial update (idle timeout, max loaded models, auto-save state, poll interval, default args, base port, selected backend). Persists to `config.yaml`; `host`/`port` changes require restart.
+
+```bash
+curl -X PUT http://127.0.0.1:9123/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"max_loaded_models": 2, "idle_timeout_seconds": 1800}'
 ```
 
 ---

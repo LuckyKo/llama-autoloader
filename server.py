@@ -2162,7 +2162,49 @@ async def get_model_port(model_id: str):
         raise HTTPException(503, f"Model '{mid}' is not loaded")
     return {"port": port, "model_id": mid}
 
-@app.put("/v1/models/{model_id}/config")
+
+@app.post("/v1/models/{model_id}/interrupt")
+async def interrupt_model(model_id: str, hard: bool = False):
+    """Best-effort in-flight generation interrupt for an active model.
+
+    Preferred (soft) path: closes the active upstream connection(s) to that model's resident
+    llama-server. Modern llama-server builds honor a dropped client connection and stop
+    generating ("srv stop: cancel task") while keeping the model loaded, so the next request
+    does not pay a JIT reload. This is best-effort: on some builds/states generation may
+    continue until it naturally completes.
+
+    With ``?hard=true`` (or when no forwarder/sockets are available) it falls back to the old
+    behaviour of unloading (killing + reclaiming) the resident process, guaranteeing the GPU
+    stops at the cost of a fresh JIT load next time.
+    """
+    mid = await manager.resolve_model_id(model_id)
+    if not mid:
+        raise HTTPException(404, f"Model not found: {model_id}")
+
+    async with manager._lock:
+        lm = manager.loaded.get(mid)
+    if lm is None or not lm.ready:
+        return {"status": "not-loaded", "model_id": mid, "cancelled_requests": 0}
+
+    cancelled = 0
+    fw = globals().get("_forwarder")
+    if fw is not None:
+        try:
+            cancelled = fw.cancel_active(lm.port)
+        except Exception as e:
+            log.warning(f"Soft interrupt failed for {model_id}: {e}")
+
+    if hard:
+        try:
+            await manager.unload_model(mid)
+            return {"status": "interrupted", "model_id": mid, "mode": "hard",
+                    "cancelled_requests": cancelled}
+        except Exception as e:
+            log.warning(f"Interrupt (hard) failed for {model_id}: {e}")
+            raise HTTPException(500, f"Interrupt failed for {model_id}: {e}")
+
+    return {"status": "interrupted", "model_id": mid, "mode": "soft",
+            "cancelled_requests": cancelled}
 async def update_model_config(model_id: str, body: ModelConfigUpdate):
     mid = await manager.resolve_model_id(model_id)
     if not mid:

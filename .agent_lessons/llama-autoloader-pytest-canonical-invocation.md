@@ -3,6 +3,8 @@ tags: [pytest, windows, test-discovery, llama-autoloader]
 aliases: [pytest-invocation, bare-pytest-fails]
 confidence: verified
 author: coder_ui_builder_20261006_112342.jsonl
+contributors:
+  - coder_loader-slots-build_20261009_070016.jsonl
 ---
 
 # `python -m pytest -q` at the repo root FAILS collection — use the explicit paths
@@ -34,7 +36,10 @@ can be mistaken for a broken feature.
 ## Check
 
 Baseline for 2026-10-06 is **216 passed** (~70 s). After the Strata bridge-card build: **223 passed**
-(+7). Use the counts, not the exit code, to detect regressions.
+(+7). After the generic multi-engine bridge: **238 passed** (+15). After the save_state_max_keep
+setting (2026-10-09): **245 passed** (+7). Use the counts, not the exit code, to detect regressions.
+⚠️ Quoted baselines go stale fast in this repo — re-verify the pre-change count with a
+`--collect-only` run before trusting a "N passed" figure from a plan.
 
 ## Related
 
