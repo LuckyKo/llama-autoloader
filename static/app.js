@@ -122,6 +122,7 @@ function buildButtonRowHTML(m) {
     <button data-act="edit" ${act ? 'disabled' : ''}>Edit</button>
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
+    <button data-act="copy-id">Copy ID</button>
     ${m.engine === 'llama' ? '<button data-act="states">States</button>' : ''}
     ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>Delete</button>' : ''}
   `;
@@ -380,6 +381,10 @@ async function handleAction(id, act, btn) {
       const cmd = `curl http://${host}:${port}/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -d '{"model":"${id}", "messages":[{"role":"user","content":"Hello!"}]}'`;
       await navigator.clipboard.writeText(cmd);
       showToast('cURL command copied to clipboard!', 'success');
+    }
+    if (act === 'copy-id') {
+      await navigator.clipboard.writeText(id);
+      showToast(`Copied model id: ${id}`, 'success');
     }
   } catch (e) {
     showToast('Error: ' + e.message, 'error');
