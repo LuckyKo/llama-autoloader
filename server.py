@@ -1090,12 +1090,22 @@ class ModelManager:
             except OSError:
                 return False
 
-    def _allocate_port(self) -> int:
+    def _allocate_port(self, model_id: Optional[str] = None) -> int:
         used_ports = {lm.port for lm in self.loaded.values()}
-        port = self.next_port
+        # Stable per-model port: base_port + position of the model id in the sorted
+        # model registry. A given card therefore tends to reuse the same port across
+        # load/unload cycles and restarts, which keeps derived configs and manual
+        # connections stable. Fall back to the monotonically-increasing pointer for
+        # unknown models (preserves the old behaviour and the exhaustion tests).
+        if model_id is not None and model_id in self.models:
+            idx = sorted(self.models.keys()).index(model_id)
+            port = self.base_port + (idx % 500)
+        else:
+            port = self.next_port
         for _ in range(500):
             if port not in used_ports and self._is_port_available(port):
-                self.next_port = port + 1
+                if model_id is None:
+                    self.next_port = port + 1
                 return port
             port += 1
         raise RuntimeError("No available ports found for llama-server")
@@ -1171,7 +1181,7 @@ class ModelManager:
                     await self._unload_unlocked(model_id)
                 await self._evict_lru_if_needed(model_id)
                 cfg = self.models[model_id]
-                port = self._allocate_port()
+                port = self._allocate_port(model_id)
                 # Engine dispatch: bridge cards build their own argv/cwd/env from the engine
                 # registry; the llama path is byte-identical to before (env/cwd are None →
                 # inherit). Every bridge failure mode below is a clean 400, never a
