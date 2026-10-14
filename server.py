@@ -1051,10 +1051,12 @@ class ModelManager:
         return ModelManager.sanitize_safe_string(label)
 
     def _require_llama_engine(self, cfg) -> None:
-        """405 gate for llama-only operations (state save/restore, vision toggle).
+        """405 gate for llama-only operations (vision toggle).
 
         Only blocks a *known* non-llama card; an unknown id (cfg is None) falls through
         to the normal downstream 404/500 handling, matching the original inline behaviour.
+        Note: state save/restore is NOT gated here — Strata's serve exposes the same
+        /slots/0?action=save|restore endpoint as llama-server.
         """
         if cfg is not None and not cfg.is_llama:
             raise HTTPException(405, "Operation not supported for this engine")
@@ -2398,7 +2400,8 @@ async def unload_all_ep():
 async def save_state_ep(model_id: str, body: StateLabel):
     mid = await manager.resolve_model_id(model_id)
     cfg = await manager.get_config(mid) if mid else None
-    manager._require_llama_engine(cfg)
+    # State save/restore is supported by both llama.cpp and Strata engines.
+    # (Previously gated to llama-only; Strata's serve exposes the same /slots/0?action=save endpoint.)
     try:
         p = await manager.save_state(model_id, body.label)
         size = p.stat().st_size
@@ -2413,7 +2416,7 @@ async def save_state_ep(model_id: str, body: StateLabel):
 async def load_state_ep(model_id: str, body: StateLabel):
     mid = await manager.resolve_model_id(model_id)
     cfg = await manager.get_config(mid) if mid else None
-    manager._require_llama_engine(cfg)
+    # State save/restore is supported by both llama.cpp and Strata engines.
     try:
         p = await manager.load_state(model_id, body.label)
         log.info(f"State restored for model={model_id} label={body.label} path={p.name}")

@@ -3,10 +3,12 @@
   "raw-tcp-forwarder-architecture.md": 1,
   "update_config-two-lock-name-race.md": 1,
   "plan-review-backend-api-mismatch.md": 2,
-  "strata-bridge-lifecycle-facts.md": 3,
+  "strata-bridge-lifecycle-facts.md": 5,
   "subagent-edit-xml-fragment-corruption.md": 1,
   "bridge-generic-plan-dig.md": 3,
   "llama-autoloader-pytest-canonical-invocation.md": 2,
   "save-state-max-keep-setting.md": 1,
-  "forwarder-model-extraction-fallthrough-fix.md": 1
+  "forwarder-model-extraction-fallthrough-fix.md": 1,
+  "strata-bridge-config-discovery-and-expert-profile.md": 1,
+  "strata-dedup-deliberate-delta.md": 1
 }

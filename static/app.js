@@ -124,7 +124,7 @@ function buildButtonRowHTML(m) {
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
     <button data-act="copy-id">Copy ID</button>
-    ${m.engine === 'llama' ? '<button data-act="states">States</button>' : ''}
+    ${(m.engine === 'llama' || m.engine === 'strata') ? '<button data-act="states">States</button>' : ''}
     ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>' + (isDeleteInFlight ? 'Deleting...' : 'Delete') + '</button>' : ''}
   `;
 }
@@ -144,7 +144,7 @@ function updateButtonRow(card, m) {
   const currentHasVision = !!btnRow.querySelector('button[data-act="toggle-vision"]');
   const currentHasStates = !!btnRow.querySelector('button[data-act="states"]');
   if (currentLoaded !== !!m.loaded || currentHasVision !== !!m.has_mmproj ||
-      currentHasStates !== (m.engine === 'llama')) {
+      currentHasStates !== (m.engine === 'llama' || m.engine === 'strata')) {
     btnRow.innerHTML = buildButtonRowHTML(m);
     return;
   }

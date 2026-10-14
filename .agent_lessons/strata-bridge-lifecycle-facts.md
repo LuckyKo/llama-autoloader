@@ -4,6 +4,8 @@ aliases: [strata-bridge-lifecycle-facts]
 related: [[raw-tcp-forwarder-architecture]], [[model-id-gguf-name-collision]], [[sidecar-args-invalid-flag-jit-load-fail]], [autoloader-registry-is-gguf-shaped]]
 confidence: verified
 author: researcher_strata_researcher_20261006_071922.jsonl
+contributors:
+  - researcher_strata-save-restore-scope_20261014_110135.jsonl   # marked the /slots claim SUPERSEDED at Strata 296b59d2; flagged all line numbers as stale
 ---
 
 # Strata serve-layer facts needed to bridge it into llama-autoloader
@@ -41,6 +43,16 @@ Verified against `N:\work\WD\Strata\serve\server.py` on 2026-10-06. Non-obvious 
   autoloader; evict in-process before `Popen` instead.
 - `StrataEngine` has no `/slots` save/restore equivalent, so the autoloader's
   `auto_save_state` must be forced off for strata cards.
+  > **SUPERSEDED (2026-10-14).** This was true when written. At Strata HEAD `296b59d2` it is **false**:
+  > `StrataEngine.session_file()` exists (`serve/server.py:2029-2126`) and the llama-server-compatible
+  > `POST /slots/0?action=save|restore` endpoint exists (`serve/server.py:3111-3177`). The autoloader's
+  > `is_llama` gate and forced `auto_save_state = False` are now guarding a limitation upstream has
+  > removed. See [[strata-save-restore-blocked-by-405-gate]] for the three current blocking points and
+  > [[strata-session-save-restore-is-fully-implemented]] for the feature's actual scope.
+  >
+  > **All line numbers in this file are stale** — e.g. `/health` cited here at `:2172-2175` is at
+  > `serve/server.py:5337` today. The *facts* about `aliases`, dead `"port"` config keys and
+  > `STRATA_API_KEY` scrubbing remain directionally useful; the citations must not be reused.
 
 Plan: `N:\work\WD\AgentCascade\plans\strata-bridge-plan.md`.
 See also [[raw-tcp-forwarder-architecture]].
