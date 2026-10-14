@@ -123,6 +123,7 @@ function buildButtonRowHTML(m) {
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
     ${m.engine === 'llama' ? '<button data-act="states">States</button>' : ''}
+    ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>Delete</button>' : ''}
   `;
 }
 
@@ -357,6 +358,11 @@ async function handleAction(id, act, btn) {
     if (act === 'unload') {
       await apiJSON(`/v1/models/${encodeURIComponent(id)}/unload`, {method:'POST'});
       showToast(`Model ${id} unloaded`, 'info');
+    }
+    if (act === 'delete') {
+      if (!confirm(`Delete engine card ${id}?`)) return;
+      await apiJSON(`/v1/models/${encodeURIComponent(id)}`, {method:'DELETE'});
+      showToast(`Engine card ${id} deleted`, 'info');
     }
     if (act === 'edit') {
       openEditModal(id);

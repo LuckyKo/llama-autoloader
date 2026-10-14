@@ -310,6 +310,14 @@ curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt
 curl -X POST 'http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt?hard=true'
 ```
 
+#### `DELETE /v1/models/{model_id}`
+
+Delete an engine bridge card (user-added). Unloads it first if loaded. Llama/GGUF models cannot be deleted via this endpoint.
+
+```bash
+curl -X DELETE http://127.0.0.1:9123/v1/models/strata-coder-iq3_xxs
+```
+
 #### `POST /v1/unload_all`
 
 Unload all currently loaded models.

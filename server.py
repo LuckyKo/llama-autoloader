@@ -2330,6 +2330,47 @@ async def unload_model_ep(model_id: str):
     await manager.unload_model(model_id)
     return {"id": model_id, "unloaded": True}
 
+@app.delete("/v1/models/{model_id}")
+async def delete_model_ep(model_id: str):
+    """Delete an engine bridge card (user-added). Llama/GGUF models and auto-discovered
+    engine cards cannot be deleted through this endpoint (remove their source file instead)."""
+    mid = await manager.resolve_model_id(model_id)
+    if not mid:
+        raise HTTPException(404, f"Model not found: {model_id}")
+
+    async with manager._lock:
+        cfg = manager.models.get(mid)
+    if cfg is None:
+        raise HTTPException(404, f"Model not found: {model_id}")
+    if not cfg.is_bridge:
+        raise HTTPException(400, "Only engine bridge cards can be deleted via this endpoint")
+    engine = cfg.engine
+
+    # Make sure the resident process (if any) is stopped and its derived config removed.
+    try:
+        await manager.unload_model(mid)
+    except Exception as e:
+        log.warning(f"Unload before delete failed for {mid}: {e}")
+
+    # Remove the card file (and any legacy copy) so a rescan won't re-add it.
+    cards_dir = manager._cards_dir_for(engine)
+    for d in [cards_dir] + [Path(p) for p in getattr(manager, "LEGACY_CARDS_DIRS", ())]:
+        try:
+            (d / f"{mid}.json").unlink(missing_ok=True)
+        except OSError as e:
+            log.warning(f"Failed to remove card file for {mid} in {d}: {e}")
+    try:
+        manager._derived_config_path(engine, mid).unlink(missing_ok=True)
+    except Exception as e:
+        log.warning(f"Derived-config cleanup failed for {mid}: {e}")
+
+    async with manager._lock:
+        manager.models.pop(mid, None)
+        manager._model_sizes.pop(mid, None)
+        manager.mmproj_paths.pop(mid, None)
+    log.info(f"Deleted engine bridge card: {mid}")
+    return {"id": mid, "deleted": True}
+
 @app.post("/v1/unload_all")
 async def unload_all_ep():
     await manager.unload_all()

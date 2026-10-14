@@ -280,6 +280,19 @@ model is not currently loaded (not an error).
 - `404 Not Found`: Model ID not recognized.
 - `500 Internal Server Error`: Hard interrupt (unload) failed.
 
+#### `DELETE /v1/models/{model_id}`
+
+Delete an engine bridge card (user-added). Unloads first if loaded.
+
+**Response Schema:**
+```json
+{ "id": "card-id", "deleted": true }
+```
+
+**Error Responses:**
+- `400 Bad Request`: Model is not a bridge/decoder card.
+- `404 Not Found`: Model ID not recognized.
+
 #### `POST /v1/models/{model_id}/vision/toggle`
 
 Toggle vision module support for a model.

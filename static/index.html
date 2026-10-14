@@ -81,7 +81,8 @@ Extensions:
   POST /v1/models/{id}/state/save              {"label":"default"} save slot 0
   POST /v1/models/{id}/state/load              {"label":"default"} restore slot 0
   GET  /v1/models/{id}/state                   list saved labels
-  DELETE /v1/models/{id}/state/{label}         delete saved label
+  DELETE /v1/models/{id}                      delete an engine bridge card
+DELETE /v1/models/{id}/state/{label}         delete saved label
   POST /v1/scan                                rescan root dir for *.gguf + engine bridge cards
   GET  /v1/engines                             configured engines + why one is unusable
   POST /v1/models/engine                       add a bridge card {"engine": "strata", "engine_config": "path.json"}
