@@ -24,7 +24,7 @@ llama-autoloader is a Just-In-Time (JIT) model loader and OpenAI-compatible prox
 - **JIT Loading**: Models load only when first requested
 - **Auto-Unload**: Models are unloaded after idle timeout to free resources
 - **LRU Eviction**: Automatically unloads least-recently-used models when reaching `max_loaded_models` limit
-- **Port Management**: Dynamically assigns available ports starting from `base_port`
+- **Port Management**: Assigns a stable per-model port (`base_port` + position of the model id in the sorted registry), falling back to a dynamic free-port scan; keeps each card on the same port across reloads and restarts
 - **Session State Persistence**: Can auto-save/restore KV cache state across load/unload cycles
 - **Vision Module Auto-Pairing**: Automatically detects and associates `mmproj` vision projector files with models
 - **Multi-Backend Support**: Supports different llama.cpp builds (e.g., CUDA, AVX2) with per-model overrides

@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 import server
-from server import ModelManager
+from server import ModelManager, ModelConfig
 
 log = logging.getLogger(__name__)
 
@@ -399,3 +399,96 @@ class TestRealSubprocessLoad:
                 _kill_proc(lm.process)
             # Let the OS release the bound port (Windows TIME_WAIT) before the next test.
             time.sleep(0.2)
+
+
+# ===========================================================================
+# DELETE /v1/models/{model_id} — engine bridge card deletion
+# ===========================================================================
+
+class TestDeleteModelEndpoint:
+    """Regression tests for delete_model_ep (atomic check-and-claim under manager._lock).
+
+    Uses the shared ``client`` / ``seeded_manager`` fixtures (an isolated ModelManager
+    swapped into server.manager). Bridge cards are seeded directly into manager.models
+    with a non-llama ``engine`` (``is_bridge`` is a property on that field); no real
+    engine config, subprocess, or GPU is involved.
+    """
+
+    def test_delete_bridge_card_happy_path(self, client, seeded_manager, tmp_path):
+        """Deleting an engine BRIDGE card: 200 + {id, deleted:True}, removed from
+        manager.models, and the card file is unlinked."""
+        mgr = seeded_manager
+        cards = tmp_path / "cards"
+        cards.mkdir()
+        mgr.cards_dir = cards
+        mid = "my-bridge-card"
+        mgr.models[mid] = ModelConfig(engine="strata")
+        card_file = cards / f"{mid}.json"
+        card_file.write_text('{"exe": "engine.exe"}', encoding="utf-8")
+
+        r = client.delete(f"/v1/models/{mid}")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"id": mid, "deleted": True}
+        assert mid not in mgr.models
+        assert not card_file.exists()
+
+    def test_delete_non_bridge_rejected(self, client, seeded_manager):
+        """Deleting a llama/GGUF (non-bridge) model: 400 with the bridge-only message,
+        and the model is NOT removed from manager.models."""
+        mgr = seeded_manager
+        mid = "model-a.gguf"  # a seeded llama GGUF (is_bridge is False)
+        assert mid in mgr.models
+        assert not mgr.models[mid].is_bridge
+
+        r = client.delete(f"/v1/models/{mid}")
+        assert r.status_code == 400, r.text
+        assert "Only engine bridge cards can be deleted" in r.json()["detail"]
+        assert mid in mgr.models  # NOT removed
+
+    def test_delete_unknown_id_404(self, client, seeded_manager):
+        """Deleting an id that does not resolve: 404."""
+        r = client.delete("/v1/models/does-not-exist.gguf")
+        assert r.status_code == 404
+        assert "Model not found" in r.json()["detail"]
+
+    def test_delete_idempotent_when_already_claimed(self, client, seeded_manager, monkeypatch):
+        """Guard the atomic-claim branch: if the card resolved but was already claimed
+        (popped) by a concurrent delete, the endpoint is an idempotent no-op (200), not
+        404/500, and state stays clean.
+
+        The branch is only reachable under concurrency (both callers resolve while the
+        card is still present, then one claims it). We simulate that post-race state
+        deterministically: resolve_model_id returns the id, but the card is already gone
+        from manager.models.
+        """
+        mgr = seeded_manager
+        mid = "race-card"
+        monkeypatch.setattr(mgr, "resolve_model_id", AsyncMock(return_value=mid))
+        assert mid not in mgr.models  # already claimed by the "other" delete
+
+        r = client.delete(f"/v1/models/{mid}")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"id": mid, "deleted": True}
+        assert mid not in mgr.models  # stays clean — no re-add
+
+    def test_delete_sequential_double_returns_404(self, client, seeded_manager, tmp_path):
+        """A purely SEQUENTIAL second delete of the same id returns 404 (resolve_model_id
+        returns None once the card is popped), NOT 500, without corrupting state. Pins the
+        real sequential behavior; the idempotent 200 path is concurrency-only (see the
+        test above).
+        """
+        mgr = seeded_manager
+        cards = tmp_path / "cards"
+        cards.mkdir()
+        mgr.cards_dir = cards
+        mid = "seq-card"
+        mgr.models[mid] = ModelConfig(engine="strata")
+        (cards / f"{mid}.json").write_text('{"exe": "engine.exe"}', encoding="utf-8")
+
+        r1 = client.delete(f"/v1/models/{mid}")
+        assert r1.status_code == 200, r1.text
+        assert r1.json() == {"id": mid, "deleted": True}
+
+        r2 = client.delete(f"/v1/models/{mid}")
+        assert r2.status_code == 404, r2.text
+        assert mid not in mgr.models

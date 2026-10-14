@@ -1099,7 +1099,10 @@ class ModelManager:
         # unknown models (preserves the old behaviour and the exhaustion tests).
         if model_id is not None and model_id in self.models:
             idx = sorted(self.models.keys()).index(model_id)
-            port = self.base_port + (idx % 500)
+            port = self.base_port + idx
+            if port > 65535:
+                log.warning(f"Stable port {port} for {model_id} exceeds 65535; falling back to dynamic scan")
+                port = self.next_port
         else:
             port = self.next_port
         for _ in range(500):
@@ -2193,28 +2196,28 @@ async def interrupt_model(model_id: str, hard: bool = False):
 
     async with manager._lock:
         lm = manager.loaded.get(mid)
-    if lm is None or not lm.ready:
-        return {"status": "not-loaded", "model_id": mid, "cancelled_requests": 0}
+        if lm is None or not lm.ready:
+            return {"status": "not-loaded", "model_id": mid, "cancelled_requests": 0}
 
-    cancelled = 0
-    fw = globals().get("_forwarder")
-    if fw is not None:
-        try:
-            cancelled = fw.cancel_active(lm.port)
-        except Exception as e:
-            log.warning(f"Soft interrupt failed for {model_id}: {e}")
+        cancelled = 0
+        fw = globals().get("_forwarder")
+        if fw is not None:
+            try:
+                cancelled = fw.cancel_active(lm.port)
+            except Exception as e:
+                log.warning(f"Soft interrupt failed for {model_id}: {e}")
 
-    if hard:
-        try:
-            await manager.unload_model(mid)
-            return {"status": "interrupted", "model_id": mid, "mode": "hard",
-                    "cancelled_requests": cancelled}
-        except Exception as e:
-            log.warning(f"Interrupt (hard) failed for {model_id}: {e}")
-            raise HTTPException(500, f"Interrupt failed for {model_id}: {e}")
+        if hard:
+            try:
+                await manager._unload_unlocked(mid)
+                return {"status": "interrupted", "model_id": mid, "mode": "hard",
+                        "cancelled_requests": cancelled}
+            except Exception as e:
+                log.warning(f"Interrupt (hard) failed for {model_id}: {e}")
+                raise HTTPException(500, f"Interrupt failed for {model_id}: {e}")
 
-    return {"status": "interrupted", "model_id": mid, "mode": "soft",
-            "cancelled_requests": cancelled}
+        return {"status": "interrupted", "model_id": mid, "mode": "soft",
+                "cancelled_requests": cancelled}
 async def update_model_config(model_id: str, body: ModelConfigUpdate):
     mid = await manager.resolve_model_id(model_id)
     if not mid:
@@ -2348,14 +2351,22 @@ async def delete_model_ep(model_id: str):
     if not mid:
         raise HTTPException(404, f"Model not found: {model_id}")
 
+    # Claim the card atomically: guard check + in-memory removal under ONE lock, so a
+    # concurrent duplicate delete sees cfg is None and returns idempotently instead of
+    # both passing the is_bridge check (a re-add can't slip in between check and remove).
     async with manager._lock:
         cfg = manager.models.get(mid)
-    if cfg is None:
-        raise HTTPException(404, f"Model not found: {model_id}")
-    if not cfg.is_bridge:
-        raise HTTPException(400, "Only engine bridge cards can be deleted via this endpoint")
-    engine = cfg.engine
+        if cfg is None:
+            # Already gone (e.g. a concurrent delete won the race) — idempotent no-op.
+            return {"id": mid, "deleted": True}
+        if not cfg.is_bridge:
+            raise HTTPException(400, "Only engine bridge cards can be deleted via this endpoint")
+        engine = cfg.engine
+        manager.models.pop(mid)
+        manager._model_sizes.pop(mid, None)
+        manager.mmproj_paths.pop(mid, None)
 
+    # State is claimed; do the blocking/disk side effects OUTSIDE the lock.
     # Make sure the resident process (if any) is stopped and its derived config removed.
     try:
         await manager.unload_model(mid)
@@ -2374,10 +2385,6 @@ async def delete_model_ep(model_id: str):
     except Exception as e:
         log.warning(f"Derived-config cleanup failed for {mid}: {e}")
 
-    async with manager._lock:
-        manager.models.pop(mid, None)
-        manager._model_sizes.pop(mid, None)
-        manager.mmproj_paths.pop(mid, None)
     log.info(f"Deleted engine bridge card: {mid}")
     return {"id": mid, "deleted": True}
 

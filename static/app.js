@@ -98,11 +98,12 @@ function getInFlightState(id) {
     isLoadInFlight: act === 'load',
     isUnloadInFlight: act === 'unload',
     isVisionInFlight: act === 'toggle-vision',
+    isDeleteInFlight: act === 'delete',
   };
 }
 
 function buildButtonRowHTML(m) {
-  const { act, isLoadInFlight, isUnloadInFlight, isVisionInFlight } = getInFlightState(m.id);
+  const { act, isLoadInFlight, isUnloadInFlight, isVisionInFlight, isDeleteInFlight } = getInFlightState(m.id);
 
   const visionBtn = m.has_mmproj ? (
     m.use_mmproj
@@ -124,7 +125,7 @@ function buildButtonRowHTML(m) {
     <button data-act="copy-curl">cURL</button>
     <button data-act="copy-id">Copy ID</button>
     ${m.engine === 'llama' ? '<button data-act="states">States</button>' : ''}
-    ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>Delete</button>' : ''}
+    ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>' + (isDeleteInFlight ? 'Deleting...' : 'Delete') + '</button>' : ''}
   `;
 }
 
