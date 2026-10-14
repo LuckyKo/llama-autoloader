@@ -193,7 +193,16 @@ function tagsRowHTML(m) {
     + (m.engine && m.engine !== 'llama' ? `<span class="tag">${esc(m.engine)}</span>` : '');
 }
 
+function updateLoadedBar() {
+  const bar = $('loaded-bar');
+  if (!bar) return;
+  if (!modelsCache || modelsCache.length === 0) { bar.textContent = 'Loading…'; return; }
+  const loaded = modelsCache.filter(m => m.loaded);
+  if (loaded.length === 0) { bar.textContent = 'No model currently loaded.'; return; }
+  bar.textContent = 'Loaded: ' + loaded.map(m => `${m.name || m.id} (port ${m.port || '?'})`).join(' · ');
+}
 function renderModels() {
+  updateLoadedBar();
   const filter = $('filter').value.toLowerCase();
   const statusFilter = $('status-filter').value;
   const grid = $('models-grid');
