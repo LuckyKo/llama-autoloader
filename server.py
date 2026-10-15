@@ -49,6 +49,10 @@ from logger import init_logging
 # engine's config-supplied argv template, derived config and scrubbed env.
 from bridge_adapter import _launch_llama, _launch_bridge, _expand_token
 
+# Per-model FIFO ticket queue: orders LLM requests (TCP forwarder) against state
+# save/restore (FastAPI) so a restore enqueued first runs before the next request.
+from model_queue import ModelQueueRegistry
+
 # Legacy launch template used ONLY when migrating a pre-registry ``strata:`` section into
 # ``engines.strata``. New engines must supply their own ``argv`` (there is no generic default).
 _DEFAULT_ARGV = ["{interpreter}", "{serve_script}", "--engine", "{engine}",
@@ -414,6 +418,10 @@ class ModelManager:
         self.temp_dir = Path(__file__).resolve().parent / "temp"
         self._lock = asyncio.Lock()
         self._loading_tasks: Dict[str, asyncio.Task] = {}
+        # Per-model FIFO ticket queues (keyed by engine port). The TCP forwarder and
+        # the state save/restore paths both acquire a ticket here so operations for a
+        # model run in strict FIFO order. See model_queue.py.
+        self.queue_registry = ModelQueueRegistry()
         self._stop = False
         self._bg_task: Optional[asyncio.Task] = None
         self._model_sizes: Dict[str, float] = {}
@@ -1258,6 +1266,10 @@ class ModelManager:
             log.info(f"Model {model_id} ready on port {port}")
             lm.touch()
 
+            # Start this model's FIFO queue now that it is ready, so the auto-restore
+            # below and any concurrent LLM request are ordered through one queue.
+            queue = self.queue_registry.get_or_create(port, model_id)
+
             # Auto-restore session state if enabled and cached auto state exists.
             # Slot save/restore is llama-only: a bridge card must never trigger it, even
             # if the global default_auto_save_state is True.
@@ -1267,8 +1279,13 @@ class ModelManager:
                 if state_path.exists():
                     try:
                         log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
-                        await self._perform_slot_restore(port, state_path, timeout=30.0)
-                        lm.state_path = state_path
+                        # Hold the FIFO ticket so the restore runs before any LLM request.
+                        ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=60.0)
+                        try:
+                            await self._perform_slot_restore(port, state_path, timeout=30.0)
+                            lm.state_path = state_path
+                        finally:
+                            queue.release_ticket(ticket)
                     except Exception as e:
                         log.warning(f"Auto-restore failed for {model_id}: {e}")
 
@@ -1310,6 +1327,10 @@ class ModelManager:
 
         # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
         # card must never trigger it (even if the global default_auto_save_state is True).
+        # NOTE: intentionally NOT routed through the FIFO ticket queue. This is a teardown
+        # path — no later LLM request depends on this save — and the engine's own FIFO
+        # already serializes it against any in-flight generation. Ticketing it here would
+        # hold the asyncio lock across a potentially long ticket wait for no ordering gain.
         if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state) and lm.config.is_llama:
             try:
                 mid_clean = self._sanitize_model_id(model_id)
@@ -1318,6 +1339,10 @@ class ModelManager:
                 await self._perform_slot_save(lm.port, state_path, timeout=60.0)
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
+
+        # Stop and drop this model's FIFO queue before killing the process, so no new
+        # ticket is granted to a port that is about to die and any waiters are woken.
+        self.queue_registry.remove(lm.port)
 
         # Kill entire process group reliably across platforms
         def _kill_proc():
@@ -1460,8 +1485,10 @@ class ModelManager:
                 if r.status_code == 200:
                     log.debug(f"Slot {action} succeeded via {desc}")
                     return True
+                log.warning(f"Slot {action} attempt failed [{desc}]: HTTP {r.status_code} — {r.text[:500]}")
                 last_err = f"[{desc}] HTTP {r.status_code}: {r.text}"
             except Exception as e:
+                log.warning(f"Slot {action} attempt failed [{desc}]: {e}")
                 last_err = f"[{desc}] {e}"
 
         raise RuntimeError(f"{action} failed across all slot endpoints. Last error: {last_err}")
@@ -1492,7 +1519,12 @@ class ModelManager:
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
 
         try:
-            await self._perform_slot_save(lm.port, state_path, timeout=120.0)
+            queue = self.queue_registry.get_or_create(lm.port, model_id)
+            ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+            try:
+                await self._perform_slot_save(lm.port, state_path, timeout=120.0)
+            finally:
+                queue.release_ticket(ticket)
         except Exception as e:
             raise HTTPException(500, f"save failed: {e}")
 
@@ -1531,7 +1563,12 @@ class ModelManager:
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
 
         try:
-            await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+            queue = self.queue_registry.get_or_create(lm.port, model_id)
+            ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+            try:
+                await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+            finally:
+                queue.release_ticket(ticket)
         except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
 
@@ -1730,6 +1767,9 @@ class ModelManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.unload_all()
+        # Defensive: stop any FIFO queues not already removed by unload_all and wake
+        # any waiters so shutdown cannot hang on a held ticket.
+        self.queue_registry.stop_all()
         await self.client.aclose()
 
 

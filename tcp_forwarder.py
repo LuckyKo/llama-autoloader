@@ -249,16 +249,25 @@ class RawTCPForwarder:
                     return
                 target_port = self._resolve_target_port(model_id)
                 if target_port:
-                    # Model already loaded -> pipe directly. (No per-request log: this is the hot path.)
-                    self._pipe_to_backend(client_sock, raw_headers,
-                                          body_prefix, target_port, _LLAMA_SERVER_LABEL)
+                    # Model already loaded -> pipe directly, but only after acquiring this
+                    # model's FIFO ticket. The ticket is granted in strict submission order,
+                    # so a state restore enqueued before this request runs first (fixes the
+                    # full-reprocess race). No per-request log: this is the hot path.
+                    queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
+                    with queue.ticket(timeout=300.0):
+                        self._pipe_to_backend(client_sock, raw_headers,
+                                              body_prefix, target_port, _LLAMA_SERVER_LABEL)
                     return
                 # Model not loaded -> JIT load it, wait for readiness, then pipe.
                 log.info(f"Model '{model_id}' not loaded; triggering JIT load...")
                 target_port = self._jit_load_and_wait(model_id)
                 if target_port:
-                    self._pipe_to_backend(client_sock, raw_headers,
-                                          body_prefix, target_port, _LLAMA_SERVER_LABEL)
+                    # Acquire the ticket only AFTER the model is loaded and ready, so the
+                    # load itself is never gated by the queue.
+                    queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
+                    with queue.ticket(timeout=300.0):
+                        self._pipe_to_backend(client_sock, raw_headers,
+                                              body_prefix, target_port, _LLAMA_SERVER_LABEL)
                     return
                 # JIT load failed (unknown model / timeout / spawn error).
                 log.error(f"JIT load failed for '{model_id}' on {method} {path}")
