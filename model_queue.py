@@ -171,9 +171,11 @@ class ModelQueueRegistry:
                 q = ModelCommandQueue(port, model_id)
                 self._queues[port] = q
             elif q.model_id != model_id:
-                log.warning(
-                    f"queue for port {port} was created with model_id={q.model_id!r} "
-                    f"but requested with {model_id!r} — returning existing queue")
+                # Expected: aliases (e.g. engine name vs autoloader internal ID) resolve
+                # to the same port. Debug-level only to avoid spam on every request.
+                log.debug(
+                    f"queue for port {port} created with model_id={q.model_id!r}, "
+                    f"requested with {model_id!r} — returning existing queue")
             return q
 
     def remove(self, port: int) -> None:

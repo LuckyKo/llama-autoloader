@@ -1487,6 +1487,11 @@ class ModelManager:
                     return True
                 log.warning(f"Slot {action} attempt failed [{desc}]: HTTP {r.status_code} — {r.text[:500]}")
                 last_err = f"[{desc}] HTTP {r.status_code}: {r.text}"
+                # 5xx = server is reachable but can't do the operation (e.g. OOM).
+                # Retrying with a different URL format will hit the same server and
+                # either get the same 5xx or a misleading 404 (endpoint doesn't exist).
+                if r.status_code >= 500:
+                    break
             except Exception as e:
                 log.warning(f"Slot {action} attempt failed [{desc}]: {e}")
                 last_err = f"[{desc}] {e}"
@@ -2462,7 +2467,7 @@ async def load_state_ep(model_id: str, body: StateLabel):
         log.info(f"State restored for model={model_id} label={body.label} path={p.name}")
         return {"id": model_id, "label": body.label, "path": str(p)}
     except HTTPException as e:
-        if "restore failed" in e.detail and "not found" in e.detail.lower():
+        if "restore failed" in e.detail and "state file not found" in e.detail.lower():
             log.info(f"State restore skipped for model={model_id} label={body.label}: state file missing")
         raise
 
