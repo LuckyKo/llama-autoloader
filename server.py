@@ -577,6 +577,31 @@ _LEGACY_STRATA_ENV_SCRUB = ["STRATA_API_KEY", "STRATA_ALLOWED_HOSTS"]
 # written here any more — new cards go to ./engine_cards (or an engine's cards_dir).
 LEGACY_CARDS_DIRS = ("./strata_cards",)
 
+# --------------------------------------------------------------------------
+# Slot-action sequencing bounds and state-temp cleanup (safe-mode ordering contract)
+# --------------------------------------------------------------------------
+# Bounded wait for an in-flight slot action (save/restore) that holds a granted
+# FIFO ticket to finish before an unload drops the queue and kills its engine.
+SLOT_ACTION_DRAIN_TIMEOUT_S = 15.0
+# Window in which a state/load arriving right after a deliberate unload is
+# refused (409) instead of silently cold-reloading the just-released model.
+RECENT_UNLOAD_REFUSE_WINDOW_S = 10.0
+# Age past which the engine's interrupted-save scratch files (*.bin.<hash>.tmp)
+# are swept from states/. Nothing else ever reclaims them.
+STATE_TEMP_MAX_AGE_S = 3600.0
+
+# Exceptions meaning the engine is unreachable AT ALL (connection refused /
+# closed), as opposed to an HTTP error it actually returned. Retrying the other
+# endpoint formats against a dead socket only reproduces the same error.
+# httpx.NetworkError is the category covering exactly Connect/Read/Write/Close,
+# so it also catches a peer that dies mid-response (httpx.ReadError('') raised
+# once response headers have already arrived).
+# Deliberately NOT httpx.TransportError: a ReadTimeout means the engine was
+# reachable and may answer a differently-shaped request. ConnectTimeout is kept
+# explicitly because it subclasses TimeoutException, NOT NetworkError — a failed
+# connect is a dead socket, not a slow one.
+_UNREACHABLE_ERRORS = (httpx.NetworkError, httpx.ConnectTimeout, httpx.RemoteProtocolError)
+
 
 def _normalize_engines(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Return the ``engines:`` registry, migrating a legacy ``strata:`` section.
@@ -669,6 +694,17 @@ class ModelManager:
         self._stop = False
         self._bg_task: Optional[asyncio.Task] = None
         self._model_sizes: Dict[str, float] = {}
+        # In-flight slot-action bookkeeping: engine port -> number of save/restore
+        # operations currently holding a GRANTED ticket against that engine. An unload
+        # drains these (bounded) before killing the process, so a save is never cut
+        # mid-write. Plain dict, no extra lock: mutated only in single bytecode steps
+        # and only ever polled by the drain — it is never awaited on, so it cannot
+        # participate in a lock cycle.
+        self._inflight_slot_actions: Dict[int, int] = {}
+        # model_id -> time.monotonic() of the most recent deliberate unload, so a
+        # state/load landing right after one is refused with 409 instead of
+        # silently cold-reloading the model the caller just released.
+        self._recent_unload: Dict[str, float] = {}
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
@@ -1660,6 +1696,11 @@ class ModelManager:
                 self.loaded[model_id].touch()
                 return self.loaded[model_id]
 
+            # A load in flight cancels the "recently released" refusal: a
+            # state/load landing during this load must join it through the
+            # dedup below, not be told the endpoint was deliberately released.
+            self._recent_unload.pop(model_id, None)
+
             if model_id in self._loading_tasks and not self._loading_tasks[model_id].done():
                 task = self._loading_tasks[model_id]
             else:
@@ -1765,6 +1806,7 @@ class ModelManager:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 if state_path.exists():
+                    self._begin_slot_action(port)
                     try:
                         log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
                         # Hold the FIFO ticket so the restore runs before any LLM request.
@@ -1776,6 +1818,9 @@ class ModelManager:
                             queue.release_ticket(ticket)
                     except Exception as e:
                         log.warning(f"Auto-restore failed for {model_id}: {e}")
+                    finally:
+                        # Runs on every path so the drain counter cannot leak.
+                        self._end_slot_action(port)
 
             return lm
         except asyncio.CancelledError:
@@ -1812,6 +1857,19 @@ class ModelManager:
             return
         self._invalidate_status()  # Force status cache rebuild on next request
         log.info(f"Unloading {model_id} (port {lm.port})")
+        # The model is gone from self.loaded now, so record the release
+        # immediately: a state/load landing before the refuse window expires
+        # gets a 409 rather than a silent cold reload.
+        # Only DELIBERATE releases arm the window. _unload_unlocked is also
+        # reached from a load in flight (force-reload, failed-load and
+        # cancelled-load cleanup); a state/load landing during such a load
+        # must join it through the load path, not be refused.
+        loading_now = self._loading_tasks.get(model_id)
+        if not (loading_now and not loading_now.done()):
+            self._recent_unload[model_id] = time.monotonic()
+        for mid, ts in list(self._recent_unload.items()):
+            if time.monotonic() - ts > RECENT_UNLOAD_REFUSE_WINDOW_S:
+                del self._recent_unload[mid]
 
         # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
         # card must never trigger it (even if the global default_auto_save_state is True).
@@ -1827,6 +1885,20 @@ class ModelManager:
                 await self._perform_slot_save(lm.port, state_path, timeout=60.0)
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
+
+        # A save/restore holding a ticket on this port is mid-operation against
+        # this very engine; killing it now truncates the write (that is what left
+        # the orphan ``*.bin.<hash>.tmp``). Wait for it to finish first — bounded,
+        # and deadlock-free (see _drain_inflight_slot_action).
+        # A cancellation of the WAIT must not skip the queue drop and the kill:
+        # releasing memory is the point of this call, so the drain is only a
+        # courtesy. Fall through and re-raise once the cleanup has run.
+        cancelled = False
+        try:
+            await self._drain_inflight_slot_action(lm.port)
+        except asyncio.CancelledError:
+            cancelled = True
+            log.warning(f"Unload of {model_id} cancelled while draining; dropping the queue and killing anyway")
 
         # Stop and drop this model's FIFO queue before killing the process, so no new
         # ticket is granted to a port that is about to die and any waiters are woken.
@@ -1876,6 +1948,11 @@ class ModelManager:
                 self._derived_config_path(lm.config.engine, model_id).unlink(missing_ok=True)
             except Exception as e:
                 log.warning(f"Failed to delete derived engine config for {model_id}: {e}")
+
+        if cancelled:
+            # The queue is dropped, the process killed and the cleanup done, so the
+            # unload itself succeeded; only the caller's cancellation is preserved.
+            raise asyncio.CancelledError
 
     async def unload_model(self, model_id_input: str):
         mid = await self.resolve_model_id(model_id_input)
@@ -1956,6 +2033,94 @@ class ModelManager:
         return out
 
     # ---------------- state save/load ----------------
+    def _begin_slot_action(self, port: int) -> None:
+        """Count a slot action against ``port`` BEFORE it acquires its ticket.
+
+        Counting from before acquire_ticket (not just while granted) is what lets
+        the drain keep waiting through a queue hand-off: model_queue grants the
+        next waiter the instant the drained holder releases.
+        """
+        self._inflight_slot_actions[port] = self._inflight_slot_actions.get(port, 0) + 1
+
+    def _end_slot_action(self, port: int) -> None:
+        """Undo one _begin_slot_action, from an outer finally (runs on every path)."""
+        n = self._inflight_slot_actions.get(port, 0) - 1
+        if n > 0:
+            self._inflight_slot_actions[port] = n
+        else:
+            self._inflight_slot_actions.pop(port, None)
+
+    async def _drain_inflight_slot_action(self, port: int) -> None:
+        """Wait (bounded) for the slot actions counted against ``port`` to finish.
+
+        An unload calls this before dropping the port's FIFO queue and killing
+        the engine: otherwise a save mid-write is truncated, which is what left
+        the orphan ``*.bin.<hash>.tmp`` in states/. Counted holders include
+        actions still WAITING for a ticket — model_queue grants the next waiter
+        the instant the drained holder releases, so an untracked queued holder
+        would otherwise be killed mid-write right after the hand-off.
+
+        Deadlock-free by construction: this polls a plain dict and never
+        acquires a lock, and the operations it waits on (save_state /
+        load_state / _do_load_model's auto-restore) never hold ``self._lock``
+        across the slot I/O — they take it only for the brief membership lookup.
+
+        Cost, deliberately: the wait runs under ``unload_all``'s lock, so other
+        operations on the pool can stall up to the cap behind it. The cap keeps
+        that bounded, and a holder that does not finish in time is simply left
+        to fail (memory safety wins over preserving the write).
+        """
+        if self._inflight_slot_actions.get(port, 0) <= 0:
+            return
+        log.info(
+            f"Unloading: waiting for in-flight slot action on port {port} before unload "
+            f"(max {SLOT_ACTION_DRAIN_TIMEOUT_S:.0f}s)"
+        )
+        deadline = time.monotonic() + SLOT_ACTION_DRAIN_TIMEOUT_S
+        while self._inflight_slot_actions.get(port, 0) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning(
+                    f"In-flight slot action on port {port} did not finish within {SLOT_ACTION_DRAIN_TIMEOUT_S:.0f}s; "
+                    "proceeding with the kill anyway (memory safety wins; the save fails cleanly)"
+                )
+                return
+            await asyncio.sleep(min(0.1, remaining))
+
+    def _cleanup_state_temps(self) -> int:
+        """Delete the engine's interrupted-save scratch files older than STATE_TEMP_MAX_AGE_S.
+
+        A save killed mid-write leaves ``<state-name>.<hash>.tmp`` behind (the
+        engine writes a dot-prefixed temp, e.g. ``.model.label.bin.08a653e446816a81.tmp``)
+        and nothing else ever reclaims it, so multi-GB scratch files accumulate.
+        Only names ending in ``.tmp`` with a ``.bin.`` component are touched —
+        completed ``.bin`` state files never match.
+        """
+        cutoff = time.time() - STATE_TEMP_MAX_AGE_S
+        removed = 0
+        try:
+            for p in self.save_state_dir.iterdir():
+                name = p.name
+                if not name.endswith(".tmp") or ".bin." not in name:
+                    continue
+                try:
+                    if not p.is_file():
+                        continue
+                    st = p.stat()
+                    if st.st_mtime > cutoff:
+                        continue
+                    p.unlink()
+                    removed += 1
+                    log.info(
+                        f"Removed orphan state temp file: {name} "
+                        f"({st.st_size / (1024 * 1024):.1f} MB, older than {STATE_TEMP_MAX_AGE_S:.0f}s)"
+                    )
+                except Exception as e:
+                    log.debug(f"Failed to remove state temp file {name}: {e}")
+        except Exception as e:
+            log.debug(f"State temp cleanup failed: {e}")
+        return removed
+
     async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0) -> bool:
         """Attempt a slot action (save/restore) trying supported endpoint formats."""
         base = f"http://127.0.0.1:{port}"
@@ -1981,14 +2146,29 @@ class ModelManager:
                 if r.status_code >= 500:
                     break
             except Exception as e:
-                log.warning(f"Slot {action} attempt failed [{desc}]: {e}")
-                last_err = f"[{desc}] {e}"
+                # str() of some httpx exceptions (e.g. ConnectError('')) is empty; repr()
+                # always carries the class and its args, so the log/exception stay legible.
+                detail = str(e) or repr(e)
+                log.warning(f"Slot {action} attempt failed [{desc}]: {detail}")
+                last_err = f"[{desc}] {detail}"
+                if isinstance(e, _UNREACHABLE_ERRORS):
+                    # The engine is unreachable at all (refused/closed) — not an
+                    # HTTP error it returned. The remaining endpoint formats hit
+                    # the same dead socket, so stop burning time on them.
+                    log.warning(
+                        f"Slot {action} aborted for port {port}: engine unreachable "
+                        f"({type(e).__name__}), not retrying other formats"
+                    )
+                    break
 
         raise RuntimeError(f"{action} failed across all slot endpoints. Last error: {last_err}")
 
     async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
         """Attempt to save slot state trying supported endpoint formats."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
+        # A save killed mid-write leaves a multi-GB scratch file behind; reclaim
+        # the stale ones right before writing another one (never touches .bin).
+        self._cleanup_state_temps()
         log.info(f"Saving slot 0 state to file: {state_path}")
         return await self._perform_slot_action("save", port, state_path, timeout)
 
@@ -2012,12 +2192,18 @@ class ModelManager:
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
 
         try:
-            queue = self.queue_registry.get_or_create(lm.port, model_id)
-            ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+            self._begin_slot_action(lm.port)
             try:
-                await self._perform_slot_save(lm.port, state_path, timeout=120.0)
+                queue = self.queue_registry.get_or_create(lm.port, model_id)
+                ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+                try:
+                    await self._perform_slot_save(lm.port, state_path, timeout=120.0)
+                finally:
+                    queue.release_ticket(ticket)
             finally:
-                queue.release_ticket(ticket)
+                # Runs on every path (including a failed acquire), so the counter
+                # can never leak and leave later unloads paying the full drain cap.
+                self._end_slot_action(lm.port)
         except Exception as e:
             raise HTTPException(500, f"save failed: {e}")
 
@@ -2040,6 +2226,23 @@ class ModelManager:
             lm = self.loaded.get(model_id)
 
         if lm is None or not lm.ready:
+            # This endpoint was deliberately released moments ago. Silently
+            # cold-reloading here is what made a racing/abandoned restore look
+            # like a success while burning a full model load; refuse instead so
+            # the caller can decide (409 = conflict with the release request).
+            released_at = self._recent_unload.get(model_id)
+            if released_at is not None:
+                since = time.monotonic() - released_at
+                if since < RECENT_UNLOAD_REFUSE_WINDOW_S:
+                    log.info(
+                        f"Refusing state restore for '{model_id}': endpoint deliberately released "
+                        f"{since:.1f}s ago"
+                    )
+                    raise HTTPException(
+                        409,
+                        f"endpoint deliberately released: model '{model_id}' was unloaded "
+                        f"{since:.1f}s ago; reload it explicitly if a state restore is intended",
+                    )
             log.info(f"Auto-loading model '{model_id}' before state restore")
             try:
                 lm = await asyncio.wait_for(self.load_model(model_id), timeout=60.0)
@@ -2056,12 +2259,16 @@ class ModelManager:
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
 
         try:
-            queue = self.queue_registry.get_or_create(lm.port, model_id)
-            ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+            self._begin_slot_action(lm.port)
             try:
-                await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+                queue = self.queue_registry.get_or_create(lm.port, model_id)
+                ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+                try:
+                    await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+                finally:
+                    queue.release_ticket(ticket)
             finally:
-                queue.release_ticket(ticket)
+                self._end_slot_action(lm.port)
         except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
 
