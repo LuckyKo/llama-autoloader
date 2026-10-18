@@ -589,7 +589,8 @@ async def test_list_models_llama_payload_gains_only_defaulted_fields(tmp_path):
     assert set(payload) == {
         "id", "name", "description", "tags", "default", "pinned", "auto_save_state",
         "backend", "engine", "engine_config", "min_free_vram_mib", "extra_args",
-        "resolved_binary", "has_mmproj", "use_mmproj", "mmproj_file", "ctx_size",
+        "resolved_binary", "has_mmproj", "use_mmproj", "mmproj_file",
+        "mmproj_resolved", "mmproj_source", "ctx_size",
         "max_ctx_size", "n_gpu_layers", "estimated_vram_mb", "args", "gguf_name",
         "size_mb", "loaded", "ready", "port", "pid", "last_used", "state_path",
         # Classification block (model-type grouping/badging). Added as its own group,

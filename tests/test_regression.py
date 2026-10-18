@@ -572,6 +572,118 @@ class TestMmprojPairingRules:
             "a projector added after scan() must be discovered without a rescan"
 
 
+class TestMmprojProvenance:
+    """Vision provenance: which projector gives a model vision, and how we decided.
+
+    A bare "vision" tag made the pairing a one-way invisible fact, and projectors get no
+    card of their own, so a projector attached to nothing was undetectable from the UI.
+    """
+
+    def _mgr(self, tmp_path):
+        from tests.conftest import build_cfg
+        return ModelManager(build_cfg(tmp_path))
+
+    def test_sidecar_projector_reports_explicit(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        model = mgr.root_dir / "alpha.gguf"
+        proj = mgr.root_dir / "mmproj-alpha.gguf"
+        gb.write_gguf(model, name="Alpha", max_ctx=1024)
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        cfg = server.ModelConfig.load(model)
+        cfg.mmproj_file = proj.name
+        cfg.save(model)
+        mgr.scan()
+        assert mgr.mmproj_source.get("alpha.gguf") == "explicit"
+
+    def test_inferred_projector_reports_auto(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        gb.write_gguf(mgr.root_dir / "alpha.gguf", name="Alpha", max_ctx=1024)
+        proj = mgr.root_dir / "mmproj-alpha.gguf"
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        mgr.scan()
+        assert mgr.mmproj_paths.get("alpha.gguf") == proj
+        assert mgr.mmproj_source.get("alpha.gguf") == "auto"
+
+    def test_provenance_is_read_before_the_inferred_name_is_written_back(self, tmp_path):
+        """scan() writes an inferred name back into cfg.mmproj_file.
+
+        If provenance were read afterwards, "auto" would be reported as "explicit" and
+        the distinction this whole feature exists for would be permanently lost.
+        """
+        mgr = self._mgr(tmp_path)
+        gb.write_gguf(mgr.root_dir / "alpha.gguf", name="Alpha", max_ctx=1024)
+        gb.write_gguf(mgr.root_dir / "mmproj-alpha.gguf", name="Proj", max_ctx=None)
+        mgr.scan()
+        # The sidecar-config value is now populated by the scan...
+        assert mgr.models["alpha.gguf"].mmproj_file == "mmproj-alpha.gguf"
+        # ...yet provenance still knows the difference.
+        assert mgr.mmproj_source.get("alpha.gguf") == "auto"
+
+    def test_unpaired_model_has_no_source(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        gb.write_gguf(mgr.root_dir / "alpha.gguf", name="Alpha", max_ctx=1024)
+        mgr.scan()
+        assert "alpha.gguf" not in mgr.mmproj_paths
+        assert "alpha.gguf" not in mgr.mmproj_source
+
+    def test_trailing_space_in_sidecar_resolves_to_canonical_path(self, tmp_path):
+        """A hand-edited sidecar carrying "mmproj-F16.gguf " must not poison the Path.
+
+        pathlib preserves the trailing space, so the resolved Path would not equal the
+        canonical one from rglob - breaking every path comparison AND emitting a --mmproj
+        launch arg with a stray space inside the quotes. It only appeared to work because
+        Windows file APIs tolerate trailing spaces.
+        """
+        mgr = self._mgr(tmp_path)
+        model = mgr.root_dir / "alpha.gguf"
+        proj = mgr.root_dir / "mmproj-alpha.gguf"
+        gb.write_gguf(model, name="Alpha", max_ctx=1024)
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        cfg = server.ModelConfig.load(model)
+        cfg.mmproj_file = "mmproj-alpha.gguf "     # trailing space, as seen in the wild
+        cfg.save(model)
+        mgr.scan()
+        resolved = mgr.mmproj_paths.get("alpha.gguf")
+        assert resolved is not None, "a trailing space must not break resolution"
+        assert str(resolved) == str(proj), "resolved path must be canonical"
+        assert resolved == proj, "must equal the rglob path, not a look-alike"
+        argv = mgr.models["alpha.gguf"].to_launch_args(
+            model, 9001, "", mmproj_full_path=resolved)
+        mmproj_arg = argv[argv.index("--mmproj") + 1]
+        assert mmproj_arg == str(proj), "launch arg must not carry a trailing space"
+
+    def test_inventory_reports_owner_and_flags_orphans(self, tmp_path):
+        """GET /v1/mmproj must name the owner, and count an orphan as unpaired.
+
+        The orphan is the bug class this feature was added to expose, so it has to be
+        visible rather than merely absent.
+        """
+        from fastapi.testclient import TestClient
+        import server as srv_mod
+
+        mgr = self._mgr(tmp_path)
+        gb.write_gguf(mgr.root_dir / "alpha.gguf", name="Alpha", max_ctx=1024)
+        gb.write_gguf(mgr.root_dir / "mmproj-alpha.gguf", name="Proj", max_ctx=None)
+        gb.write_gguf(mgr.root_dir / "orphan-mmproj.gguf", name="Proj2", max_ctx=None)
+        mgr.scan()
+
+        old = srv_mod.manager
+        srv_mod.manager = mgr
+        try:
+            client = TestClient(srv_mod.app)
+            r = client.get("/v1/mmproj")
+            assert r.status_code == 200
+            body = r.json()
+            assert body["count"] == 2
+            assert body["unpaired"] == 1
+            by_name = {p["name"]: p for p in body["projectors"]}
+            assert by_name["mmproj-alpha.gguf"]["owner"] == "alpha.gguf"
+            assert by_name["mmproj-alpha.gguf"]["source"] == "auto"
+            assert by_name["orphan-mmproj.gguf"]["owner"] == ""
+        finally:
+            srv_mod.manager = old
+
+
 def _gguf_with_general_type(gguf_type: str, arch: str) -> bytes:
     """A minimal GGUF header carrying general.type / general.architecture as strings."""
     kvs = [("general.architecture", arch), ("general.type", gguf_type)]

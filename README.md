@@ -619,6 +619,51 @@ List configured bridge engines with readiness status.
 curl http://127.0.0.1:9123/v1/engines
 ```
 
+### Vision Projectors
+
+#### `GET /v1/mmproj`
+
+List every vision projector under the models root, and which model owns it.
+
+Projectors are deliberately **not** model cards, so this is the only place they appear
+at all. It exists because a pairing is otherwise a one-way invisible fact: a card shows
+"vision" without saying which file provides it, and a projector attached to nothing is
+not shown anywhere — so an orphan was undetectable from the UI.
+
+```json
+{
+  "count": 2,
+  "unpaired": 1,
+  "projectors": [
+    { "name": "mmproj-F16.gguf", "path": "...", "dir": "...", "size_mb": 1143.0,
+      "owner": "Qwen3.8-27B-UD-Q4_K_XL.gguf", "source": "explicit", "enabled": true },
+    { "name": "mmproj-F32.gguf", "path": "...", "dir": "...", "size_mb": 1584.4,
+      "owner": "", "source": "", "enabled": false }
+  ]
+}
+```
+
+`owner` is the model id, or `""` when unpaired. `source` is `explicit` (set in a
+sidecar) or `auto` (inferred at scan). `enabled` is whether the owner will actually pass
+`--mmproj`.
+
+#### Vision provenance on `GET /v1/models`
+
+Each model additionally carries:
+
+| Field | Meaning |
+| --- | --- |
+| `mmproj_file` | The **configured** name. Empty when the link was inferred. |
+| `mmproj_resolved` | The file that actually reaches `--mmproj`. |
+| `mmproj_source` | `explicit` (you set it) or `auto` (we inferred it). |
+| `has_mmproj` | Whether a projector resolves at all. |
+
+The WebUI shows these as a `vision ← <filename>` tag on the card (with `auto` and `off`
+markers) plus a collapsible **Vision projectors** panel listing every projector and its
+owner. `mmproj_resolved` is separate from `mmproj_file` precisely because an inferred
+pairing has to be distinguishable from a deliberate one — otherwise a wrong pairing is
+indistinguishable from a right one.
+
 #### `POST /v1/models/engine`
 
 Register a bridge card for any configured engine.

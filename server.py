@@ -646,6 +646,10 @@ class ModelManager:
         self.models: Dict[str, ModelConfig] = {}      # id -> config
         self.gguf_paths: Dict[str, Path] = {}         # id -> path
         self.mmproj_paths: Dict[str, Path] = {}       # id -> mmproj path
+        # id -> "explicit" | "auto": how the pairing above came to be. Must be recorded
+        # at pairing time, because scan() then writes an inferred name back into
+        # cfg.mmproj_file - after which the two cases are indistinguishable forever.
+        self.mmproj_source: Dict[str, str] = {}
         # Every vision projector found by the last scan. Seeded here (and fingerprinted in
         # the loop below) so _list_mmproj_files() validates cheaply instead of re-reading
         # every header on the update_config path.
@@ -909,12 +913,31 @@ class ModelManager:
         return list(self._mmproj_paths)
 
     def _best_mmproj_by_name(self, model_stem: str, candidates: List[Path]) -> Optional[Path]:
-        """Pick the projector whose name shares the longest prefix with the model's.
+        """Pick the projector most likely to belong to a model, out of several.
 
-        Positional heuristic, kept for the multi-projector case. It happily returns a
-        candidate at score 0, which is why the ambiguous single-projector case below uses
-        :meth:`_mmproj_affinity` instead.
+        Two signals, in order:
+
+        1. :meth:`_mmproj_affinity` - a normalized name relationship (exact / containment
+           after stripping the ``mmproj-`` prefix). Where this finds any signal at all it
+           is strictly more trustworthy than the positional heuristic, so it wins.
+        2. Positional character agreement - only when NO candidate has a name
+           relationship. This preserves the historical behaviour for real libraries whose
+           projectors carry no model name at all (e.g. mmproj-F16 / mmproj-F32 beside a
+           single model), where there is no better information and changing the choice
+           would alter a working setup for no gain.
+
+        The positional heuristic on its own gets things plainly wrong: pairing "alpha"
+        with a directory containing mmproj-alpha.gguf and orphan-mmproj.gguf picked
+        ORPHAN-mmproj, because it compares characters by index and the "mmproj-" prefix
+        shifts every position ("alpha" vs "mmpro" scores 1, "alpha" vs "orpha" scores 3
+        on pure coincidence). Normalized affinity scores that pair 1000 vs 0.
         """
+        if not candidates:
+            return None
+        # key= avoids comparing Paths, which are not orderable.
+        best_affinity = max(self._mmproj_affinity(model_stem, mp.stem) for mp in candidates)
+        if best_affinity > 0:
+            return max(candidates, key=lambda mp: self._mmproj_affinity(model_stem, mp.stem))
         p_stem = model_stem.lower()
         best_match = None
         best_score = -1
@@ -998,7 +1021,12 @@ class ModelManager:
 
         # 1. Check explicit mmproj_file setting
         if cfg.mmproj_file:
-            candidate = Path(cfg.mmproj_file)
+            # Strip: a sidecar edited by hand or filled by a copy/paste can carry a
+            # trailing space ("mmproj-F16.gguf "). pathlib keeps it, so the resolved
+            # Path would NOT equal the canonical one from rglob - silently breaking every
+            # path comparison, and putting a stray space inside the --mmproj launch arg.
+            # It only "worked" because Windows file APIs tolerate trailing spaces.
+            candidate = Path(cfg.mmproj_file.strip())
             if candidate.exists() and candidate.is_file():
                 paired_mmproj = candidate
             else:
@@ -1263,15 +1291,20 @@ class ModelManager:
             if (self.models[mid].model_type or MODEL_TYPE_TEXT) not in MODEL_TYPE_AUXILIARY:
                 eligible_by_dir.setdefault(p.parent, []).append(p.stem)
                 eligible_all.append(p.stem)
+        self.mmproj_source = {}
         for mid, p in self.gguf_paths.items():
             cfg = self.models[mid]
             ctx = {
                 "eligible_siblings": [s for s in eligible_by_dir.get(p.parent, []) if s != p.stem],
                 "eligible_others": [s for s in eligible_all if s != p.stem],
             }
+            # Read provenance BEFORE pairing: the write two lines below stamps an inferred
+            # name into cfg.mmproj_file, which would make "auto" look "explicit" forever.
+            explicit = bool((cfg.mmproj_file or "").strip())
             paired_mmproj = self._pair_mmproj(p, cfg, mmproj_paths, **ctx)
             if paired_mmproj:
                 self.mmproj_paths[mid] = paired_mmproj
+                self.mmproj_source[mid] = "explicit" if explicit else "auto"
                 if not cfg.mmproj_file:
                     cfg.mmproj_file = paired_mmproj.name
             else:
@@ -1337,6 +1370,7 @@ class ModelManager:
             loaded_snap = dict(self.loaded)
             sizes_snap = dict(self._model_sizes)
             mmproj_snap = dict(self.mmproj_paths)
+            mmproj_src_snap = dict(self.mmproj_source)
 
         out = []
         for mid, cfg in snapshots:
@@ -1373,6 +1407,14 @@ class ModelManager:
                 "has_mmproj": has_mmproj,
                 "use_mmproj": cfg.use_mmproj,
                 "mmproj_file": cfg.mmproj_file,
+                # Vision provenance. ``mmproj_file`` is only the CONFIGURED name and is
+                # empty when a pairing was inferred; ``mmproj_resolved`` is the file that
+                # actually reaches --mmproj. ``mmproj_source`` says which produced it, so
+                # the UI can distinguish "you set this" from "we guessed this" - the two
+                # were indistinguishable on the card, which is how a wrong pairing stayed
+                # invisible.
+                "mmproj_resolved": mmproj_p.name if has_mmproj else "",
+                "mmproj_source": mmproj_src_snap.get(mid, ""),
                 "ctx_size": cfg.ctx_size,
                 "max_ctx_size": cfg.max_ctx_size,
                 "n_gpu_layers": cfg.n_gpu_layers,
@@ -1461,7 +1503,10 @@ class ModelManager:
             # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
             # mmproj_file is written to the sidecar (matches scan() behavior).
             mmprojs = self._list_mmproj_files()
+            # Provenance before the fill below, same reason as in scan().
+            explicit = bool((new_cfg.mmproj_file or "").strip())
             paired = self._pair_mmproj(path, new_cfg, mmprojs)
+            paired_source = ("explicit" if explicit else "auto") if paired is not None else ""
             if paired is not None and not new_cfg.mmproj_file:
                 new_cfg.mmproj_file = paired.name
             # Re-derive the effective type so a just-changed override (or a reset back to
@@ -1477,9 +1522,11 @@ class ModelManager:
             # Sync the mmproj pairing computed above so --mmproj is correct at launch.
             if paired is not None:
                 self.mmproj_paths[mid] = paired
+                self.mmproj_source[mid] = paired_source
             else:
                 # Stale/cleared: drop any previous pairing so --mmproj is dropped at launch.
                 self.mmproj_paths.pop(mid, None)
+                self.mmproj_source.pop(mid, None)
         return new_cfg
 
     # ---------------- sanitization ----------------
@@ -2642,6 +2689,9 @@ async def list_models():
             "use_mmproj": m["use_mmproj"],
             "mmproj_file": m["mmproj_file"],
             "has_mmproj": m["has_mmproj"],
+            # Vision provenance — the resolved file and how the link was decided.
+            "mmproj_resolved": m["mmproj_resolved"],
+            "mmproj_source": m["mmproj_source"],
             "ctx_size": m["ctx_size"],
             "max_ctx_size": m["max_ctx_size"],
             "n_gpu_layers": m["n_gpu_layers"],
@@ -2923,6 +2973,55 @@ async def list_engines():
             "has_configs_dir": bool(spec.get("configs_dir")),
         })
     return out
+
+@app.get("/v1/mmproj")
+async def list_projectors():
+    """Every vision projector under root_dir, and which model owns it.
+
+    Projectors are deliberately not model cards, so this is the ONLY place they are
+    visible at all. It exists because a pairing is otherwise a one-way, invisible fact:
+    a card shows "vision" without saying which file provides it, and a projector attached
+    to nothing is not shown anywhere - so an orphan (exactly the mispairing class fixed
+    in _pair_mmproj) was undetectable from the UI.
+
+    Fields per projector:
+      ``name``     filename, e.g. "mmproj-F16.gguf"
+      ``path``     absolute path
+      ``size_mb``  on-disk size
+      ``owner``    model id it is paired to, or "" when unpaired
+      ``source``   "explicit" (set in a sidecar) | "auto" (inferred at scan)
+      ``enabled``  whether the owner will actually pass --mmproj at launch
+      ``dir``      parent directory, to spot a projector shared from elsewhere
+
+    ``count``/``unpaired`` let a caller assert "nothing is orphaned" without walking the
+    list.
+    """
+    async with manager._lock:
+        pairs = dict(manager.mmproj_paths)
+        sources = dict(manager.mmproj_source)
+        models = dict(manager.models)
+    owner_of: Dict[Path, str] = {p: mid for mid, p in pairs.items()}
+    out = []
+    for p in sorted(manager._list_mmproj_files()):
+        mid = owner_of.get(p, "")
+        try:
+            size_mb = p.stat().st_size / 1024 / 1024
+        except OSError:
+            size_mb = 0.0
+        out.append({
+            "name": p.name,
+            "path": str(p),
+            "dir": str(p.parent),
+            "size_mb": round(size_mb, 1),
+            "owner": mid,
+            "source": sources.get(mid, "") if mid else "",
+            "enabled": bool(mid and models.get(mid) and models[mid].use_mmproj),
+        })
+    return {
+        "count": len(out),
+        "unpaired": sum(1 for p in out if not p["owner"]),
+        "projectors": out,
+    }
 
 @app.post("/v1/models/strata")
 async def add_strata_card_ep(b: StrataCardCreate):

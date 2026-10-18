@@ -197,9 +197,40 @@ rule 3's directory scoping entirely. `_mmproj_affinity` normalizes the `mmproj-`
 and scores exact/containment matches, because the old positional heuristic scores every
 projector above zero (index 2 of `mmproj-*` is always `p`).
 
+Rule 3's multi-projector branch uses `_best_mmproj_by_name`, which prefers
+`_mmproj_affinity` whenever **any** candidate has a name relationship, and falls back to
+the positional heuristic only when none does. Affinity is strictly more trustworthy, and
+the fallback preserves the historical answer for real libraries whose projectors carry no
+model name at all (e.g. `mmproj-F16` / `mmproj-F32` beside a single model). The purely
+positional heuristic gets this visibly wrong: for `alpha.gguf` in a directory holding
+`mmproj-alpha.gguf` and `orphan-mmproj.gguf` it picked **orphan**-mmproj, because it
+compares characters by index and the `mmproj-` prefix shifts every position (`alpha` vs
+`mmpro` scores 1; `alpha` vs `orpha` scores 3 on coincidence). Affinity scores that
+1000 vs 0.
+
+An explicit `mmproj_file` is `.strip()`ed before resolution. A sidecar edited by hand or
+filled by copy/paste can carry a trailing space (`"mmproj-F16.gguf "`); pathlib preserves
+it, so the resolved `Path` would not equal the canonical one from `rglob` — silently
+breaking every path comparison and emitting a `--mmproj` launch arg with a stray space
+inside the quotes. It only appeared to work because Windows file APIs tolerate trailing
+spaces; it would fail outright on Linux.
+
 `eligible_siblings` / `eligible_others` default to `None`, preserving the historical
 unconditional behaviour for `update_config()` and existing tests; `scan()` supplies
 them. Pairing runs **after** classification in `scan()` so auxiliary types are known.
+
+### Vision Projector Provenance
+
+A projector pairing is a two-way fact, so both directions are exposed:
+
+- `mmproj_paths[mid]` → the model (via `GET /v1/mmproj`, which lists every projector and
+  its `owner`, counting any projector with no owner in `unpaired`)
+- model → the projector (via `mmproj_resolved` + `mmproj_source` on `GET /v1/models`)
+
+`mmproj_source` is `explicit` or `auto`. It is read **before** the pairing loop writes an
+inferred name back into `cfg.mmproj_file`, because after that write the two are
+indistinguishable forever — which is the bug this fixes: `mmproj_file` alone could not
+tell a deliberate pairing from a guessed one.
 
 Detection is a default, not a guarantee: `OuteTTS` reports `olmo` with no audio tensors
 (filename only), and `Laya` reports `modern-bert` despite being multimodal. Both are
@@ -621,6 +652,27 @@ Return the raw TCP port of a resident `llama-server` (see also interrupt above l
 **Error Responses:**
 - `404 Not Found`: Model ID not recognized.
 - `503 Service Unavailable`: Model known but not loaded.
+
+#### `GET /v1/mmproj`
+
+Every vision projector under `root_dir`, and which model owns it. Added 2026-10-18.
+Projectors are not model cards, so this is the only place they are visible at all —
+without it a projector paired to nothing was undetectable from the UI.
+
+**Response:**
+```json
+{ "count": 2, "unpaired": 1,
+  "projectors": [
+    { "name": "mmproj-F16.gguf", "path": "...", "dir": "...", "size_mb": 1143.0,
+      "owner": "Qwen3.8-27B-UD-Q4_K_XL.gguf", "source": "explicit", "enabled": true },
+    { "name": "mmproj-F32.gguf", "path": "...", "dir": "...", "size_mb": 1584.4,
+      "owner": "", "source": "", "enabled": false }
+  ] }
+```
+
+`owner` is `""` when unpaired; `source` is `explicit` (sidecar) or `auto` (inferred at
+scan); `enabled` is whether the owner will actually pass `--mmproj`. `count` and
+`unpaired` let a caller assert nothing is orphaned without walking the list.
 
 #### `GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS /v1/raw/{model_id}/{path}`
 

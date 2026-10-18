@@ -279,6 +279,75 @@ function typeHintHTML(m) {
   return `<div class="type-hint"><span class="icon">⚠</span><span>${esc(hint)}</span></div>`;
 }
 
+// Vision provenance: the bare "vision" tag used to hide the file that provides the
+// capability, and whether WE inferred that link or the user set it. A wrong pairing was
+// therefore undetectable from the card - which is exactly how one survived an audit.
+function mmprojTagHTML(m) {
+  if (!m.has_mmproj) return '';
+  const file = m.mmproj_resolved || m.mmproj_file || 'unknown';
+  const on = !!m.use_mmproj;
+  const auto = m.mmproj_source === 'auto';
+  const known = m.mmproj_source === 'auto' || m.mmproj_source === 'explicit';
+  const src = !known ? 'unknown source'
+             : auto ? 'inferred at scan — edit to pin it'
+             : 'set in your sidecar';
+  const short = file.length > 26 ? '…' + file.slice(-25) : file;
+  // Single line on purpose: a newline inside a title attribute is not rendered as a break.
+  const tip = `Vision projector: ${file} · Source: ${src} · `
+            + `--mmproj is ${on ? 'ON for this model' : 'OFF (projector found, but the toggle is off)'}`;
+  return `<span class="tag tag-proj${on ? '' : ' off'}" title="${esc(tip)}">`
+       + `vision ← ${esc(short)}${auto ? '<span class="proj-mark">auto</span>' : ''}`
+       + `${on ? '' : '<span class="proj-mark">off</span>'}</span>`;
+}
+
+// ---------- Vision projector inventory ----------
+// Projectors are deliberately not model cards, so GET /v1/mmproj is the only place they
+// appear at all. Without it a projector attached to nothing is simply invisible — which
+// is the exact failure mode the provenance fields were added to expose. Fetched on load
+// and after a rescan, NOT per tick: the set only changes when the tree does.
+let projectorsCache = [];
+
+async function loadProjectors() {
+  const el = $('proj-list');
+  try {
+    const body = await apiJSON('/v1/mmproj');
+    projectorsCache = (body && body.projectors) || [];
+    renderProjectors();
+  } catch (e) {
+    if (el) el.innerHTML = `<div class="empty">Could not load projectors: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderProjectors() {
+  const el = $('proj-list');
+  if (!el) return;
+  const rows = projectorsCache;
+  $('proj-count').textContent = rows.length
+    ? ` (${rows.length}, ${rows.filter(p => !p.owner).length} unpaired)`
+    : '';
+  if (!rows.length) {
+    el.innerHTML = '<div class="empty">No vision projectors found under the models root.</div>';
+    return;
+  }
+  const nameOf = (id) => (modelsCache.find(m => m.id === id) || {}).name || id;
+  el.innerHTML = rows.map(p => {
+    const owner = p.owner
+      ? `<span class="proj-owner" title="${esc(p.owner)}">${esc(nameOf(p.owner))}</span>`
+      : '<span class="proj-owner none">unpaired</span>';
+    const src = p.source === 'auto' ? '<span class="proj-src auto">inferred</span>'
+              : p.source === 'explicit' ? '<span class="proj-src">sidecar</span>' : '';
+    const on = p.owner
+      ? (p.enabled ? '<span class="proj-on">on</span>' : '<span class="proj-off2">off</span>')
+      : '';
+    const dir = p.dir || '';
+    return `<div class="proj-row" title="${esc(dir)}">`
+      + `<span class="proj-file">${esc(p.name)}</span>`
+      + `<span class="proj-size">${esc(fmtBytes(p.size_mb))}</span>`
+      + owner + src + on
+      + `</div>`;
+  }).join('');
+}
+
 function tagsRowHTML(m) {
   // Type badge leads the row — it is the primary classification, ahead of user tags.
   // The engine badge sits next to it: both describe what the card IS rather than
@@ -289,7 +358,7 @@ function tagsRowHTML(m) {
     + (m.default ? '<span class="tag">default</span>' : '')
     + (m.pinned ? '<span class="tag">pinned</span>' : '')
     + (m.auto_save_state ? '<span class="tag">autosave</span>' : '')
-    + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '');
+    + mmprojTagHTML(m);
 }
 
 function updateLoadedBar() {
@@ -847,6 +916,11 @@ async function refreshAll() {
       use_mmproj: d.use_mmproj,
       mmproj_file: d.mmproj_file,
       has_mmproj: d.has_mmproj,
+      // Vision provenance: mmproj_file is only the CONFIGURED name (empty when the link
+      // was inferred); mmproj_resolved is the file that actually reaches --mmproj, and
+      // mmproj_source says whether we inferred it or the user set it.
+      mmproj_resolved: d.mmproj_resolved || '',
+      mmproj_source: d.mmproj_source || '',
       ctx_size: d.ctx_size,
       max_ctx_size: d.max_ctx_size,
       n_gpu_layers: d.n_gpu_layers,
@@ -980,6 +1054,7 @@ $('btn-rescan').onclick = async () => {
     modelsCache = [];
     showToast('Rescanned models directory', 'info');
     await refreshAll();
+    await loadProjectors();
   } catch (e) {
     showToast('Rescan failed: ' + e.message, 'error');
   }
@@ -1124,4 +1199,9 @@ $('settings-save').onclick = saveSettings;
 loadSettings();
 // Engine metadata first, so the very first card paint already has correct engine badges
 // instead of briefly showing raw engine names.
-loadEngines().then(refreshAll).then(wsLoop);
+// Projector names are resolved server-side; the inventory panel links them back to the
+// card they belong to, so a pairing is navigable in both directions.
+$('proj-panel').addEventListener('toggle', (ev) => {
+  if (ev.target.open && !projectorsCache.length) loadProjectors();
+});
+loadEngines().then(refreshAll).then(loadProjectors).then(wsLoop);
