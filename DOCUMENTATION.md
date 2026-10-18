@@ -34,6 +34,35 @@ llama-autoloader is a Just-In-Time (JIT) model loader and OpenAI-compatible prox
 
 ## Configuration
 
+### Running Multiple Instances
+
+The process binds three things; each instance needs its own set:
+
+| What | Default | Control |
+|------|---------|---------|
+| Main client-facing port (raw TCP forwarder) | `launcher.port` (9124) | `--port` |
+| Internal FastAPI / uvicorn | `$AUTOLOADER_INTERNAL_PORT` or 1235 | `--internal-port` |
+| First engine port (one per model) | `launcher.base_port` (9001) | `--base-port` |
+
+`--port` alone is enough to start a second instance: the internal port auto-advances past
+anything already listening and the engine range self-heals by scanning upward.
+
+- `_port_in_use(port, host)` — connect probe (not a bind probe; on Windows
+  `SO_REUSEADDR` does not cleanly separate "free" from "owned by another instance").
+- `_resolve_internal_port(desired, explicit, host, max_tries)` — returns
+  `(port, auto_advanced_from)`. Busy + **explicit** raises `SystemExit` (the user named
+  that port; moving it would hide the collision). Busy + **implicit** advances to the
+  next free port, so a second instance starts cleanly. Exhausting `max_tries` raises.
+- The main port being busy raises `SystemExit` with a readable message. Previously this
+  surfaced as a bare `WinError 10048` from uvicorn *after* the forwarder had already
+  bound, leaving a half-initialized app.
+- Engine-port cross-instance safety comes from `_is_port_available` probing the real
+  socket: `_allocate_port` only knows about its own manager's `loaded` set.
+
+**Not instance-scoped:** `models.save_state_dir`, `engine_cards/` and `temp/`. Notably
+`temp/<engine>/<model>.json` derived configs are written at load and unlinked at unload,
+so one instance unloading a bridge card deletes the config another instance is using.
+
 ### config.yaml Structure
 
 ```yaml
@@ -114,6 +143,40 @@ Each model can have an optional sidecar config file named `model.gguf.json` plac
 | `mmproj_file` | string | `""` | Explicit vision projector filename (auto-detected if empty) |
 | `estimated_vram_mb` | int | `0` | Estimated VRAM usage hint (display only) |
 | `tags` | string[] | `[]` | Tags for filtering in the WebUI |
+| `type_override` | string | `""` | Pin the card to a model type; empty = auto-detect |
+
+> `arch` and `model_type` also exist on `ModelConfig` but are **derived**: they are
+> recomputed from the GGUF header on every scan and are deliberately NOT written to the
+> sidecar (`ModelConfig.DERIVED_FIELDS`). Only `type_override` is persisted, so an
+> auto-detected type can never be mistaken for a deliberate user pin.
+
+### Model Type Classification
+
+`_classify_model_type(path, info, override)` in `server.py` returns one of
+`text`, `vision`, `audio`, `asr`, `embedding`, `draft`, `codec`, `mmproj`.
+First match wins:
+
+1. `override` — the sidecar's `type_override`, if it names a valid type.
+2. Vision projector — `general.type == "mmproj"`, else an `mmproj` filename marker.
+3. Auxiliary component — filename markers for codecs (`vae`, `wavtokenizer`, `codec`,
+   `vocoder`, `tokenizer-`) and drafts (`mtp-`, `draft-`, `speculative`). **Checked
+   before** the architecture table because some codecs share an architecture with their
+   host model (`yue2-vae` and `yue2-3b` are both `audiocpp`).
+4. `general.architecture` via `_ARCH_TO_TYPE`. Any `<arch>-assistant` suffix is a draft.
+5. Filename family (`outetts`, `kokoro`, `tts`, `whisper`, `bge-`, …) for generic arches.
+6. `text` — a plain decoder.
+
+Only the GGUF KV block is read (`_read_gguf_info`); tensor data is never touched.
+The same reader also supplies `general.name`, `*.context_length` and `general.architecture`,
+so `scan()` opens each file exactly once.
+
+`_is_mmproj(path, info)` drives the registry partition. It trusts `general.type` when
+present and falls back to the filename marker, which preserves the original behaviour for
+every file that already worked.
+
+Detection is a default, not a guarantee: `OuteTTS` reports `olmo` with no audio tensors
+(filename only), and `Laya` reports `modern-bert` despite being multimodal. Both are
+correctable via `type_override`.
 
 ### How default_args Combine with Model-Specific Args
 
@@ -171,11 +234,26 @@ List all discovered models with their status.
       "port": null,
       "pid": null,
       "last_used": null,
-      "state_path": null
+      "state_path": null,
+      "model_type": "text",
+      "model_type_override": "",
+      "model_type_label": "Text Generation",
+      "arch": "llama",
+      "auxiliary": false
     }
   ]
 }
 ```
+
+Classification fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model_type` | string | Effective type; drives the WebUI group, badge and hint |
+| `model_type_override` | string | The user's pin (`""` = auto-detected) |
+| `model_type_label` | string | Display name for `model_type` |
+| `arch` | string | Raw `general.architecture`, `""` when absent |
+| `auxiliary` | bool | True for component types (`mmproj`, `codec`, `draft`) |
 
 #### `GET /v1/models/{model_id}`
 
@@ -218,9 +296,14 @@ Update a model's configuration. Accepts partial updates.
 
 **Request Body:** Any subset of ModelConfig fields.
 
+**Type pinning:** `model_type` accepts any value in `VALID_MODEL_TYPES`. An empty string
+clears the pin and returns the card to auto-detection (the effective type is re-derived
+immediately, without waiting for a rescan). An unknown value is rejected with **400**.
+
 **Response Schema:** Updated ModelConfig as dict.
 
 **Error Responses:**
+- `400 Bad Request`: unknown `model_type`, or an invalid `engine_config` on a bridge card.
 - `404 Not Found`: Model ID not recognized.
 
 #### `POST /v1/models/{model_id}/load`
@@ -453,6 +536,17 @@ curl "http://127.0.0.1:9001/slots/0?action=save&filename=test.bin"
 #### `GET /v1/engines`
 
 List configured bridge engines with readiness status and errors.
+
+Response per engine: `name`, `label`, `enabled`, `ready`, `error`, `cards_dir`,
+`has_configs_dir`. `ready=false` means a load attempt would return a 400, and `error`
+carries that exact reason.
+
+The WebUI uses this both to populate the add-engine dropdown and to render the per-card
+engine badge (`⚙ <label>`, dashed, coloured from a hash of the engine name). A
+misconfigured engine gets a red `!` on the badge plus an inline warning naming `error`,
+so the reason is visible on the card instead of surfacing as an opaque 400 on Load. It is
+fetched once at startup and after add/delete — not on the per-tick refresh, since it is
+static config.
 
 #### `POST /v1/models/engine`
 

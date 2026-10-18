@@ -417,6 +417,9 @@ def test_save_engine_card_only_editable_fields(tmp_path):
         "tags": ["strata", "coder"],
         "min_free_vram_mib": 40960,
         "extra_args": ["--foo", "bar"],
+        # User-chosen type pin. Empty = follow auto-detection (which defaults to text for
+        # a bridge card, since no engine config today is anything but a text server).
+        "type_override": "",
         # Self-describing card: the engine name and config path are both recorded so a
         # rescan can re-register a user-added card without configs_dir.
         "engine": "strata",
@@ -589,6 +592,9 @@ async def test_list_models_llama_payload_gains_only_defaulted_fields(tmp_path):
         "resolved_binary", "has_mmproj", "use_mmproj", "mmproj_file", "ctx_size",
         "max_ctx_size", "n_gpu_layers", "estimated_vram_mb", "args", "gguf_name",
         "size_mb", "loaded", "ready", "port", "pid", "last_used", "state_path",
+        # Classification block (model-type grouping/badging). Added as its own group,
+        # after the pre-existing keys, and defaulted like the engine fields above.
+        "model_type", "model_type_override", "model_type_label", "arch", "auxiliary",
     }
     assert payload["engine"] == "llama"
     assert payload["engine_config"] == ""
@@ -598,6 +604,13 @@ async def test_list_models_llama_payload_gains_only_defaulted_fields(tmp_path):
     assert payload["ctx_size"] == 8192
     assert payload["n_gpu_layers"] == 999
     assert payload["has_mmproj"] is False
+    # An unparseable 12-byte stub has no readable GGUF header, so it falls back to text
+    # with no arch and no override — i.e. classification defaults, it never invents a type.
+    assert payload["model_type"] == "text"
+    assert payload["model_type_override"] == ""
+    assert payload["model_type_label"] == "Text Generation"
+    assert payload["arch"] == ""
+    assert payload["auxiliary"] is False
 
 
 # ---------------------------------------------------------------------------

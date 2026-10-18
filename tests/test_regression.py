@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import struct
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,6 +30,9 @@ from server import (
     ModelManager,
     _read_gguf_metadata,
     _read_gguf_name,
+    _classify_model_type,
+    _port_in_use,
+    _resolve_internal_port,
 )
 from tests import gguf_bytes as gb
 
@@ -140,11 +144,14 @@ class TestEnsureGGUFName:
         cfg.max_ctx_size = None
         assert cfg.name == "Alpha"  # scan set display name from metadata
 
-        with patch.object(server, "_read_gguf_metadata", wraps=server._read_gguf_metadata) as spy:
+        with patch.object(server, "_read_gguf_info", wraps=server._read_gguf_info) as spy:
             await mgr._ensure_gguf_name("m.gguf")
 
         assert cfg.gguf_name == "Alpha"
         assert cfg.max_ctx_size == 4096
+        # The lazy path must also fill the classification fields (arch + model_type),
+        # which is why it now reads the full header rather than just name/context.
+        assert cfg.model_type == "text"
         assert spy.call_count >= 1
 
     async def test_defaults_display_name_to_stem_when_unedited(self, tmp_path):
@@ -181,7 +188,7 @@ class TestEnsureGGUFName:
         cfg = mgr.models["m.gguf"]
         assert cfg.gguf_name == "CacheMe" and cfg.max_ctx_size == 4096
 
-        with patch.object(server, "_read_gguf_metadata", wraps=server._read_gguf_metadata) as spy:
+        with patch.object(server, "_read_gguf_info", wraps=server._read_gguf_info) as spy:
             await mgr._ensure_gguf_name("m.gguf")
         assert spy.call_count == 0, "cached config must not trigger a re-read"
 
@@ -192,7 +199,7 @@ class TestEnsureGGUFName:
         cfg.gguf_name = ""
         cfg.max_ctx_size = None
 
-        with patch.object(server, "_read_gguf_metadata", wraps=server._read_gguf_metadata) as spy:
+        with patch.object(server, "_read_gguf_info", wraps=server._read_gguf_info) as spy:
             await asyncio.gather(*[mgr._ensure_gguf_name("m.gguf") for _ in range(20)])
 
         assert cfg.gguf_name == "Conc"
@@ -203,6 +210,261 @@ class TestEnsureGGUFName:
         # 20 tasks, so the reliable ceiling is exactly N=20. (Tighter values like 10 are
         # flaky: with a cold cache all 20 observe it before any result is written back.)
         assert 1 <= spy.call_count <= 20
+
+
+# ===========================================================================
+# Model type classification
+# ===========================================================================
+
+class TestModelTypeClassification:
+    """_classify_model_type decides which WebUI group a card lands in.
+
+    The cases below are lifted from the real library on this box, so a regression here
+    means a real card visibly moves groups.
+    """
+
+    @staticmethod
+    def _cls(filename, arch=None, gguf_type=None, override=""):
+        info = {"arch": arch, "gguf_type": gguf_type}
+        return _classify_model_type(Path(filename), info, override)
+
+    # --- 2. vision projector: metadata first, filename as fallback ---
+    def test_mmproj_from_gguf_type_metadata(self):
+        # A projector whose filename carries no "mmproj" marker at all.
+        assert self._cls("proj-F16.gguf", arch="clip", gguf_type="mmproj") == "mmproj"
+
+    def test_mmproj_from_filename_when_metadata_absent(self):
+        assert self._cls("mmproj-F16.gguf") == "mmproj"
+        assert self._cls("Qwen3.6-35B-A3B-mmproj-BF16.gguf") == "mmproj"
+
+    # --- 3. auxiliary components beat the architecture table ---
+    def test_codec_filename_beats_shared_arch(self):
+        # yue2-vae and yue2-3b both report arch "audiocpp"; only the name separates them.
+        assert self._cls("yue2-vae-f32.gguf", arch="audiocpp") == "codec"
+        assert self._cls("yue2-3b-q8_0.gguf", arch="audiocpp") == "audio"
+
+    def test_codec_arch_when_name_is_generic(self):
+        assert self._cls("WavTokenizer-Large-75-Q4_0.gguf", arch="wavtokenizer-dec") == "codec"
+
+    def test_draft_from_filename_and_assistant_arch(self):
+        assert self._cls("mtp-gemma-4-31B-it.gguf", arch="gemma4-assistant") == "draft"
+        # An engine naming the draft head "<arch>-assistant" needs no filename marker.
+        assert self._cls("spec.gguf", arch="llama-assistant") == "draft"
+
+    # --- 4/5. architecture table, then filename families ---
+    def test_native_vlm_arch_is_vision(self):
+        assert self._cls("Qwen3-VL-4B-Instruct-Q8_0.gguf", arch="qwen3vl") == "vision"
+
+    def test_tts_arch(self):
+        assert self._cls("Kokoro_no_espeak_Q4.gguf", arch="kokoro") == "audio"
+
+    def test_generic_arch_rescued_by_filename(self):
+        # OuteTTS is built on OLMo: arch says "olmo", carries no audio tensors, and the
+        # filename is the only remaining signal.
+        assert self._cls("OuteTTS-0.3-1B-Q4_0.gguf", arch="olmo") == "audio"
+
+    def test_encoder_only_arch_is_embedding(self):
+        assert self._cls("Laya-BF16.gguf", arch="modern-bert") == "embedding"
+
+    def test_asr_arch(self):
+        assert self._cls("whisper-large-v3-turbo-Q5.gguf", arch="whisper") == "asr"
+
+    # --- 6. default ---
+    @pytest.mark.parametrize("name,arch", [
+        ("llama-3.2-1b-instruct-q8_0.gguf", "llama"),
+        ("Qwen3.8-27B-UD-Q4_K_XL.gguf", "qwen35"),
+        ("gemma-4-31B-scotoma-2-Q4_K_S.gguf", "gemma4"),
+        ("Agents-A1-APEX-I-Quality.gguf", "qwen35moe"),
+    ])
+    def test_plain_decoders_are_text(self, name, arch):
+        assert self._cls(name, arch) == "text"
+
+    def test_no_metadata_at_all_is_text(self):
+        assert self._cls("mystery.gguf") == "text"
+
+    def test_none_path_is_safe(self):
+        assert _classify_model_type(None, {}) == "text"
+
+    # --- 1. the sidecar override wins over everything ---
+    def test_override_beats_detection(self):
+        assert self._cls("OuteTTS-0.3-1B-Q4_0.gguf", arch="olmo", override="text") == "text"
+        # Even an mmproj file can be pinned to another type.
+        assert self._cls("mmproj-F16.gguf", gguf_type="mmproj", override="vision") == "vision"
+
+    def test_invalid_override_falls_back_to_detection(self):
+        # A hand-edited sidecar must not be able to produce a type the UI can't render.
+        assert self._cls("m.gguf", arch="qwen3vl", override="bogus") == "vision"
+
+    # --- wiring: the whole pipeline, not just the classifier ---
+    def test_scan_assigns_types_and_arch(self, tmp_path):
+        from tests.conftest import build_cfg
+        mgr = ModelManager(build_cfg(tmp_path))
+        p = mgr.root_dir / "text-model.gguf"
+        gb.write_gguf(p, name="TextModel", max_ctx=8192)
+        q = mgr.root_dir / "mmproj-text-model-f16.gguf"
+        gb.write_gguf(q, name="Proj", max_ctx=None)
+        mgr.scan()
+        cfg = mgr.models["text-model.gguf"]
+        assert cfg.model_type == "text"     # filename, not a projector
+        assert cfg.arch == ""               # dummy GGUF carries no general.architecture
+        # The projector is still filtered out of the registry and paired, as before.
+        assert "mmproj-text-model-f16.gguf" not in mgr.models
+        assert mgr.mmproj_paths.get("text-model.gguf") == q
+
+    def test_sidecar_override_survives_rescan(self, tmp_path):
+        from tests.conftest import build_cfg
+        mgr = ModelManager(build_cfg(tmp_path))
+        p = mgr.root_dir / "m.gguf"
+        gb.write_gguf(p, name="M", max_ctx=1024)
+        mgr.scan()
+        # Simulate a WebUI type pin, which persists the override to the sidecar.
+        mgr.models["m.gguf"].type_override = "audio"
+        mgr.models["m.gguf"].save(p)
+        mgr.scan()                                     # rescan must not clobber it
+        cfg = mgr.models["m.gguf"]
+        assert cfg.type_override == "audio"
+        assert cfg.model_type == "audio"
+
+    def test_auto_detected_type_is_not_persisted_as_an_override(self, tmp_path):
+        """A merely auto-detected type must never masquerade as a user's pinned choice.
+
+        Regression: save() used to persist the effective type, so the first unrelated
+        sidecar edit froze the classification and the UI showed a "pinned" badge forever.
+        """
+        from tests.conftest import build_cfg
+        mgr = ModelManager(build_cfg(tmp_path))
+        p = mgr.root_dir / "m.gguf"
+        gb.write_gguf(p, name="M", max_ctx=1024)
+        mgr.scan()
+        cfg = mgr.models["m.gguf"]
+        assert cfg.model_type == "text" and cfg.type_override == ""
+        cfg.save(p)                                    # e.g. user edited the tags
+        import json as _json
+        sidecar = _json.loads(p.with_suffix(p.suffix + ".json").read_text())
+        assert "model_type" not in sidecar, "derived type must not be written to the sidecar"
+        assert "arch" not in sidecar, "derived arch must not be written to the sidecar"
+        assert sidecar.get("type_override", "") == ""
+
+    async def test_list_models_exposes_classification(self, tmp_path):
+        from tests.conftest import build_cfg
+        mgr = ModelManager(build_cfg(tmp_path))
+        gb.write_gguf(mgr.root_dir / "m.gguf", name="M", max_ctx=1024)
+        mgr.scan()
+        payload = (await mgr.list_models())[0]
+        assert payload["model_type"] == "text"
+        assert payload["model_type_override"] == ""
+        assert payload["model_type_label"] == "Text Generation"
+        assert payload["auxiliary"] is False
+
+
+# ===========================================================================
+# Multi-instance port resolution
+# ===========================================================================
+
+class TestMultiInstancePorts:
+    """Contract for running several autoloaders side by side.
+
+    The app binds three things: the main port (forwarder), an internal FastAPI port, and
+    a base port for spawned engines. ``--port`` used to move only the first, so running a
+    second instance died with a bare ``WinError 10048`` after the forwarder had already
+    bound. These lock the resolution rules that replaced that.
+    """
+
+    @staticmethod
+    def _listener():
+        """A genuinely bound + LISTENING loopback socket.
+
+        Real loopback pair, never ``socket.socketpair()`` - on Windows socketpair ignores
+        settimeout and blocks forever.
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        return s
+
+    def test_port_in_use_false_when_free(self):
+        s = self._listener()
+        port = s.getsockname()[1]
+        s.close()
+        assert _port_in_use(port) is False
+
+    def test_port_in_use_true_when_listening(self):
+        s = self._listener()
+        try:
+            assert _port_in_use(s.getsockname()[1]) is True
+        finally:
+            s.close()
+
+    def test_free_port_is_returned_unchanged(self):
+        s = self._listener()
+        port = s.getsockname()[1]
+        s.close()
+        assert _resolve_internal_port(port, explicit=False) == (port, None)
+
+    def test_implicit_busy_port_auto_advances(self):
+        """The default internal port being taken must not stop a second instance."""
+        s = self._listener()
+        busy = s.getsockname()[1]
+        try:
+            port, advanced_from = _resolve_internal_port(busy, explicit=False)
+            assert advanced_from == busy, "must report what it moved away from (for logging)"
+            assert port > busy
+            assert _port_in_use(port) is False, "must land on a genuinely free port"
+        finally:
+            s.close()
+
+    def test_explicit_busy_port_fails_fast(self):
+        """A port the user NAMED must not be silently moved."""
+        s = self._listener()
+        busy = s.getsockname()[1]
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                _resolve_internal_port(busy, explicit=True)
+            assert "already in use" in str(excinfo.value)
+        finally:
+            s.close()
+
+    def test_exhausted_range_fails_fast(self):
+        s = self._listener()
+        busy = s.getsockname()[1]
+        try:
+            with pytest.raises(SystemExit) as excinfo:
+                _resolve_internal_port(busy, explicit=False, max_tries=0)
+            assert "No free internal port" in str(excinfo.value)
+        finally:
+            s.close()
+
+    def test_base_port_flag_moves_the_engine_range(self, tmp_path):
+        """--base-port must actually relocate engine ports, not just parse."""
+        from tests.conftest import build_cfg
+        mgr = ModelManager(build_cfg(tmp_path, base_port=19001))
+        mgr.base_port = 21500                       # what --base-port does at startup
+        gb.write_gguf(mgr.root_dir / "m.gguf", name="M", max_ctx=1024)
+        mgr.scan()
+        assert mgr._allocate_port("m.gguf") >= 21500
+
+    def test_two_instances_do_not_collide_on_engine_ports(self, tmp_path):
+        """A second instance must not hand out a port the first is really listening on.
+
+        ``_allocate_port`` only knows about ITS OWN manager's loaded set, so cross-instance
+        safety comes from ``_is_port_available`` probing the real socket. Simulate instance A
+        by actually listening on the port it would have picked.
+        """
+        from tests.conftest import build_cfg
+        b = ModelManager(build_cfg(tmp_path, base_port=22000))
+        gb.write_gguf(b.root_dir / "m.gguf", name="M", max_ctx=1024)
+        b.scan()
+        chosen = b._allocate_port("m.gguf")           # first pick, nothing bound yet
+
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupied.bind(("127.0.0.1", chosen))
+        occupied.listen(1)                            # instance A now owns it
+        try:
+            assert _port_in_use(chosen) is True, "sanity: the fake owner is reachable"
+            assert b._allocate_port("m.gguf") != chosen, (
+                "must skip a port another instance is actually listening on")
+        finally:
+            occupied.close()
 
 
 # ===========================================================================

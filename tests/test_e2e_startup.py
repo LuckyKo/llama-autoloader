@@ -133,6 +133,40 @@ class TestStartupHappyPath:
         assert body["default_binary"] == "llama-server"
         assert body["resolved_global_binary"] == "llama-server"
 
+    def test_model_type_override_roundtrip(self, client):
+        """PUT model_type pins the group; "" resets to auto-detection; junk is a 400."""
+        data = client.get("/v1/models").json()["data"]
+        assert data, "expected at least one discovered model"
+        mid = data[0]["id"]
+
+        # /v1/models carries the resolved projection the WebUI renders from; the
+        # single-model endpoint nests the raw config one level down under "config".
+        listed = {m["id"]: m for m in data}[mid]
+        auto_type = listed["model_type"]
+        assert listed["model_type_override"] == ""
+        assert listed["auxiliary"] is False
+
+        # 1. Pin to a different type.
+        target = "audio" if auto_type != "audio" else "text"
+        r = client.put(f"/v1/models/{mid}/config", json={"model_type": target})
+        assert r.status_code == 200, r.text
+        after = {m["id"]: m for m in client.get("/v1/models").json()["data"]}[mid]
+        assert after["model_type"] == target
+        assert after["model_type_override"] == target, "a pinned type must persist"
+
+        # 2. Reset to auto-detection -> effective type reverts, override clears.
+        r = client.put(f"/v1/models/{mid}/config", json={"model_type": ""})
+        assert r.status_code == 200, r.text
+        after = {m["id"]: m for m in client.get("/v1/models").json()["data"]}[mid]
+        assert after["model_type_override"] == ""
+        assert after["model_type"] == auto_type
+
+        # 3. An unknown type is rejected rather than silently stored.
+        r = client.put(f"/v1/models/{mid}/config", json={"model_type": "not-a-type"})
+        assert r.status_code == 400, r.text
+        after = {m["id"]: m for m in client.get("/v1/models").json()["data"]}[mid]
+        assert after["model_type_override"] == ""
+
     def test_settings_defaults(self, client):
         r = client.get("/v1/settings")
         assert r.status_code == 200

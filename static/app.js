@@ -12,6 +12,61 @@ const TOAST_FADE_MS = 300;
 // Track in-flight async actions per model to prevent WS re-renders from blowing away button state
 const inFlightActions = new Map();
 
+// ---------------------------------------------------------------------------
+// Model types
+// ---------------------------------------------------------------------------
+// Mirrors MODEL_TYPE_* in server.py. The server is the source of truth for what a card
+// IS (model_type on /v1/models); this table only supplies the presentation — colour,
+// group description and the advisory hint — and the canonical group order.
+const TYPE_META = {
+  text:      { label: 'Text Generation',    color: '#7c5cff', desc: 'Chat / completion models' },
+  vision:    { label: 'Vision',             color: '#4ade80', desc: 'Multimodal — vision built into the weights' },
+  audio:     { label: 'Audio Generation',   color: '#fbbf24', desc: 'Text to speech and other audio output models' },
+  asr:       { label: 'Speech to Text',     color: '#f59e0b', desc: 'Audio transcription' },
+  embedding: { label: 'Embeddings',         color: '#38bdf8', desc: 'Serve /v1/embeddings, not chat' },
+  draft:     { label: 'Draft / Speculative',color: '#a78bfa', desc: 'Speculative-decoding draft, used via --model-draft' },
+  codec:     { label: 'Audio Codec',        color: '#fb923c', desc: 'Codec / VAE consumed by an audio model' },
+  mmproj:    { label: 'Vision Projector',   color: '#94a3b8', desc: 'Vision projector, attached to a host model via --mmproj' },
+};
+const TYPE_ORDER = ['text','vision','audio','asr','embedding','draft','codec','mmproj'];
+const DEFAULT_TYPE = 'text';
+
+// Component types: loaded by a host model rather than served on their own. These get an
+// explanatory notice on the card. NOT a block - the Load button stays enabled.
+const TYPE_HINTS = {
+  mmproj:    'Vision projector. Attached to a host model with --mmproj — not served on its own.',
+  codec:     'Audio codec / VAE. Consumed by an audio model — not served on its own.',
+  draft:     'Speculative-decoding draft. Referenced with --model-draft, not served on its own.',
+  embedding: 'Encoder-only model. Serves /v1/embeddings, not /v1/chat/completions.',
+};
+
+function typeMeta(t) { return TYPE_META[t] || TYPE_META[DEFAULT_TYPE]; }
+function typeOrderIndex(t) {
+  const i = TYPE_ORDER.indexOf(t);
+  return i === -1 ? TYPE_ORDER.length : i;
+}
+
+// Active type filter. '' means "All" (cards render under group headers).
+let typeFilter = '';
+// engine name -> {name, label, ready, error, color}, from GET /v1/engines. Fetched once
+// at startup and refreshed whenever the engine list can have changed (add/delete card),
+// NOT on every WebSocket tick — it is effectively static config.
+let enginesCache = {};
+// Distinct palette for engine badges. An engine's colour is derived from its name, so
+// Strata always looks the same across reloads and instances.
+const ENGINE_COLORS = ['#f472b6', '#22d3ee', '#fb923c', '#a3e635', '#c084fc', '#facc15'];
+function engineColor(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return ENGINE_COLORS[h % ENGINE_COLORS.length];
+}
+
+// id -> card element, and type -> {section, grid, countEl, descEl}. Module-level so
+// renderModels() can do in-place updates across renders instead of rebuilding the DOM
+// on every 1 Hz WebSocket tick.
+const cardNodes = new Map();
+const groupNodes = new Map();
+
 function esc(str) {
   const div = document.createElement('div');
   div.textContent = str || '';
@@ -183,15 +238,58 @@ function updateButtonRow(card, m) {
   }
 }
 
+function typeBadgeHTML(m) {
+  const t = m.model_type || DEFAULT_TYPE;
+  const meta = typeMeta(t);
+  // A dashed border marks a type the user pinned in the sidecar, so an auto-detected
+  // classification is never mistaken for a deliberate choice.
+  const pinned = !!m.model_type_override;
+  return `<span class="type-badge${pinned ? ' override' : ''}" style="--type-color:${meta.color}"`
+       + ` title="${esc(meta.label)}${pinned ? ' (pinned via sidecar override)' : ' (auto-detected)'}">`
+       + `${esc(meta.label)}${pinned ? '<span class="badge-override-mark">✎</span>' : ''}</span>`;
+}
+
+// Bridge-card provenance: which configured engine serves this card, and whether that
+// engine is actually usable. Dashed (like a pinned type) to read as "structural", and
+// coloured per engine so Strata looks the same everywhere. A misconfigured engine is
+// surfaced here rather than being discovered as an opaque 400 on Load — the WebUI already
+// knows the reason from GET /v1/engines.
+function engineBadgeHTML(m) {
+  const name = m.engine;
+  if (!name || name === 'llama') return '';
+  const info = enginesCache[name];
+  const label = info && info.label ? info.label : name;
+  const broken = info && info.ready === false;
+  const tip = !info
+    ? `${name} (not present in the engine registry — loading will fail with a 400)`
+    : broken ? `${label}: ${info.error}` : `${label} engine`;
+  return `<span class="engine-badge${broken ? ' broken' : ''}" style="--engine-color:${engineColor(name)}"`
+       + ` title="${esc(tip)}">⚙ ${esc(label)}${broken ? '<span class="engine-warn">!</span>' : ''}</span>`;
+}
+
+function typeHintHTML(m) {
+  const t = m.model_type || DEFAULT_TYPE;
+  let hint = TYPE_HINTS[t] || '';
+  // Surfaces a bridge engine's boot-time validation error on the card itself.
+  const info = enginesCache[m.engine];
+  if (info && info.ready === false) {
+    hint = `${info.label} engine is misconfigured: ${info.error}` + (hint ? ' — ' + hint : '');
+  }
+  if (!hint) return '';
+  return `<div class="type-hint"><span class="icon">⚠</span><span>${esc(hint)}</span></div>`;
+}
+
 function tagsRowHTML(m) {
-  const tags = (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('');
-  return tags
+  // Type badge leads the row — it is the primary classification, ahead of user tags.
+  // The engine badge sits next to it: both describe what the card IS rather than
+  // metadata the user attached.
+  return typeBadgeHTML(m)
+    + engineBadgeHTML(m)
+    + (m.tags||[]).map(t => `<span class="tag">${esc(t)}</span>`).join('')
     + (m.default ? '<span class="tag">default</span>' : '')
     + (m.pinned ? '<span class="tag">pinned</span>' : '')
     + (m.auto_save_state ? '<span class="tag">autosave</span>' : '')
-    + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '')
-    // Bridge cards carry an engine badge; llama is the default and gets none.
-    + (m.engine && m.engine !== 'llama' ? `<span class="tag">${esc(m.engine)}</span>` : '');
+    + (m.has_mmproj && m.use_mmproj ? '<span class="tag">vision</span>' : '');
 }
 
 function updateLoadedBar() {
@@ -202,11 +300,141 @@ function updateLoadedBar() {
   if (loaded.length === 0) { bar.textContent = 'No model currently loaded.'; return; }
   bar.textContent = 'Loaded: ' + loaded.map(m => `${m.name || m.id} (port ${m.port || '?'})`).join(' · ');
 }
+function renderTypeChips() {
+  const row = $('type-chips');
+  if (!row) return;
+  // Counts come from the FULL cache, not the filtered list, so a chip never vanishes
+  // just because the text or status filter is currently hiding its models.
+  const counts = new Map();
+  for (const m of modelsCache) {
+    const t = m.model_type || DEFAULT_TYPE;
+    counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  // Known types first in canonical order, then any type the server reports that this
+  // build has no metadata for — a new backend type still gets a usable chip.
+  const present = TYPE_ORDER.filter(t => counts.has(t));
+  for (const t of [...counts.keys()].sort()) {
+    if (TYPE_ORDER.indexOf(t) === -1) present.push(t);
+  }
+
+  const parts = [`<button class="type-chip${typeFilter === '' ? ' active' : ''}" data-type="" style="--type-color:#7c5cff">All<span class="count">${modelsCache.length}</span></button>`];
+  for (const t of present) {
+    const meta = typeMeta(t);
+    parts.push(`<button class="type-chip${typeFilter === t ? ' active' : ''}" data-type="${esc(t)}" style="--type-color:${meta.color}" title="${esc(meta.desc || meta.label)}">`
+      + `<span class="dot"></span>${esc(meta.label)}<span class="count">${counts.get(t)}</span></button>`);
+  }
+  row.innerHTML = parts.join('');
+  row.querySelectorAll('.type-chip').forEach(btn => {
+    btn.onclick = () => {
+      const t = btn.dataset.type;
+      typeFilter = (t === typeFilter) ? '' : t;   // clicking the active chip returns to All
+      renderModels();
+    };
+  });
+}
+
+// Build or update a single card in place; returns the card element.
+//
+// This used to be two branches of a loop (build-new vs in-place-update), which is how
+// the two drifted apart. Now there is ONE path: the card is created with empty
+// placeholders once, and every field is filled on every render. A field can therefore
+// never be added to one path and forgotten in the other.
+function renderCard(m, pm) {
+  // Extra-args display, computed once and shared by both render paths.
+  const parts = [];
+  if (m.engine !== 'llama') {
+    if (m.min_free_vram_mib > 0) parts.push(`--min-free-vram-mib ${m.min_free_vram_mib}`);
+    if (m.extra_args && m.extra_args.length) parts.push(m.extra_args.join(' '));
+  } else {
+    if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
+    if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
+    if (m.args) parts.push(m.args);
+  }
+  const argsDisplay = parts.join(' ');
+
+  // Meta line: bridge cards show the (truncated) engine-config path instead of size_mb.
+  const metaMid = m.engine !== 'llama' && m.engine_config
+    ? (m.engine_config.length > 60 ? '…' + m.engine_config.slice(-59) : m.engine_config)
+    : fmtBytes(m.size_mb);
+  const metaLine = `${esc(m.id)} · ${esc(metaMid)}${m.port ? ' · :' + esc(m.port) : ''}${m.pid ? ' · pid ' + esc(m.pid) : ''}`;
+
+  let card = cardNodes.get(m.id);
+  const isNew = !card;
+  if (isNew) {
+    card = document.createElement('div');
+    card.className = 'model-card';
+    card.dataset.id = m.id;
+    card.innerHTML = `
+      <div class="model-head">
+        <div>
+          <div class="model-name"></div>
+          <div class="model-meta"></div>
+          <div class="tags-row" style="margin-top:6px;"></div>
+        </div>
+        <div class="status-wrap"></div>
+      </div>
+      <div class="model-hint-slot"></div>
+      <div class="args-box"></div>
+      <div class="model-stats">
+        <div data-stat="vram">VRAM: <b></b></div>
+        <div data-stat="ram">RAM:  <b></b></div>
+        <div data-stat="ctx">ctx / max: <b></b></div>
+        <div data-stat="uptime">uptime: <b></b></div>
+      </div>
+      <div class="btn-row"></div>`;
+    cardNodes.set(m.id, card);
+    // Seed the button row so updateButtonRow's structure comparison matches on the
+    // first pass (an empty row would compare as "no vision / no states / not loaded"
+    // and skip the rebuild, leaving the card with no buttons at all).
+    card.querySelector('.btn-row').innerHTML = buildButtonRowHTML(m);
+  }
+
+  const nameEl = card.querySelector('.model-name');
+  if (nameEl) nameEl.textContent = m.name || m.id;
+  const metaEl = card.querySelector('.model-meta');
+  if (metaEl) metaEl.innerHTML = metaLine;
+  const tagsRow = card.querySelector('.tags-row');
+  if (tagsRow) tagsRow.innerHTML = tagsRowHTML(m);
+  const statusWrap = card.querySelector('.status-wrap');
+  if (statusWrap) statusWrap.innerHTML = statusBadge(m.loaded, m.ready);
+  const hintSlot = card.querySelector('.model-hint-slot');
+  if (hintSlot) hintSlot.innerHTML = typeHintHTML(m);
+  const argsBox = card.querySelector('.args-box');
+  if (argsBox) argsBox.textContent = argsDisplay || '(no extra args)';
+
+  const statsDiv = card.querySelector('.model-stats');
+  if (statsDiv) {
+    const vramEl = statsDiv.querySelector('[data-stat="vram"]');
+    if (vramEl) vramEl.innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
+    const ramEl = statsDiv.querySelector('[data-stat="ram"]');
+    if (ramEl) ramEl.innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
+    // Only llama reports ctx; the row is meaningless for a bridge engine, and once
+    // removed ctxEl is null on later renders — so the removal is idempotent.
+    const ctxEl = statsDiv.querySelector('[data-stat="ctx"]');
+    if (m.engine !== 'llama') { if (ctxEl) ctxEl.remove(); }
+    else if (ctxEl) ctxEl.innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
+    const uptimeEl = statsDiv.querySelector('[data-stat="uptime"]');
+    if (uptimeEl) uptimeEl.innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
+  }
+
+  updateButtonRow(card, m);
+
+  // Attach/update button click listeners (idempotent)
+  card.querySelectorAll('button[data-act]').forEach(btn => {
+    btn.onclick = () => handleAction(m.id, btn.dataset.act, btn);
+  });
+  return card;
+}
+
 function renderModels() {
   updateLoadedBar();
-  const filter = $('filter').value.toLowerCase();
-  const statusFilter = $('status-filter').value;
-  const grid = $('models-grid');
+  renderTypeChips();
+  const container = $('models-container');
+  const emptySlot = $('models-grid');   // holds the "nothing matches" message
+  if (!container || !emptySlot) return;
+
+  const filter = ($('filter') ? $('filter').value : '').toLowerCase();
+  const statusFilter = $('status-filter') ? $('status-filter').value : 'all';
   let list = modelsCache;
 
   if (filter) {
@@ -223,130 +451,73 @@ function renderModels() {
     list = list.filter(m => !m.loaded);
   }
 
-  if (list.length === 0) {
-    const hasFilter = filter || statusFilter !== 'all';
-    grid.innerHTML = `<div class="empty">${hasFilter ? 'No models match your filter.' : 'No models found.'}</div>`;
-    return;
+  if (typeFilter) {
+    list = list.filter(m => (m.model_type || DEFAULT_TYPE) === typeFilter);
   }
 
-  const perModel = (statusCache && statusCache.per_model) || {};
+  // Retire cards that are no longer visible before deciding the empty state.
   const idsNeeded = new Set(list.map(m => m.id));
-
-  // Collect existing card nodes by data-id
-  const existingCards = new Map();
-  grid.querySelectorAll('.model-card').forEach(c => existingCards.set(c.dataset.id, c));
-
-  // Remove cards no longer present in filtered list
-  existingCards.forEach((card, id) => {
-    if (!idsNeeded.has(id)) card.remove();
+  cardNodes.forEach((node, id) => {
+    if (!idsNeeded.has(id)) { node.remove(); cardNodes.delete(id); }
   });
 
-  list.forEach(m => {
-    const pm = perModel[m.id] || {};
-    let card = existingCards.get(m.id);
+  if (list.length === 0) {
+    groupNodes.forEach(g => g.section.remove());
+    groupNodes.clear();
+    const hasFilter = filter || statusFilter !== 'all' || typeFilter;
+    emptySlot.innerHTML = `<div class="empty">${hasFilter ? 'No models match your filter.' : 'No models found.'}</div>`;
+    return;
+  }
+  emptySlot.innerHTML = '';
 
-    // Extra-args display, computed once and shared by both render paths.
-    // Bridge engines get min-free-vram + free-form extra_args; llama gets its flags.
-    const parts = [];
-    if (m.engine !== 'llama') {
-      if (m.min_free_vram_mib > 0) parts.push(`--min-free-vram-mib ${m.min_free_vram_mib}`);
-      if (m.extra_args && m.extra_args.length) parts.push(m.extra_args.join(' '));
-    } else {
-      if (m.ctx_size != null) parts.push(`--ctx-size ${m.ctx_size}`);
-      if (m.n_gpu_layers != null) parts.push(`--n-gpu-layers ${m.n_gpu_layers}`);
-      if (m.args) parts.push(m.args);
-    }
-    const argsDisplay = parts.join(' ');
+  // Group by type; canonical order first so sections never jump around between renders.
+  const byType = new Map();
+  for (const m of list) {
+    const t = m.model_type || DEFAULT_TYPE;
+    if (!byType.has(t)) byType.set(t, []);
+    byType.get(t).push(m);
+  }
+  const types = [...byType.keys()].sort((a, b) =>
+    typeOrderIndex(a) - typeOrderIndex(b) || a.localeCompare(b));
 
-    // Meta line: bridge cards show the (truncated) engine-config path instead of size_mb.
-    const metaMid = m.engine !== 'llama' && m.engine_config
-      ? (m.engine_config.length > 60 ? '…' + m.engine_config.slice(-59) : m.engine_config)
-      : fmtBytes(m.size_mb);
-
-    if (!card) {
-      // Build brand new card element
-      const name = esc(m.name || m.id);
-      const id = esc(m.id);
-
-      card = document.createElement('div');
-      card.className = 'model-card';
-      card.dataset.id = m.id;
-      card.innerHTML = `
-        <div class="model-head">
-          <div>
-            <div class="model-name">${name}</div>
-            <div class="model-meta">${id} · ${esc(metaMid)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}</div>
-            <div class="tags-row" style="margin-top:6px;">${tagsRowHTML(m)}</div>
-          </div>
-          <div class="status-wrap">${statusBadge(m.loaded, m.ready)}</div>
-        </div>
-
-        <div class="args-box">${esc(argsDisplay) || '(no extra args)'}</div>
-
-        <div class="model-stats">
-          <div data-stat="vram">VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b></div>
-          <div data-stat="ram">RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b></div>
-          <div data-stat="ctx">ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b></div>
-          <div data-stat="uptime">uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b></div>
-        </div>
-
-        <div class="btn-row">${buildButtonRowHTML(m)}</div>`;
-
-      // Only llama reports ctx; the row is meaningless for a bridge engine.
-      if (m.engine !== 'llama') card.querySelector('[data-stat="ctx"]').remove();
-      grid.appendChild(card);
-    } else {
-      // In-place DOM update without tearing down node
-      const nameEl = card.querySelector('.model-name');
-      if (nameEl) {
-        nameEl.textContent = m.name || m.id;
-      }
-
-      const metaEl = card.querySelector('.model-meta');
-      if (metaEl) {
-        metaEl.innerHTML = `${esc(m.id)} · ${esc(metaMid)}${m.port ? ' · :'+esc(m.port) : ''}${m.pid ? ' · pid '+esc(m.pid) : ''}`;
-      }
-
-      const tagsRow = card.querySelector('.tags-row');
-      if (tagsRow) {
-        tagsRow.innerHTML = tagsRowHTML(m);
-      }
-
-      const argsBox = card.querySelector('.args-box');
-      if (argsBox) {
-        argsBox.textContent = argsDisplay || '(no extra args)';
-      }
-
-      const statusWrap = card.querySelector('.status-wrap');
-      if (statusWrap) {
-        statusWrap.innerHTML = statusBadge(m.loaded, m.ready);
-      }
-
-      const statsDiv = card.querySelector('.model-stats');
-      if (statsDiv) {
-        const vramEl = statsDiv.querySelector('[data-stat="vram"]');
-        const ramEl = statsDiv.querySelector('[data-stat="ram"]');
-        const ctxEl = statsDiv.querySelector('[data-stat="ctx"]');
-        const uptimeEl = statsDiv.querySelector('[data-stat="uptime"]');
-        if (vramEl) vramEl.innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
-        if (ramEl) ramEl.innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
-        if (ctxEl) ctxEl.innerHTML = `ctx / max: <b>${m.ctx_size != null ? m.ctx_size : '—'}${m.max_ctx_size ? ' / ' + m.max_ctx_size.toLocaleString() : ''}</b>`;
-        if (uptimeEl) uptimeEl.innerHTML = `uptime: <b>${m.loaded && statusCache ? formatUptime(m.id) : '—'}</b>`;
-        // Bridge engines have no ctx. ctxEl is null once removed → guarded (repeat renders).
-        if (m.engine !== 'llama' && ctxEl) ctxEl.remove();
-      }
-
-      // Update button row in-place to avoid flickering from innerHTML rebuild
-      updateButtonRow(card, m);
-    }
-
-    // Attach/update button click listeners (idempotent)
-    card.querySelectorAll('button[data-act]').forEach(btn => {
-      btn.onclick = () => handleAction(m.id, btn.dataset.act, btn);
-    });
+  // Retire group sections for types with nothing left to show.
+  groupNodes.forEach((g, t) => {
+    if (!byType.has(t)) { g.section.remove(); groupNodes.delete(t); }
   });
+
+  const perModel = (statusCache && statusCache.per_model) || {};
+
+  for (const t of types) {
+    let g = groupNodes.get(t);
+    if (!g) {
+      const section = document.createElement('section');
+      section.className = 'model-group';
+      section.dataset.type = t;
+      section.innerHTML = `<div class="group-head"><span class="dot"></span>`
+        + `<span class="group-title"></span><span class="group-count"></span>`
+        + `<span class="group-desc"></span></div><div class="group-grid"></div>`;
+      section.querySelector('.group-title').textContent = typeMeta(t).label;
+      g = {
+        section,
+        grid: section.querySelector('.group-grid'),
+        countEl: section.querySelector('.group-count'),
+        descEl: section.querySelector('.group-desc'),
+      };
+      groupNodes.set(t, g);
+    }
+    const meta = typeMeta(t);
+    g.section.style.setProperty('--type-color', meta.color);
+    g.descEl.textContent = meta.desc || '';
+    g.countEl.textContent = `${byType.get(t).length}`;
+
+    for (const m of byType.get(t)) {
+      // appendChild MOVES an existing node, so this inserts new cards and re-orders the
+      // existing ones without rebuilding anything (important: the WS pushes ~1 Hz).
+      g.grid.appendChild(renderCard(m, perModel[m.id] || {}));
+    }
+    container.appendChild(g.section);
+  }
 }
-
 function formatUptime(id) {
   if (!statusCache || !Array.isArray(statusCache.uptime_models)) return '—';
   const m = statusCache.uptime_models.find(x => x.id === id);
@@ -374,6 +545,7 @@ async function handleAction(id, act, btn) {
       if (!confirm(`Delete engine card ${id}?`)) return;
       await apiJSON(`/v1/models/${encodeURIComponent(id)}`, {method:'DELETE'});
       showToast(`Engine card ${id} deleted`, 'info');
+      await loadEngines();   // a deleted card may have been an engine's last user
     }
     if (act === 'edit') {
       openEditModal(id);
@@ -444,6 +616,22 @@ $('global-backend-select').onchange = async (ev) => {
   }
 };
 
+// Explain the current classification under the model-type select: what was detected, from
+// what, and what picking a value will do. An empty note leaves the row collapsed.
+function updateModelTypeNote(m) {
+  const note = $('f-model-type-note');
+  if (!note) return;
+  const detected = m.model_type || DEFAULT_TYPE;
+  const dLabel = TYPE_META[detected] ? TYPE_META[detected].label : detected;
+  if (m.model_type_override) {
+    note.textContent = `Pinned to ${TYPE_META[m.model_type_override] ? TYPE_META[m.model_type_override].label : m.model_type_override}`
+      + ` (auto-detection said ${dLabel}). Choose "Auto-detect" to go back.`;
+  } else {
+    const src = m.arch ? `from architecture "${m.arch}"` : 'from the filename';
+    note.textContent = `Auto-detected: ${dLabel} ${src}. Pick a value to override.`;
+  }
+}
+
 function openEditModal(id) {
   const m = modelsCache.find(x => x.id === id);
   if (!m) return;
@@ -468,6 +656,15 @@ function openEditModal(id) {
   $('f-ngl').value = m.n_gpu_layers !== undefined && m.n_gpu_layers !== null ? m.n_gpu_layers : '';
   $('f-vram').value = m.estimated_vram_mb || 0;
   $('f-tags').value = (m.tags||[]).join(', ');
+  // Model type: "Auto-detect" (empty value) plus every known type. The option list is
+  // rebuilt from the same TYPE_ORDER the chips use so the two can never disagree.
+  const typeSel = $('f-model-type');
+  if (typeSel) {
+    typeSel.innerHTML = '<option value="">Auto-detect</option>'
+      + TYPE_ORDER.map(t => `<option value="${esc(t)}">${esc(TYPE_META[t] ? TYPE_META[t].label : t)}</option>`).join('');
+    typeSel.value = m.model_type_override || '';
+    updateModelTypeNote(m);
+  }
   $('f-mmproj-file').value = m.mmproj_file || '';
   $('f-default').checked = !!m.default;
   $('f-pinned').checked = !!m.pinned;
@@ -506,6 +703,10 @@ $('modal-save').onclick = async () => {
     auto_save_state: $('f-autosave').checked,
     use_mmproj: $('f-use-mmproj').checked,
   };
+  // "" means "reset to auto-detection", which the backend re-derives immediately so the
+  // card lands back in its detected group on the very next render.
+  const mtSel = $('f-model-type');
+  if (mtSel) body.model_type = mtSel.value || '';
 
   const currentModel = modelsCache.find(x => x.id === editingId);
   const isBridge = !!(currentModel && currentModel.engine && currentModel.engine !== 'llama');
@@ -652,6 +853,14 @@ async function refreshAll() {
       estimated_vram_mb: d.estimated_vram_mb,
       args: d.args,
       gguf_name: d.gguf_name,
+      // Classification (backend-sourced). model_type drives grouping/badge/filter chips,
+      // model_type_override is the raw sidecar value (empty = auto-detected), arch is the
+      // raw general.architecture shown in the edit modal.
+      model_type: d.model_type || 'text',
+      model_type_override: d.model_type_override || '',
+      model_type_label: d.model_type_label || '',
+      arch: d.arch || '',
+      auxiliary: !!d.auxiliary,
       // Bridge-card fields (defaulted for llama cards).
       engine: d.engine || 'llama',
       engine_config: d.engine_config || '',
@@ -676,16 +885,32 @@ async function refreshAll() {
 // The engine dropdown is fed by GET /v1/engines, so a second engine needs no UI change.
 // Engines that failed boot validation are listed but disabled, with the reason inline —
 // hiding them would make a config typo look like "no engines configured".
+// Engine registry metadata for the card badges. Deliberately NOT part of refreshAll():
+// it is static config, and refreshAll runs on every WebSocket tick.
+// Returns the engine list, or null when the fetch itself failed (callers must tell that
+// apart from "no engines configured" — the two need different messages).
+async function loadEngines() {
+  try {
+    const engines = await apiJSON('/v1/engines');
+    const next = {};
+    (engines || []).forEach(en => { next[en.name] = en; });
+    enginesCache = next;
+    return engines || [];
+  } catch (e) {
+    // Keep the previous cache: a transient failure should not blank the badges on every
+    // card. The badge falls back to the raw engine name meanwhile.
+    return null;
+  }
+}
+
 async function loadEngineOptions() {
   const sel = $('ea-engine');
   $('ea-error-row').style.display = 'none';  // cleared up front; set below if needed
-  let engines = [];
-  try {
-    engines = await apiJSON('/v1/engines');
-  } catch (e) {
+  const engines = await loadEngines();
+  if (engines === null) {
     sel.innerHTML = '<option value="">(could not load engines)</option>';
     $('ea-error-row').style.display = 'block';
-    $('ea-error').textContent = 'Could not load engines: ' + e.message;
+    $('ea-error').textContent = 'Could not load engines — is the server still running?';
     return;
   }
   if (!engines.length) {
@@ -736,6 +961,9 @@ $('ea-add').onclick = async () => {
     });
     $('engine-add-overlay').classList.remove('active');
     showToast(`Added ${engine} card ${res.id}`, 'success');
+    // Re-read engine metadata too: a newly added card may be the first user of an engine
+    // that was missing from the registry (badge would otherwise warn until next reload).
+    await loadEngines();
     await refreshAll();
   } catch (e) {
     // 400 (unknown/misconfigured engine, invalid config) / 409 (id collision) surface
@@ -894,4 +1122,6 @@ $('settings-save').onclick = saveSettings;
 
 // Load settings on startup
 loadSettings();
-refreshAll().then(wsLoop);
+// Engine metadata first, so the very first card paint already has correct engine badges
+// instead of briefly showing raw engine names.
+loadEngines().then(refreshAll).then(wsLoop);

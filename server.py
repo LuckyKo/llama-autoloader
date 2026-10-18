@@ -36,7 +36,7 @@ from fastapi import (
 )
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import uvicorn
 
 # Console-log-to-file logging (see logger.py). init_logging() is called in the
@@ -117,47 +117,74 @@ def _safe_float(val: str, default: float = 0.0) -> float:
         return default
 
 
-def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
-    """Read (general.name, context_length) from GGUF file metadata using fast binary stream parsing.
+# Fixed-width GGUF value types -> byte width. Used to skip large numeric arrays with a
+# single seek instead of one seek per element (a 150k-entry float array is one seek, not
+# 150k). String arrays (type 8) are variable-width and still walked element by element,
+# but skipped without decoding.
+_GGUF_FIXED_WIDTH = {0: 1, 1: 1, 7: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 10: 8, 11: 8, 12: 8}
 
-    Bypasses np.memmap and tensor allocations, executing in < 1ms per file.
+
+def _read_gguf_info(gguf_path) -> Dict[str, Any]:
+    """Read the GGUF header keys we care about, using fast binary stream parsing.
+
+    Returns a dict with:
+      name      -- ``general.name``                (display only; NOT a retrieval alias)
+      max_ctx   -- the first ``*.context_length``  (max context the arch supports)
+      arch      -- ``general.architecture``        (e.g. "llama", "qwen35", "clip", "whisper")
+      gguf_type -- ``general.type``                (e.g. "model", "mmproj")
+
+    Bypasses np.memmap and tensor allocations. Only the KV block is walked; values are
+    skipped by seek and the tensor-info/tensor-data blocks are never touched, so this
+    stays in the sub-millisecond-per-file range even for a 150k-token vocabulary.
+
+    Every failure mode (missing file, bad magic, corrupt header, unknown value type)
+    returns an all-None dict rather than raising - callers treat "no metadata" and
+    "unreadable metadata" identically.
     """
-    name = None
-    max_ctx = None
+    empty = {"name": None, "max_ctx": None, "arch": None, "gguf_type": None}
+    name: Optional[str] = None
+    max_ctx: Optional[int] = None
+    arch: Optional[str] = None
+    gguf_type: Optional[str] = None
     try:
         with open(gguf_path, 'rb') as f:
             magic = f.read(4)
             if magic != b'GGUF':
-                return None, None
+                return empty
             ver, tensors, kvs = struct.unpack('<IQQ', f.read(20))
             if kvs > 1_000_000:
-                return None, None
+                return empty
 
             def read_str():
                 l = struct.unpack('<Q', f.read(8))[0]
                 return f.read(l).decode('utf-8', errors='replace')
 
             def skip_val(vtype):
-                if vtype in (0, 1, 7): f.seek(1, 1)
-                elif vtype in (2, 3): f.seek(2, 1)
-                elif vtype in (4, 5, 6): f.seek(4, 1)
-                elif vtype in (10, 11, 12): f.seek(8, 1)
+                if vtype in _GGUF_FIXED_WIDTH:
+                    f.seek(_GGUF_FIXED_WIDTH[vtype], 1)
                 elif vtype == 8:
                     l = struct.unpack('<Q', f.read(8))[0]
                     f.seek(l, 1)
                 elif vtype == 9:
                     itype, ilen = struct.unpack('<IQ', f.read(12))
-                    for _ in range(ilen):
-                        skip_val(itype)
+                    if itype in _GGUF_FIXED_WIDTH:
+                        f.seek(ilen * _GGUF_FIXED_WIDTH[itype], 1)   # one seek, not ilen
+                    else:
+                        for _ in range(ilen):
+                            skip_val(itype)
                 else:
                     # Unknown/corrupt value type — can't safely skip; abort parse.
                     raise ValueError(f"Unknown GGUF value type {vtype}")
 
-            for _ in range(kvs):
+            for examined in range(kvs):
                 key = read_str()
                 vtype = struct.unpack('<I', f.read(4))[0]
                 if key == 'general.name' and vtype == 8:
                     name = read_str()
+                elif key == 'general.architecture' and vtype == 8:
+                    arch = read_str()
+                elif key == 'general.type' and vtype == 8:
+                    gguf_type = read_str()
                 elif key.endswith('.context_length'):
                     if vtype == 4: max_ctx = struct.unpack('<I', f.read(4))[0]
                     elif vtype == 10: max_ctx = struct.unpack('<Q', f.read(8))[0]
@@ -166,16 +193,204 @@ def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
                     else: skip_val(vtype)
                 else:
                     skip_val(vtype)
-                if name and max_ctx:
+                # Stop as soon as we have everything the callers use. ``gguf_type`` is
+                # best-effort: plenty of files omit ``general.type`` entirely, so after a
+                # bounded number of keys we stop looking rather than walking a 150k-entry
+                # tokenizer array. mmproj detection has a filename fallback, so a missing
+                # ``general.type`` never costs us a correct classification.
+                if name and max_ctx and arch is not None and (gguf_type is not None or examined >= 128):
                     break
     except Exception as e:
         log.debug(f"Fast GGUF header read failed for {gguf_path}: {e}")
-    return name, max_ctx
+        return empty
+    return {"name": name, "max_ctx": max_ctx, "arch": arch, "gguf_type": gguf_type}
+
+
+def _read_gguf_metadata(gguf_path) -> Tuple[Optional[str], Optional[int]]:
+    """Read (general.name, context_length) from GGUF file metadata.
+
+    Thin wrapper over :func:`_read_gguf_info` kept for its existing callers/tests, which
+    only need the name/context pair.
+    """
+    info = _read_gguf_info(gguf_path)
+    return info["name"], info["max_ctx"]
 
 def _read_gguf_name(gguf_path) -> Optional[str]:
     """Read general.name from GGUF file metadata. Returns None on failure."""
     name, _ = _read_gguf_metadata(gguf_path)
     return name
+
+
+# --------------------------------------------------------------------------
+# Model type taxonomy
+# --------------------------------------------------------------------------
+# Every card gets exactly one *model type*. It drives three separate things:
+#   1. the WebUI grouping / filter chips,
+#   2. the type badge on each card,
+#   3. the "not directly servable" hint shown on auxiliary types.
+#
+# It is deliberately NOT the same concept as the existing `vision` tag: that tag means
+# "this text model has a paired mmproj", which is orthogonal to what the weights are.
+# A Qwen3.8 text LLM with an mmproj stays in the Text Generation group and keeps its
+# `vision` tag; a Qwen3-VL model is natively vision and gets the Vision group.
+#
+# Types that are components or sidecars rather than standalone servers:
+#   mmproj - vision projector, attached to a host model via --mmproj
+#   codec  - audio codec / VAE / tokenizer, consumed by a TTS host model
+#   draft  - speculative-decoding draft (MTP / draft model), used via --model-draft
+# `embedding` is standalone-servable but only through /v1/embeddings, not chat.
+MODEL_TYPE_TEXT = "text"
+MODEL_TYPE_VISION = "vision"
+MODEL_TYPE_AUDIO = "audio"
+MODEL_TYPE_ASR = "asr"
+MODEL_TYPE_EMBEDDING = "embedding"
+MODEL_TYPE_DRAFT = "draft"
+MODEL_TYPE_CODEC = "codec"
+MODEL_TYPE_MMPROJ = "mmproj"
+
+# Canonical display order for the WebUI groups (first match wins; sorted, not frequency).
+MODEL_TYPE_ORDER = [
+    MODEL_TYPE_TEXT,
+    MODEL_TYPE_VISION,
+    MODEL_TYPE_AUDIO,
+    MODEL_TYPE_ASR,
+    MODEL_TYPE_EMBEDDING,
+    MODEL_TYPE_DRAFT,
+    MODEL_TYPE_CODEC,
+    MODEL_TYPE_MMPROJ,
+]
+VALID_MODEL_TYPES = set(MODEL_TYPE_ORDER)
+
+# Human-readable labels, shared with the WebUI via /v1/models so both sides agree.
+MODEL_TYPE_LABELS = {
+    MODEL_TYPE_TEXT: "Text Generation",
+    MODEL_TYPE_VISION: "Vision",
+    MODEL_TYPE_AUDIO: "Audio Generation",
+    MODEL_TYPE_ASR: "Speech to Text",
+    MODEL_TYPE_EMBEDDING: "Embeddings",
+    MODEL_TYPE_DRAFT: "Draft / Speculative",
+    MODEL_TYPE_CODEC: "Audio Codec",
+    MODEL_TYPE_MMPROJ: "Vision Projector",
+}
+
+# Component types: they are loaded by a host model, never served on their own. The WebUI
+# shows an explanatory hint on these instead of blocking the Load button.
+MODEL_TYPE_AUXILIARY = {MODEL_TYPE_MMPROJ, MODEL_TYPE_CODEC, MODEL_TYPE_DRAFT}
+
+# general.architecture -> model type. Only architectures whose family unambiguously
+# implies a modality are listed; a plain decoder (llama/qwen2/qwen3/qwen35/gemma4/...)
+# is deliberately absent and falls through to the default TEXT.
+_ARCH_TO_TYPE = {
+    # Vision projectors (llama.cpp loads these as --mmproj).
+    "clip": MODEL_TYPE_MMPROJ,
+    "vit": MODEL_TYPE_MMPROJ,
+    "siglip": MODEL_TYPE_MMPROJ,
+    "mamba-clip": MODEL_TYPE_MMPROJ,
+    # Speech-to-text.
+    "whisper": MODEL_TYPE_ASR,
+    "w2v2": MODEL_TYPE_ASR,
+    "mmspeech": MODEL_TYPE_ASR,
+    "moonshine": MODEL_TYPE_ASR,
+    # Audio generation / codecs.
+    "kokoro": MODEL_TYPE_AUDIO,
+    "parler_tts": MODEL_TYPE_AUDIO,
+    "outetts": MODEL_TYPE_AUDIO,
+    "vits": MODEL_TYPE_AUDIO,
+    # NOTE: audiocpp covers BOTH the Yue TTS LLM and its VAE half, so the filename codec
+    # markers above (which run first) are what tell `yue2-vae-f32` from `yue2-3b-q8_0`.
+    # Both report arch `audiocpp`; only the name separates them.
+    "audiocpp": MODEL_TYPE_AUDIO,
+    "snac": MODEL_TYPE_CODEC,
+    "encodec": MODEL_TYPE_CODEC,
+    "mimi": MODEL_TYPE_CODEC,
+    "dac": MODEL_TYPE_CODEC,
+    "wavtokenizer-dec": MODEL_TYPE_CODEC,
+    "wavtokenizer-enc": MODEL_TYPE_CODEC,
+    # Native multimodal LLMs (vision baked into the weights, no mmproj needed).
+    "qwen2vl": MODEL_TYPE_VISION,
+    "qwen3vl": MODEL_TYPE_VISION,
+    "qwen-omni": MODEL_TYPE_VISION,
+    "minicpmv": MODEL_TYPE_VISION,
+    "internvl": MODEL_TYPE_VISION,
+    "llava": MODEL_TYPE_VISION,
+    "mllama": MODEL_TYPE_VISION,
+    "pixtral": MODEL_TYPE_VISION,
+    "moondream": MODEL_TYPE_VISION,
+    "smolvlm": MODEL_TYPE_VISION,
+    # Encoder-only backbones: serve embeddings, not chat.
+    "bert": MODEL_TYPE_EMBEDDING,
+    "nomic-bert": MODEL_TYPE_EMBEDDING,
+    "jina-bert-v2": MODEL_TYPE_EMBEDDING,
+    "modern-bert": MODEL_TYPE_EMBEDDING,
+    "roberta": MODEL_TYPE_EMBEDDING,
+    "xlm-roberta": MODEL_TYPE_EMBEDDING,
+    "gte": MODEL_TYPE_EMBEDDING,
+}
+
+# Filename markers for auxiliary components. Checked BEFORE the architecture table on
+# purpose: several codecs ship under a shared architecture with their host model
+# (yue2-vae and yue2-3b are both `audiocpp`), so only the filename separates them.
+_FILENAME_CODEC_MARKERS = ("vae", "wavtokenizer", "vocoder", "codec", "tokenizer-")
+_FILENAME_DRAFT_MARKERS = ("mtp-", "-mtp", "draft-", "-draft", "speculative")
+# Filename families that disambiguate an otherwise generic architecture.
+_FILENAME_AUDIO_MARKERS = ("outetts", "kokoro", "tts")
+_FILENAME_ASR_MARKERS = ("whisper", "w2v2", "moonshine")
+_FILENAME_EMBEDDING_MARKERS = ("bge-", "-bge", "gte-", "e5-", "minilm", "nomic-embed", "embed-")
+
+
+def _classify_model_type(gguf_path: Optional[Path], info: Dict[str, Any],
+                         override: str = "") -> str:
+    """Return the model type for a GGUF file.
+
+    ``override`` (the sidecar's ``type_override``) always wins when it names a valid type —
+    that is the escape hatch for weights whose metadata lies or is silent (OuteTTS
+    reports ``olmo`` and carries no audio tensors; Laya reports ``modern-bert``).
+
+    Precedence:
+      1. explicit sidecar override
+      2. vision projector  (general.type == "mmproj", else the filename marker)
+      3. auxiliary codec / draft   (filename markers - see _FILENAME_CODEC_MARKERS)
+      4. general.architecture      (the _ARCH_TO_TYPE table)
+      5. filename family           (a generic arch like "olmo" with "outetts" in its name)
+      6. text                      (a plain decoder - the overwhelmingly common case)
+
+    Never raises: a missing file or empty info yields ``text``.
+    """
+    if override and override in VALID_MODEL_TYPES:
+        return override
+
+    name = (gguf_path.name if gguf_path is not None else "").lower()
+    stem = (gguf_path.stem if gguf_path is not None else "").lower()
+    arch = ((info or {}).get("arch") or "").strip().lower()
+    gguf_type = ((info or {}).get("gguf_type") or "").strip().lower()
+
+    # 2. Vision projector. general.type is authoritative when present; the filename marker
+    #    catches older conversions that omit the key (and is what the original scan used).
+    if gguf_type == "mmproj" or "mmproj" in name:
+        return MODEL_TYPE_MMPROJ
+
+    # 3. Auxiliary components, before the arch table (shared-arch codecs live here).
+    if any(m in name for m in _FILENAME_CODEC_MARKERS):
+        return MODEL_TYPE_CODEC
+    if any(m in stem for m in _FILENAME_DRAFT_MARKERS):
+        return MODEL_TYPE_DRAFT
+
+    # 4. Architecture. Some engines name the draft head "<arch>-assistant".
+    if arch.endswith("-assistant"):
+        return MODEL_TYPE_DRAFT
+    if arch in _ARCH_TO_TYPE:
+        return _ARCH_TO_TYPE[arch]
+
+    # 5. Filename families, for generic architectures.
+    if any(m in stem for m in _FILENAME_AUDIO_MARKERS):
+        return MODEL_TYPE_AUDIO
+    if any(m in stem for m in _FILENAME_ASR_MARKERS):
+        return MODEL_TYPE_ASR
+    if any(m in stem for m in _FILENAME_EMBEDDING_MARKERS):
+        return MODEL_TYPE_EMBEDDING
+
+    # 6. Default: a plain text decoder.
+    return MODEL_TYPE_TEXT
 
 # --------------------------------------------------------------------------
 # Data models
@@ -198,6 +413,16 @@ class ModelConfig:
     estimated_vram_mb: int = 0      # hint; 0 = unknown
     tags: List[str] = field(default_factory=list)
     gguf_name: str = ""             # embedded name from GGUF metadata
+    # ---- DERIVED classification (computed, never persisted) ----
+    arch: str = ""                 # general.architecture from GGUF metadata (e.g. "qwen35")
+    model_type: str = ""           # EFFECTIVE type the UI groups on (see _classify_model_type)
+    # ---- USER choice (persisted) ----
+    # Empty = follow auto-detection. Set it to pin a card to a type when detection guesses
+    # wrong (OuteTTS reports arch "olmo"; Laya reports "modern-bert"). This is deliberately a
+    # SEPARATE field from ``model_type``: conflating them meant a card whose type was merely
+    # auto-detected got persisted on the next save and then reported back as a pinned
+    # override, permanently freezing the classification.
+    type_override: str = ""
     # --- Bridge-card fields (defaulted; llama cards ignore them) ---
     engine: str = "llama"           # "llama" (default) or a key of the config's engines: section
     engine_config: str = ""         # absolute path to the engine config JSON (bridge cards only)
@@ -230,6 +455,9 @@ class ModelConfig:
             estimated_vram_mb=0,
             tags=[],
             gguf_name="",
+            arch="",
+            model_type="",
+            type_override="",
             engine="llama",
             engine_config="",
             min_free_vram_mib=0,
@@ -252,9 +480,15 @@ class ModelConfig:
                 log.warning(f"Failed to read sidecar {sidecar}: {e}")
         return cls.default_for(gguf_path)
 
+    # Fields recomputed on every scan from the file itself. Writing them into the sidecar
+    # would freeze a stale classification and, worse, turn an auto-detected value into what
+    # ``type_override`` claims is a deliberate user choice.
+    DERIVED_FIELDS = frozenset({"arch", "model_type"})
+
     def save(self, gguf_path: Path) -> None:
         sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
-        sidecar.write_text(json.dumps(asdict(self), indent=2))
+        data = {k: v for k, v in asdict(self).items() if k not in self.DERIVED_FIELDS}
+        sidecar.write_text(json.dumps(data, indent=2))
 
     def save_engine_card(self, card_path: Path) -> None:
         """Write the editable card-overlay fields to a bridge card file.
@@ -272,6 +506,7 @@ class ModelConfig:
             "tags": self.tags,
             "min_free_vram_mib": self.min_free_vram_mib,
             "extra_args": self.extra_args,
+            "type_override": self.type_override,
             "engine": self.engine or "llama",
             # Self-describing: lets each card file record its engine config path.
             "engine_config": self.engine_config,
@@ -430,6 +665,15 @@ class ModelManager:
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
         self._status_cache: Optional[Dict[str, Any]] = None
         self._status_cache_time: float = 0.0
+        # Generation counter guarding the status cache against a stale commit.
+        # _build_status() snapshots self.loaded and then awaits slow nvidia-smi
+        # subprocesses on worker threads (100-500ms). A load/unload can land in that
+        # window and invalidate the cache, after which the in-flight builder would write
+        # its pre-mutation snapshot back with a FRESH timestamp — so the next /v1/status
+        # serves stale data until the following poll (a just-unloaded model still shows
+        # as loaded). Builders stamp the generation they read and only commit if it is
+        # unchanged; every mutation bumps it via _invalidate_status().
+        self._status_gen: int = 0
 
         # Reference to the MAIN running event loop, captured at startup so worker threads
         # (e.g. the raw TCP forwarder) can schedule async-only lookups onto it via
@@ -721,6 +965,11 @@ class ModelManager:
         base.engine_config = str(cfg_path)
         base.auto_save_state = False                       # slot save/restore is llama-only
         base.name = data.get("model_name") or base.name or cfg_path.stem
+        # A bridge card has no GGUF to classify, so default it to text generation: every
+        # engine configured today (llama, Strata) serves text tokens. The card overlay
+        # applied above may already carry an override.
+        if not base.model_type:
+            base.model_type = base.type_override or MODEL_TYPE_TEXT
         return base
 
     def _scan_bridge_cards(self) -> None:
@@ -800,13 +1049,55 @@ class ModelManager:
             return mid
         return None
 
+    def _is_mmproj(self, path: Path, info: Dict[str, Any]) -> bool:
+        """True when a .gguf is a vision projector rather than a servable model.
+
+        ``general.type == "mmproj"`` is authoritative when the converter wrote it; the
+        filename marker is the fallback for files that omit the key (and preserves the
+        original scan behaviour exactly for every file that already worked).
+        """
+        return (info.get("gguf_type") or "").strip().lower() == "mmproj" or "mmproj" in path.name.lower()
+
+    def _apply_gguf_info(self, cfg: "ModelConfig", path: Path, mid: str,
+                         info: Dict[str, Any]) -> None:
+        """Fill display + classification fields on ``cfg`` from parsed GGUF metadata.
+
+        Single source of truth shared by :meth:`scan` and :meth:`_ensure_gguf_name` so the
+        two can never drift on how a model is named, sized or typed. Mutates ``cfg``.
+
+        ``type_override`` is the user's explicit choice (or empty); ``model_type`` is
+        always the effective type, so it is recomputed here rather than trusted from the
+        sidecar. This is what lets "Auto-detect" in the WebUI take effect immediately.
+        """
+        cfg.model_type = _classify_model_type(path, info, cfg.type_override)
+        cfg.arch = (info.get("arch") or "").strip()
+        name = info.get("name")
+        max_ctx = info.get("max_ctx")
+        if name and not cfg.gguf_name:
+            cfg.gguf_name = name
+            if not cfg.name or cfg.name == path.stem:
+                # Promote the GGUF internal name to display name, but keep it
+                # unique (it is the retrieval key). Two quants of the same base
+                # model share the same gguf_name, so disambiguate on collision.
+                cfg.name = self._unique_display_name(name, mid, path.stem)
+        if max_ctx and cfg.max_ctx_size is None:
+            cfg.max_ctx_size = max_ctx
+
     def scan(self) -> List[str]:
-        """Re-scan root_dir for .gguf files, filtering out mmproj files and pairing them as vision modules."""
+        """Re-scan root_dir for .gguf files, partitioning out vision projectors and pairing them.
+
+        Each file's header is read exactly once here: the same parse feeds the mmproj
+        partition, the display name, the max-context figure and the model type.
+        """
         all_ggufs = sorted(self.root_dir.rglob("*.gguf"))
         model_paths = []
         mmproj_paths = []
+        # path -> parsed header, so the metadata pass below never re-opens the file.
+        gguf_info: Dict[Path, Dict[str, Any]] = {}
         for p in all_ggufs:
-            if "mmproj" in p.name.lower():
+            info = _read_gguf_info(p)
+            gguf_info[p] = info
+            if self._is_mmproj(p, info):
                 mmproj_paths.append(p)
             else:
                 model_paths.append(p)
@@ -838,33 +1129,26 @@ class ModelManager:
         for cfg in self.models.values():
             if cfg.n_gpu_layers is None:
                 cfg.n_gpu_layers = self.default_n_gpu_layers
-        # Cache model file sizes and read GGUF metadata (name, context_length)
+        # Cache model file sizes and apply GGUF metadata (name, context, arch, type)
         for mid in self.gguf_paths:
             path = self.gguf_paths[mid]
             try:
                 self._model_sizes[mid] = path.stat().st_size / 1024 / 1024
             except Exception:
                 self._model_sizes[mid] = 0.0
-            # Read GGUF metadata at scan time so it's available immediately for list_models
-            try:
-                name, max_ctx = _read_gguf_metadata(path)
-                cfg = self.models[mid]
-                if name and not cfg.gguf_name:
-                    cfg.gguf_name = name
-                    if not cfg.name or cfg.name == path.stem:
-                        # Promote the GGUF internal name to display name, but keep it
-                        # unique (it is the retrieval key). Two quants of the same base
-                        # model share the same gguf_name, so disambiguate on collision.
-                        cfg.name = self._unique_display_name(name, mid, path.stem)
-                if max_ctx:
-                    cfg.max_ctx_size = max_ctx
-            except Exception as e:
-                log.debug(f"Failed to read GGUF metadata for {mid}: {e}")
+            # Reuse the header already parsed during the partition above.
+            self._apply_gguf_info(self.models[mid], path, mid, gguf_info.get(path) or {})
         # Additive bridge-card pass (inert with no engines: section). Runs AFTER the
-        # gguf metadata loop; bridge ids never enter self.gguf_paths, so _read_gguf_metadata
-        # is never called on a JSON file (R5).
+        # gguf metadata loop; bridge ids never enter self.gguf_paths, so _read_gguf_info
+        # is never called on a JSON file (R5). Bridge cards have no GGUF of their own, so
+        # they carry a fixed type: every engine configured today serves text tokens.
         self._scan_bridge_cards()
-        log.info(f"Scan complete: {len(self.models)} models found (filtered {len(mmproj_paths)} mmproj vision modules)")
+        counts: Dict[str, int] = {}
+        for cfg in self.models.values():
+            counts[cfg.model_type or MODEL_TYPE_TEXT] = counts.get(cfg.model_type or MODEL_TYPE_TEXT, 0) + 1
+        log.info(f"Scan complete: {len(self.models)} models found "
+                 f"(filtered {len(mmproj_paths)} mmproj vision modules); "
+                 f"types: {counts}")
         return list(self.models.keys())
 
     async def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
@@ -935,6 +1219,16 @@ class ModelManager:
                 "min_free_vram_mib": cfg.min_free_vram_mib,
                 "extra_args": cfg.extra_args,
                 "resolved_binary": resolved_bin,
+                # Classification. ``model_type`` is the effective type the UI groups and
+                # badges on; ``model_type_override`` is the raw sidecar value, so the UI can
+                # show "auto-detected" vs "pinned by you" and offer a reset. ``arch`` is the
+                # raw general.architecture, useful context for an auto-detected type.
+                "model_type": cfg.model_type or MODEL_TYPE_TEXT,
+                "model_type_override": cfg.type_override,
+                "arch": cfg.arch,
+                "auxiliary": (cfg.model_type or MODEL_TYPE_TEXT) in MODEL_TYPE_AUXILIARY,
+                "model_type_label": MODEL_TYPE_LABELS.get(
+                    cfg.model_type or MODEL_TYPE_TEXT, "Text Generation"),
                 "has_mmproj": has_mmproj,
                 "use_mmproj": cfg.use_mmproj,
                 "mmproj_file": cfg.mmproj_file,
@@ -963,32 +1257,33 @@ class ModelManager:
             return self.models.get(mid)
 
     async def _ensure_gguf_name(self, mid: str):
-        """Read gguf_name and max_ctx_size from GGUF file lazily, caching the result in config."""
+        """Read gguf_name, max_ctx_size, arch and model_type from GGUF metadata lazily.
+
+        Caches the result on the config. Delegates to :meth:`_apply_gguf_info` so the lazy
+        path and the scan path can never disagree about a model's name, context or type.
+        """
         # Fast path: check cache without holding the lock across I/O.
+        # ``model_type`` is the completion marker because classification ALWAYS assigns a
+        # non-empty value (defaulting to "text"), whereas ``arch`` legitimately stays "" for
+        # files that carry no general.architecture — gating on it would re-read forever.
         async with self._lock:
             cfg = self.models.get(mid)
             path = self.gguf_paths.get(mid)
-            if not cfg or not path or (cfg.gguf_name and cfg.max_ctx_size is not None):
+            if not cfg or not path or (cfg.gguf_name and cfg.max_ctx_size is not None
+                                      and cfg.model_type):
                 return  # Already cached
 
         # Perform the (now-fast) blocking read outside the lock so we don't
         # serialize other lock users during file I/O.
-        name, max_ctx = await asyncio.to_thread(_read_gguf_metadata, path)
-        if not name and not max_ctx:
+        info = await asyncio.to_thread(_read_gguf_info, path)
+        if not any(info.values()):
             return
 
         async with self._lock:
             cfg = self.models.get(mid)
             if not cfg:
                 return
-            if name and not cfg.gguf_name:
-                cfg.gguf_name = name
-                if not cfg.name or cfg.name == path.stem:
-                    # Keep the promoted display name unique (retrieval key). Same
-                    # rationale as the scan path above.
-                    cfg.name = self._unique_display_name(name, mid, path.stem)
-            if max_ctx and cfg.max_ctx_size is None:
-                cfg.max_ctx_size = max_ctx
+            self._apply_gguf_info(cfg, path, mid, info)
 
     async def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
         mid = await self.resolve_model_id(model_id_or_alias)
@@ -1019,6 +1314,7 @@ class ModelManager:
             # card-overlay fields (plus engine/engine_config) to the engine's cards_dir.
             save_path = self._cards_dir_for(cfg.engine) / f"{self._sanitize_model_id(mid)}.json"
             save_path.parent.mkdir(parents=True, exist_ok=True)
+            new_cfg.model_type = new_cfg.type_override or MODEL_TYPE_TEXT
             await asyncio.to_thread(new_cfg.save_engine_card, save_path)
         else:
             # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
@@ -1027,6 +1323,10 @@ class ModelManager:
             paired = self._pair_mmproj(path, new_cfg, mmprojs)
             if paired is not None and not new_cfg.mmproj_file:
                 new_cfg.mmproj_file = paired.name
+            # Re-derive the effective type so a just-changed override (or a reset back to
+            # "Auto-detect") lands on the card without waiting for the next rescan.
+            info = await asyncio.to_thread(_read_gguf_info, path)
+            new_cfg.model_type = _classify_model_type(path, info, new_cfg.type_override)
             await asyncio.to_thread(new_cfg.save, path)
 
         async with self._lock:
@@ -1250,7 +1550,7 @@ class ModelManager:
                 )
                 self.loaded[model_id] = lm
                 self._start_log_thread(model_id, proc)
-                self._status_cache = None  # Force status cache rebuild after load
+                self._invalidate_status()  # Force status cache rebuild after load
 
             # Wait until ready OUTSIDE the lock! Bridge first loads can be slow (multi-GPU),
             # so the timeout comes from the engine entry; llama keeps the original 120s.
@@ -1322,7 +1622,7 @@ class ModelManager:
         lm = self.loaded.pop(model_id, None)
         if lm is None:
             return
-        self._status_cache = None  # Force status cache rebuild on next request
+        self._invalidate_status()  # Force status cache rebuild on next request
         log.info(f"Unloading {model_id} (port {lm.port})")
 
         # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
@@ -1700,14 +2000,30 @@ class ModelManager:
             ],
         }
 
+    # ---------------- status cache ----------------
+    def _invalidate_status(self) -> None:
+        """Drop the cached status and bump the generation.
+
+        Call under ``self._lock`` whenever ``self.loaded`` changes. The bump is what
+        stops an in-flight :meth:`_build_status` from committing a pre-mutation snapshot
+        back into the cache after we have just cleared it.
+        """
+        self._status_gen += 1
+        self._status_cache = None
+
     async def _status_cache_updater(self) -> None:
         """Background task that refreshes status cache at poll_interval intervals."""
         while not self._stop:
             try:
+                async with self._lock:
+                    gen = self._status_gen
                 status = await self._build_status()
                 async with self._lock:
-                    self._status_cache_time = time.time()
-                    self._status_cache = status
+                    # Discard the result if anything mutated the loaded set while we were
+                    # building — otherwise we'd resurrect the invalidated snapshot.
+                    if gen == self._status_gen:
+                        self._status_cache_time = time.time()
+                        self._status_cache = status
             except Exception as e:
                 log.warning(f"status_cache_updater error: {e}")
             await asyncio.sleep(self._poll_interval)
@@ -1720,11 +2036,16 @@ class ModelManager:
             else:
                 needs_refresh = False
             cached = self._status_cache.copy() if self._status_cache else {}
+            gen = self._status_gen
         if needs_refresh:
             status = await self._build_status()
             async with self._lock:
-                self._status_cache_time = time.time()
-                self._status_cache = status
+                if gen == self._status_gen:
+                    self._status_cache_time = time.time()
+                    self._status_cache = status
+            # A concurrent mutation means this snapshot is already outdated; return what we
+            # built for this caller (it answered from a consistent point in time) but leave
+            # the cache invalidated so the next reader rebuilds.
             return status
         return cached
 
@@ -1945,6 +2266,11 @@ app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")
 
 # ---------- models payloads ----------
 class ModelConfigUpdate(BaseModel):
+    # `model_type` collides with pydantic's protected `model_` namespace. The field name is
+    # load-bearing (it is the sidecar key and the WebUI field id), so opt out explicitly
+    # instead of renaming it.
+    model_config = ConfigDict(protected_namespaces=())
+
     name: Optional[str] = None
     description: Optional[str] = None
     args: Optional[str] = None
@@ -1960,6 +2286,10 @@ class ModelConfigUpdate(BaseModel):
     estimated_vram_mb: Optional[int] = None
     tags: Optional[List[str]] = None
     gguf_name: Optional[str] = None
+    # Model type override. Accepts any of VALID_MODEL_TYPES; an empty string RESETS the
+    # card back to auto-detection (rather than storing an invalid type). An unknown value
+    # is rejected with a 400 instead of being silently dropped.
+    model_type: Optional[str] = None
     # Bridge-card fields (llama cards ignore them). The engine NAME is intentionally
     # ABSENT: a card must not be able to re-engine itself (see _make_engine_config).
     engine_config: Optional[str] = None
@@ -2177,6 +2507,13 @@ async def list_models():
             "estimated_vram_mb": m["estimated_vram_mb"],
             "args": m["args"],
             "gguf_name": m["gguf_name"],
+            # Classification (see _classify_model_type). Required by the WebUI field
+            # whitelist, which drives the type chips, the group headers and the card badge.
+            "model_type": m["model_type"],
+            "model_type_override": m["model_type_override"],
+            "model_type_label": m["model_type_label"],
+            "arch": m["arch"],
+            "auxiliary": m["auxiliary"],
             # Bridge-card fields (defaulted for llama cards). Pass-through only —
             # required by the WebUI field whitelist (F1); the llama payload shape is unchanged.
             "engine": m["engine"],
@@ -2265,12 +2602,25 @@ async def interrupt_model(model_id: str, hard: bool = False):
 
         return {"status": "interrupted", "model_id": mid, "mode": "soft",
                 "cancelled_requests": cancelled}
+
+@app.put("/v1/models/{model_id}/config")
 async def update_model_config(model_id: str, body: ModelConfigUpdate):
     mid = await manager.resolve_model_id(model_id)
     if not mid:
         raise HTTPException(404, "Unknown model")
     cfg = await manager.get_config(mid)
     for k, v in body.model_dump(exclude_none=True).items():
+        if k == "model_type":
+            # Maps the API/WebUI field onto the PERSISTED override, not onto the derived
+            # effective type. "" is the explicit "reset to auto-detection" value and must
+            # survive; anything else must name a real type.
+            v = (v or "").strip().lower()
+            if v and v not in VALID_MODEL_TYPES:
+                raise HTTPException(
+                    400, f"Unknown model_type '{v}'. Valid: {', '.join(sorted(VALID_MODEL_TYPES))}. "
+                         f"Use an empty string to reset to auto-detection.")
+            cfg.type_override = v
+            continue   # never setattr(cfg, "model_type", ...) — that field is derived
         if k == "engine_config" and cfg.is_bridge:
             # Pointing a bridge card at a new engine config must be validated exactly the
             # way the add path does it, or the card is broken until the next rescan.
@@ -2516,8 +2866,56 @@ async def ws(websocket: WebSocket):
 # to this FastAPI app, which now runs on an INTERNAL port. See tcp_forwarder.py.
 from tcp_forwarder import RawTCPForwarder  # noqa: E402
 
-INTERNAL_API_PORT = int(os.environ.get("AUTOLOADER_INTERNAL_PORT", "1235"))
+# The app binds THREE things: the main client-facing port (forwarder), an internal
+# FastAPI/uvicorn port, and a base port for spawned engines. All three must be distinct
+# per instance, which is what lets several autoloaders run side by side.
+_DEFAULT_INTERNAL_PORT = 1235
+INTERNAL_API_PORT = int(os.environ.get("AUTOLOADER_INTERNAL_PORT", _DEFAULT_INTERNAL_PORT))
 _forwarder: Optional[RawTCPForwarder] = None
+
+
+def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
+    """True when something is ACCEPTING connections on ``host:port``.
+
+    A connect probe rather than a bind probe: on Windows ``SO_REUSEADDR`` does not
+    cleanly distinguish "free" from "another instance owns it", whereas a refused
+    connection is unambiguous.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.settimeout(0.5)
+            return s.connect_ex((host, port)) == 0
+        except OSError:
+            return False
+
+
+def _resolve_internal_port(desired: int, explicit: bool, host: str = "127.0.0.1",
+                           max_tries: int = 64) -> Tuple[int, Optional[int]]:
+    """Return ``(port, auto_advanced_from)`` for the internal FastAPI port.
+
+    uvicorn binds the internal port AFTER the forwarder has already claimed the main
+    port, so a collision used to surface as a bare ``WinError 10048`` and take the whole
+    process down with a half-initialized forwarder behind it.
+
+    - Explicitly requested (``--internal-port``) and busy -> fail fast with a readable
+      message. The user named that exact port; silently moving it would only hide the
+      collision they are trying to diagnose.
+    - Implicit (env var / default) and busy -> advance to the next free port. Another
+      instance is almost certainly what is holding it, and starting alongside it is the
+      whole point.
+    """
+    if not _port_in_use(desired, host):
+        return desired, None
+    if explicit:
+        raise SystemExit(
+            f"[start] --internal-port {desired} is already in use on {host}. "
+            f"Choose a different one, or omit --internal-port to auto-select.")
+    for port in range(desired + 1, desired + 1 + max_tries):
+        if not _port_in_use(port, host):
+            return port, desired
+    raise SystemExit(
+        f"[start] No free internal port in {desired + 1}..{desired + max_tries} "
+        f"on {host}. Pass --internal-port explicitly.")
 
 
 @app.on_event("startup")
@@ -2590,9 +2988,24 @@ def install_tcp_nodelay() -> None:
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default=CFG["launcher"]["host"])
-    ap.add_argument("--port", type=int, default=CFG["launcher"]["port"])
+    ap = argparse.ArgumentParser(
+        description="llama-autoloader - JIT model loader and OpenAI-compatible proxy. "
+                    "Run several instances side by side by giving each one a distinct "
+                    "--port / --internal-port / --base-port.")
+    ap.add_argument("--host", default=CFG["launcher"]["host"],
+                    help="bind address (default: config launcher.host)")
+    ap.add_argument("--port", type=int, default=CFG["launcher"]["port"],
+                    help="main client-facing port, owned by the raw TCP forwarder "
+                         "(default: config launcher.port)")
+    ap.add_argument("--internal-port", type=int, default=None,
+                    help=f"port for the internal FastAPI/uvicorn app, which the forwarder "
+                         f"falls back to for management + /ws traffic "
+                         f"(default: $AUTOLOADER_INTERNAL_PORT, else {_DEFAULT_INTERNAL_PORT}). "
+                         f"If that default is already taken it auto-advances to the next free "
+                         f"port so a second instance can start.")
+    ap.add_argument("--base-port", type=int, default=None,
+                    help="first port allocated to spawned engines "
+                         "(default: config launcher.base_port)")
     args = ap.parse_args()
     manager.host = args.host
     manager.port = args.port
@@ -2631,8 +3044,51 @@ if __name__ == "__main__":
     # Round 10: test whether h11's write cadence avoids the relay-path buffering (httptools is default).
     _http_backend = os.environ.get("AUTOLOADER_HTTP", "auto").lower()  # auto|httptools|h11
 
+    # ------------------------------------------------------------------
+    # Multi-instance port resolution
+    # ------------------------------------------------------------------
+    # The forwarder owns the MAIN port; uvicorn owns the INTERNAL port; spawned engines
+    # take base_port+. All three must be clear of any other running instance. This runs
+    # AFTER init_logging() so the diagnostics below land in logs/console.log too.
+    if args.base_port is not None:
+        manager.base_port = args.base_port
+
+    _wanted_internal = (args.internal_port if args.internal_port is not None
+                        else int(os.environ.get("AUTOLOADER_INTERNAL_PORT", _DEFAULT_INTERNAL_PORT)))
+    INTERNAL_API_PORT, _auto_advanced_from = _resolve_internal_port(
+        _wanted_internal, explicit=args.internal_port is not None, host=args.host)
+
+    # Fail fast and legibly on the one collision we must NOT paper over: if the main port
+    # is taken, this instance has nothing to offer. Raw bind errors here are cryptic.
+    if _port_in_use(manager.port, args.host):
+        raise SystemExit(
+            f"[start] Main port {manager.port} is already in use on {args.host}. "
+            f"Another autoloader instance is probably running - pass --port <free port> "
+            f"(and --internal-port / --base-port so this instance stays independent).")
+    if _auto_advanced_from is not None:
+        log.warning(
+            f"Internal port {_auto_advanced_from} is already in use on {args.host} "
+            f"(another instance?) - using {INTERNAL_API_PORT} instead. "
+            f"Pin it for reproducible restarts with --internal-port {INTERNAL_API_PORT}.")
+    if _port_in_use(manager.base_port, args.host):
+        log.warning(
+            f"Engine base port {manager.base_port} is already in use. Per-model ports "
+            f"self-heal by scanning upward, but pass --base-port <n> to keep this "
+            f"instance's engines in a predictable range.")
+
+    log.info("=" * 72)
+    log.info("llama-autoloader instance")
+    log.info(f"  WebUI + OpenAI API : http://{args.host}:{manager.port}   (raw TCP forwarder)")
+    log.info(f"  Internal FastAPI    : {INTERNAL_API_PORT}   (forwarder falls back here)")
+    log.info(f"  Engine port range   : {manager.base_port}+   (one port per model)")
+    log.info(f"  Models root         : {manager.root_dir}")
+    log.info(f"  Shared on disk      : states={manager.save_state_dir}  cards={manager.cards_dir}  temp={manager.temp_dir}")
+    log.info("  NOTE: states/, engine_cards/ and temp/ are NOT instance-scoped, so two")
+    log.info("        instances share them (incl. temp/<engine>/<model>.json derived")
+    log.info("        configs, which one instance deletes when it unloads a bridge card).")
+    log.info("=" * 72)
+
     # The MAIN client-facing port (args.port) is owned by the RawTCPForwarder (started in
-    # _startup). uvicorn/FastAPI now runs on an INTERNAL port for management + non-streaming
+    # _startup). uvicorn/FastAPI runs on an INTERNAL port for management + non-streaming
     # requests only. This removes the ASGI layer from the streaming data path entirely.
-    log.info(f"Main client port {args.port} -> raw TCP forwarder; FastAPI -> internal port {INTERNAL_API_PORT}")
     uvicorn.run(app, host=args.host, port=INTERNAL_API_PORT, reload=False, use_colors=False, http=_http_backend)

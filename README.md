@@ -11,6 +11,7 @@ A **JIT (Just-In-Time) model loader** and **OpenAI-compatible proxy** for [llama
 - **Session State Persistence** — Auto-save and restore KV cache state across model switches
 - **LRU Auto-Eviction** — Automatically unloads least-recently-used models to stay within GPU memory limits
 - **Live WebUI Dashboard** — Real-time GPU/RAM monitoring, model management, and one-click controls
+- **Automatic Model-Type Classification** — Cards are grouped and badged by type (text, vision, audio, speech-to-text, embeddings, draft, codec, vision projector), auto-detected from GGUF metadata with a per-model override
 - **Per-Model Configuration** — Sidecar `.gguf.json` files for custom launch args, context size, GPU layers, etc.
 
 ---
@@ -68,6 +69,56 @@ Open **http://127.0.0.1:9123** in your browser for the WebUI dashboard.
 
 ---
 
+## Running Multiple Instances
+
+The autoloader binds **three** things, and each instance needs its own set:
+
+| What | Port | Controlled by |
+|------|------|---------------|
+| WebUI + OpenAI API (raw TCP forwarder) | 9124 | `--port` |
+| Internal FastAPI / uvicorn | 1235 | `--internal-port` |
+| First port for spawned engines | 9001+ | `--base-port` |
+
+```bash
+# Instance 1
+python server.py --port 1234 --internal-port 1235 --base-port 9001
+
+# Instance 2, fully independent
+python server.py --port 9126 --internal-port 1245 --base-port 9101
+```
+
+**Only `--port` is required.** The other two fall back to `$AUTOLOADER_INTERNAL_PORT`,
+then `1235`, and `launcher.base_port` from `config.yaml`.
+
+- **Internal port** — if the default is already taken, the instance **auto-advances** to
+  the next free port and logs a warning telling you which one it took (pin it with
+  `--internal-port` for reproducible restarts). If you pass `--internal-port`
+  explicitly and it is busy, startup fails immediately with a readable message rather
+  than silently moving it.
+- **Engine base port** — per-model ports self-heal by scanning upward past anything
+  already listening, so a shared `base_port` still works, just less predictably. Pass
+  `--base-port` to keep each instance's engines in a predictable range.
+- **Main port** — if it is busy, startup fails fast with a readable message.
+
+Every startup prints a banner listing the resolved ports, so you can always see what an
+instance actually bound:
+
+```
+llama-autoloader instance
+  WebUI + OpenAI API : http://127.0.0.1:9126   (raw TCP forwarder)
+  Internal FastAPI    : 1236   (forwarder falls back here)
+  Engine port range   : 9001+   (one port per model)
+```
+
+> **Shared on-disk state is *not* instance-scoped.** `models.save_state_dir`
+> (`states/`), `engine_cards/` and `temp/` are shared by every instance. In particular
+> `temp/<engine>/<model>.json` derived configs are written on load and **deleted on
+> unload**, so if two instances have the same bridge card loaded, the first one to unload
+> removes the config the other is still using. Give concurrent instances separate
+> `save_state_dir` / `temp` directories if that matters to you.
+
+---
+
 ## Directory Structure
 
 ```
@@ -110,7 +161,8 @@ Each model can have an optional sidecar JSON file (`<model>.gguf.json`) placed n
   "use_mmproj": true,
   "mmproj_file": "mmproj-MyModel-F16.gguf",
   "estimated_vram_mb": 5000,
-  "tags": ["chat", "7B"]
+  "tags": ["chat", "7B"],
+  "type_override": ""
 }
 ```
 
@@ -129,6 +181,85 @@ Each model can have an optional sidecar JSON file (`<model>.gguf.json`) placed n
 | `mmproj_file`      | string   | `""`    | Explicit vision projector filename (auto-detected if empty)                 |
 | `estimated_vram_mb`| int      | `0`     | Estimated VRAM usage hint (for display only)                                |
 | `tags`             | string[] | `[]`    | Tags for filtering in the WebUI                                             |
+| `type_override`    | string   | `""`    | Pin the card to a model type; empty = auto-detect (see below)                |
+
+---
+
+## Model Type Classification
+
+Every card gets exactly one **model type**. It drives the WebUI grouping, the filter
+chips, the card badge, and an advisory hint on component files.
+
+| Type                | Meaning                                              | Servable alone? |
+|---------------------|------------------------------------------------------|-----------------|
+| `text`              | Chat / completion model (the default)                | yes |
+| `vision`            | Multimodal — vision built into the weights (`qwen3vl`, `llava`, …) | yes |
+| `audio`             | Text-to-speech / audio output (`kokoro`, `audiocpp`)  | yes |
+| `asr`               | Speech-to-text (`whisper`)                           | yes |
+| `embedding`         | Encoder-only; serves `/v1/embeddings`                | embeddings only |
+| `draft`             | Speculative-decoding draft / MTP                     | no — component |
+| `codec`             | Audio codec / VAE / tokenizer                        | no — component |
+| `mmproj`            | Vision projector (`--mmproj`)                        | no — component |
+
+### How the type is detected
+
+Resolution order (first match wins):
+
+1. **`type_override`** — the sidecar field / Edit-modal selector. Always wins.
+2. **Vision projector** — `general.type == "mmproj"` in the GGUF header, else a
+   `mmproj` marker in the filename.
+3. **Auxiliary component** — filename markers (`vae`, `wavtokenizer`, `codec`,
+   `vocoder`, `tokenizer-`; `mtp-`, `draft-`, `speculative`). Checked *before* the
+   architecture table because some codecs ship under the same architecture as their
+   host model (`yue2-vae` and `yue2-3b` are both `audiocpp`).
+4. **`general.architecture`** — mapped through a table of architectures whose family
+   implies a modality.
+5. **Filename family** — for generic architectures (`outetts`, `kokoro`, `whisper`, …).
+6. **`text`** — a plain decoder.
+
+Steps 2–5 read only the GGUF header; no tensor data is touched.
+
+> Auto-detection is a good default, not a guarantee. Some weights report a misleading
+> architecture — `OuteTTS` reports `olmo` and carries no audio tensors, so only its
+> filename gives it away; `Laya` reports `modern-bert` despite being a multimodal model.
+> Use **Edit → Model type** to pin those, or **Auto-detect** to release the pin.
+
+The `text`-generation type is orthogonal to the `vision` **tag**: a text LLM with a
+paired `mmproj` stays in the Text Generation group and keeps its `vision` tag.
+
+`arch` and `model_type` are derived and recomputed on every scan, so they are never
+written into the sidecar — only `type_override` is persisted.
+
+> **Vision projectors are not listed as their own cards.** `scan()` filters `mmproj`
+> files out of the registry and pairs them onto host models, exactly as before. They are
+> classified so the pairing and the host's `vision` tag stay correct, but they do not
+> appear in the model grid.
+
+---
+
+## Engine Badges (Bridge Cards)
+
+Cards backed by a configured engine (`engines:` in `config.yaml` — Strata today) carry a
+second badge next to the type badge:
+
+```
+[ Text Generation ]  [ ⚙ Strata ]  chat  pinned
+```
+
+- **Dashed** border, so it reads as structural rather than as one of your own tags.
+- **Coloured per engine**, derived from the engine name, so Strata looks identical on
+  every card and across reloads.
+- Tooltip shows the engine's state. A **red `!`** plus an inline warning appears when the
+  engine failed boot-time validation, e.g.
+  `⚠ Strata engine is misconfigured: engines.strata.interpreter is not set` — the same
+  reason a load would return as a 400, surfaced before you try.
+- Llama cards (the default engine) get no engine badge.
+- If a card references an engine missing from the registry, the badge falls back to the
+  raw engine name and warns that loading will fail with a 400.
+
+Engine metadata comes from `GET /v1/engines` and is fetched once at startup (plus after
+adding or deleting a card) — it is static config, so it is deliberately *not* part of the
+per-tick refresh.
 
 ---
 
@@ -214,11 +345,24 @@ curl http://127.0.0.1:9123/v1/models
       "port": 9001,
       "tags": ["chat", "7B"],
       "size_mb": 4200.5,
-      "default": false
+      "default": false,
+      "model_type": "text",
+      "model_type_override": "",
+      "model_type_label": "Text Generation",
+      "arch": "llama",
+      "auxiliary": false
     }
   ]
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `model_type` | string | Effective type driving the WebUI group + badge |
+| `model_type_override` | string | The user's pin; `""` means auto-detected |
+| `model_type_label` | string | Display name for `model_type` |
+| `arch` | string | Raw `general.architecture` (`""` if absent) |
+| `auxiliary` | bool | True for component types (codec / draft / mmproj) |
 
 #### `GET /v1/models/{model_id}`
 
@@ -261,7 +405,10 @@ curl -X PUT http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/config \
   }'
 ```
 
-**Updatable fields:** `name`, `description`, `args`, `ctx_size`, `n_gpu_layers`, `default`, `pinned`, `auto_save_state`, `backend`, `use_mmproj`, `mmproj_file`, `estimated_vram_mb`, `tags`
+**Updatable fields:** `name`, `description`, `args`, `ctx_size`, `n_gpu_layers`, `default`, `pinned`, `auto_save_state`, `backend`, `use_mmproj`, `mmproj_file`, `estimated_vram_mb`, `tags`, `model_type`
+
+`model_type` accepts any type from the table above. Send `""` to clear the pin and
+return the card to auto-detection. An unknown value is rejected with **400**.
 
 #### `GET /v1/models/{model_id}/port`
 

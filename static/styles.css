@@ -143,6 +143,63 @@ button.danger:hover { background: var(--red); border-color: var(--red); color: w
 
 .empty { color: var(--muted); padding: 40px; text-align: center; grid-column: 1 / -1; }
 
+/* ---- model type: filter chips, group headers, card badges ---- */
+/* One accent colour per type, shared by the chip, the group header rule and the card
+   badge so the three never disagree. --type-color is set inline from JS. */
+.type-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.type-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg2); border: 1px solid var(--border); color: var(--muted);
+  padding: 5px 11px; border-radius: 999px; font-size: 11px; font-family: var(--mono);
+  cursor: pointer; user-select: none; transition: border-color .15s, color .15s;
+}
+.type-chip:hover { color: var(--fg); border-color: var(--type-color, var(--accent)); }
+.type-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--type-color, var(--muted)); }
+.type-chip .count { color: var(--muted); font-size: 10px; }
+.type-chip.active {
+  color: var(--fg); border-color: var(--type-color, var(--accent));
+  background: color-mix(in srgb, var(--type-color, var(--accent)) 12%, var(--bg2));
+}
+
+#models-container { display: flex; flex-direction: column; gap: 22px; }
+.model-group { display: block; }
+.group-head { display: flex; align-items: center; gap: 9px; margin-bottom: 10px; }
+.group-head .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--type-color, var(--muted)); flex: 0 0 auto; }
+.group-title { font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
+               color: var(--fg); margin: 0; font-weight: 600; }
+.group-count { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.group-desc { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-left: auto; text-align: right; }
+.group-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+
+/* Bridge-card provenance. Dashed like a pinned type badge so both read as "structural"
+   rather than user metadata; the colour is derived from the engine name (JS), so an
+   engine looks identical on every card and across reloads. */
+.engine-badge { display: inline-block; border: 1px dashed var(--engine-color, var(--border));
+  background: color-mix(in srgb, var(--engine-color, var(--accent)) 12%, var(--bg3));
+  color: var(--fg); padding: 2px 9px; border-radius: 999px; font-size: 10px;
+  font-family: var(--mono); font-weight: 600; margin-right: 4px; cursor: help; }
+.engine-badge.broken { border-color: var(--red); background: color-mix(in srgb, var(--red) 14%, var(--bg3)); }
+.engine-warn { display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: 999px;
+  background: var(--red); color: #fff; font-size: 9px; font-weight: 700; }
+
+/* Leading card badge - sized up from .tag so it reads as the primary classification
+   rather than competing with the user's own tags. */
+.type-badge { display: inline-block; border: 1px solid var(--type-color, var(--border));
+  background: color-mix(in srgb, var(--type-color, var(--accent)) 14%, var(--bg3));
+  color: var(--fg); padding: 2px 9px; border-radius: 999px; font-size: 10px;
+  font-family: var(--mono); font-weight: 600; margin-right: 4px; }
+.type-badge.override { border-style: dashed; }
+.badge-override-mark { color: var(--accent2); margin-left: 3px; }
+
+/* Advisory notice on component-type cards (mmproj / codec / draft). NOT a block: the
+   Load button stays enabled, this only explains what the file actually is. */
+.type-hint { display: flex; gap: 7px; align-items: flex-start;
+  background: color-mix(in srgb, var(--amber) 9%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--amber) 32%, var(--border));
+  color: var(--fg); border-radius: 8px; padding: 7px 10px; margin-bottom: 8px;
+  font-size: 11px; font-family: var(--mono); line-height: 1.45; }
+.type-hint .icon { color: var(--amber); flex: 0 0 auto; }
+
 .tools-row { display: flex; justify-content: space-between; align-items: center; gap: 8px;
              margin-bottom: 12px; flex-wrap: wrap; }
 .tools-row .left { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
