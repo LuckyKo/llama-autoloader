@@ -489,6 +489,12 @@ curl -X POST http://127.0.0.1:9123/v1/scan
 
 Toggle the vision projector (`--mmproj`) on or off for a model.
 
+> **Pairing rules.** A projector is auto-paired to a model in its directory when it is
+> the only eligible model there. If several eligible models share the directory, the
+> projector is only attached on a clear, unique name match — and a projector is **never**
+> auto-attached to an `mmproj`, `codec` or `draft` model, which have no vision tower. Set
+> `mmproj_file` explicitly to override any of this.
+
 ```bash
 curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/vision/toggle
 ```
@@ -727,6 +733,13 @@ curl -X PUT http://127.0.0.1:9123/v1/settings \
 
 Forward any request directly to a loaded model's `llama-server` instance. Useful for accessing native llama.cpp endpoints like `/slots`, `/tokenize`, `/detokenize`.
 
+> **Registered 2026-10-18** — this was documented before but never actually routed, so
+> every call returned 404. It does **not** JIT-load; it returns 503 if the model is not
+> already resident.
+>
+> Note for slot operations: llama-server takes `action` in the **query string** but
+> `filename` in the **JSON body**. `?action=save&filename=x.bin` returns 400.
+
 ```bash
 # Tokenize text
 curl -X POST http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/tokenize \
@@ -735,6 +748,10 @@ curl -X POST http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/tokenize \
 
 # Get slot info
 curl http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/slots
+
+# Save slot 0 (action in query, filename in body)
+curl -X POST 'http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/slots/0?action=save' \
+  -H 'Content-Type: application/json' -d '{"filename": "state.bin"}'
 ```
 
 ---

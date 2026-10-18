@@ -56,6 +56,99 @@ class _FakeProc:
 # Startup happy path (real HTTP via TestClient)
 # ===========================================================================
 
+class TestRawPassthrough:
+    """``/v1/raw/{model}/{path}`` was documented in both READMEs but never registered,
+    so every call 404'd. Drives a REAL loopback HTTP server standing in for the engine."""
+
+    @pytest.fixture()
+    def engine(self):
+        """A real HTTP server on loopback that echoes method/path/query/body."""
+        import json as _json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                payload = self.rfile.read(length) if length else b""
+                body = _json.dumps({
+                    "method": self.command,
+                    "path": self.path,
+                    "x_custom": self.headers.get("X-Custom"),
+                    "body": payload.decode("utf-8", "replace"),
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _reply
+            do_HEAD = _reply
+
+            def log_message(self, *a):   # silence the default stderr spam
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), Handler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            yield srv.server_address[1]
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def _mark_loaded(self, model_id, port):
+        """Register a LoadedModel for ``model_id`` without spawning a real process."""
+        from pathlib import Path
+
+        from server import LoadedModel, ModelConfig
+        lm = LoadedModel(model_id=model_id, gguf_path=Path("x.gguf"),
+                         config=ModelConfig(), port=port, process=None)
+        lm.ready = True
+        lm.pid = 0
+        server.manager.loaded[model_id] = lm
+        return lm
+
+    def test_forwards_method_path_query_and_body(self, client, engine):
+        import json as _json
+        data = client.get("/v1/models").json()["data"]
+        assert data, "need a model"
+        mid = data[0]["id"]
+        self._mark_loaded(mid, engine)
+        try:
+            r = client.post(f"/v1/raw/{mid}/slots/0?action=save&filename=state.bin",
+                            json={"hello": "world"})
+            assert r.status_code == 200, r.text
+            got = _json.loads(r.text)
+            assert got["method"] == "POST"
+            assert got["path"] == "/slots/0?action=save&filename=state.bin"
+            assert "world" in got["body"]
+        finally:
+            server.manager.loaded.pop(mid, None)
+
+    def test_unknown_model_404(self, client, engine):
+        assert client.get("/v1/raw/definitely-not-a-model/props").status_code == 404
+
+    def test_known_but_unloaded_model_503(self, client):
+        data = client.get("/v1/models").json()["data"]
+        mid = data[0]["id"]
+        server.manager.loaded.pop(mid, None)
+        r = client.get(f"/v1/raw/{mid}/slots")
+        assert r.status_code == 503
+        assert "not loaded" in r.text
+
+    def test_does_not_jit_load(self, client, engine):
+        """/v1/raw must NOT spawn a model on a typo'd path - a 503 is the better answer."""
+        data = client.get("/v1/models").json()["data"]
+        mid = data[0]["id"]
+        server.manager.loaded.pop(mid, None)
+        before = set(server.manager.loaded)
+        client.get(f"/v1/raw/{mid}/slots")
+        assert set(server.manager.loaded) == before, "must not have loaded anything"
+
+
 class TestStartupHappyPath:
     def test_health_root(self, client):
         r = client.get("/health")

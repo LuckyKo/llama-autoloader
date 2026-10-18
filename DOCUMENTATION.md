@@ -174,6 +174,33 @@ so `scan()` opens each file exactly once.
 present and falls back to the filename marker, which preserves the original behaviour for
 every file that already worked.
 
+### Vision Projector Pairing Rules
+
+`_pair_mmproj(p, cfg, mmproj_paths, *, eligible_siblings=None, eligible_others=None)`
+resolves a model's projector. Order:
+
+1. **Auxiliary types are never auto-paired.** A `draft`/MTP model or a `codec` has no
+   vision tower, so a projector is always wrong for them. An *explicit* sidecar
+   `mmproj_file` is still honoured — that is a user decision, not inference.
+2. **Explicit `mmproj_file`** — as a path, else by filename in the model's directory,
+   else in `root_dir`.
+3. **Sibling projectors** — exactly one in the model's directory, *provided this is the
+   only eligible model there*. If several eligible models share the directory, the lone
+   projector is contested and is only handed over on a clear, **unique** name match
+   (`_mmproj_affinity`). Two or more siblings fall back to the positional-prefix
+   heuristic.
+4. **Single projector anywhere in the tree** — same uniqueness rule, scoped tree-wide.
+
+The ambiguity rules exist because both "lone sibling" and "single projector in the tree"
+previously attached a projector to **every** model regardless of name; rule 4 bypassed
+rule 3's directory scoping entirely. `_mmproj_affinity` normalizes the `mmproj-` prefix
+and scores exact/containment matches, because the old positional heuristic scores every
+projector above zero (index 2 of `mmproj-*` is always `p`).
+
+`eligible_siblings` / `eligible_others` default to `None`, preserving the historical
+unconditional behaviour for `update_config()` and existing tests; `scan()` supplies
+them. Pairing runs **after** classification in `scan()` so auxiliary types are known.
+
 Detection is a default, not a guarantee: `OuteTTS` reports `olmo` with no audio tensors
 (filename only), and `Laya` reports `modern-bert` despite being multimodal. Both are
 correctable via `type_override`.
@@ -506,30 +533,49 @@ Also available without `/v1` prefix:
 
 ### Direct llama-server Slot Endpoints (via Proxy)
 
-For advanced state management, you can access the underlying llama-server's native slot endpoints through the autoloader's proxy route `/v1/raw/{model_id}/{path}`. These requests are forwarded directly to the loaded model's llama-server process.
+For advanced state management, you can access the underlying llama-server's native slot
+endpoints through the autoloader's proxy route `/v1/raw/{model_id}/{path}`. These
+requests are forwarded directly to the loaded model's llama-server process.
+
+> **Verified 2026-10-18.** This endpoint was documented here but never actually
+> registered — every call 404'd. It now works. **The old examples were also wrong:**
+> llama-server takes `action` in the **query string** but `filename` in the **JSON body**.
+> Putting `filename` in the query returns **HTTP 400**, which is exactly what the
+> previous examples did. `_perform_slot_action()` has always used the correct shape.
 
 **Slot-specific endpoints:**
-- `GET/POST /v1/raw/{model_id}/slots/0?action=save&filename=state.bin`
-- `GET/POST /v1/raw/{model_id}/slots/0?action=restore&filename=state.bin`
+- `GET/POST /v1/raw/{model_id}/slots/0?action=save` + body `{"filename": "state.bin"}`
+- `GET/POST /v1/raw/{model_id}/slots/0?action=restore` + body `{"filename": "state.bin"}`
 
 **Multi-slot endpoints (specify slot via query param):**
-- `GET/POST /v1/raw/{model_id}/slots?action=save&id_slot=0&filename=state.bin`
-- `GET/POST /v1/raw/{model_id}/slots?action=restore&id_slot=0&filename=state.bin`
+- `GET/POST /v1/raw/{model_id}/slots?action=save&id_slot=0` + body `{"filename": "state.bin"}`
+- `GET/POST /v1/raw/{model_id}/slots?action=restore&id_slot=0` + body `{"filename": "state.bin"}`
 
-Both query parameters and JSON body formats are supported, matching llama-server's native API. Examples:
+Both query parameters and JSON body formats are supported, matching llama-server's native
+API. Examples:
 
 ```bash
-# Via autoloader proxy (query param format)
+# Via autoloader proxy (correct shape: action in query, filename in body)
+curl -X POST 'http://127.0.0.1:9123/v1/raw/mymodel/slots/0?action=save' \
+  -H "Content-Type: application/json" \
+  -d '{"filename":"test.bin"}'
+
+# WRONG -> HTTP 400: filename belongs in the body, not the query string
 curl "http://127.0.0.1:9123/v1/raw/mymodel/slots/0?action=save&filename=test.bin"
 
-# Via autoloader proxy (JSON body format — POST only)
-curl -X POST http://127.0.0.1:9123/v1/raw/mymodel/slots/0 \
-  -H "Content-Type: application/json" \
-  -d '{"action":"save","filename":"test.bin"}'
-
 # Direct llama-server (if you know the port)
-curl "http://127.0.0.1:9001/slots/0?action=save&filename=test.bin"
+curl -X POST 'http://127.0.0.1:9001/slots/0?action=save' \
+  -H "Content-Type: application/json" \
+  -d '{"filename":"test.bin"}'
 ```
+
+The model must already be **loaded**: `/v1/raw` returns **503** rather than JIT-loading
+it, because silently spending a minute loading a multi-GB model on a typo is worse than a
+clear error. Call `POST /v1/models/{id}/load` first.
+
+Unlike `/v1/models/{id}/state/save`, this route writes wherever llama-server's
+`--slot-save-path` points and does **not** register the file in the autoloader's state
+list — the two paths are independent.
 
 ### Other Endpoints
 
@@ -576,9 +622,25 @@ Return the raw TCP port of a resident `llama-server` (see also interrupt above l
 - `404 Not Found`: Model ID not recognized.
 - `503 Service Unavailable`: Model known but not loaded.
 
-#### `POST|GET|... /v1/raw/{model_id}/{path}`
+#### `GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS /v1/raw/{model_id}/{path}`
 
-Pass-through any request to a loaded model's resident `llama-server`.
+Pass any request through to a loaded model's resident `llama-server`. Registered
+2026-10-18 — it was documented before but never actually routed, so every call 404'd.
+
+Does **not** JIT-load: returns **503** if the model is not resident (load it first).
+Upstream failures surface as **502**. The response is streamed, and hop-by-hop / framing
+headers are recomputed rather than replayed. Query strings, request bodies and content
+type are forwarded verbatim.
+
+**Error Responses:**
+- `404 Not Found`: Model ID not recognized.
+- `502 Bad Gateway`: The engine connection failed.
+- `503 Service Unavailable`: Model known but not loaded.
+
+> **Security:** this exposes the engine's full HTTP surface, including slot
+> save/restore which writes files next to it. It inherits the autoloader's trust model —
+> bound to `launcher.host` (127.0.0.1 by default), no authentication. Do not bind the
+> launcher to a shared interface if you care about this.
 
 #### `GET /`
 
@@ -731,11 +793,13 @@ curl -X POST http://127.0.0.1:9123/v1/models/mymodel/state/load \
 
 **Via direct llama-server (after getting port from `/v1/models/{id}`):**
 ```bash
-# Save
-curl -X POST "http://127.0.0.1:9001/slots/0?action=save&filename=mysave.bin"
+# Save - action in the query, filename in the BODY
+curl -X POST "http://127.0.0.1:9001/slots/0?action=save" \
+  -H "Content-Type: application/json" -d '{"filename":"mysave.bin"}'
 
 # Restore
-curl -X POST "http://127.0.0.1:9001/slots/0?action=restore&filename=mysave.bin"
+curl -X POST "http://127.0.0.1:9001/slots/0?action=restore" \
+  -H "Content-Type: application/json" -d '{"filename":"mysave.bin"}'
 ```
 
 ### Important Limitations
@@ -789,7 +853,8 @@ This saves the KV cache to `save_state_dir` as `{sanitized_model_id}.{sanitized_
 
 **Alternative: via direct llama-server slot endpoint (using port from load response)**
 ```bash
-curl -X POST "http://127.0.0.1:$PORT/slots/0?action=save&filename=mymodel.state.bin"
+curl -X POST "http://127.0.0.1:$PORT/slots/0?action=save" \
+  -H "Content-Type: application/json" -d '{"filename":"mymodel.state.bin"}'
 ```
 
 **Step 5: Unload model**
@@ -814,7 +879,8 @@ After restore, the slot's KV cache contains the previous conversation context. S
 
 **Alternative: via direct llama-server slot endpoint**
 ```bash
-curl -X POST "http://127.0.0.1:$PORT/slots/0?action=restore&filename=mymodel.state.bin"
+curl -X POST "http://127.0.0.1:$PORT/slots/0?action=restore" \
+  -H "Content-Type: application/json" -d '{"filename":"mymodel.state.bin"}'
 ```
 
 **Step 8: Continue conversation via autoloader (should use restored KV cache)**

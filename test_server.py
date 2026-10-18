@@ -140,9 +140,31 @@ class TestScan:
         ids = list(manager.models.keys())
         assert "clip-mmproj.gguf" not in ids
 
-    def test_pairs_mmproj(self, manager):
-        # There's one mmproj and 4 models; fallback pairs it with every model
-        assert len(manager.mmproj_paths) > 0
+    def test_lone_unrelated_mmproj_is_not_auto_paired(self, manager):
+        """A lone projector with no name relationship must NOT be attached to the models.
+
+        Previously the "exactly one mmproj in the tree" fallback paired that projector
+        with EVERY model in the library regardless of name. That is the broadest form of
+        the mispairing bug (it bypassed the directory-scoped rule entirely): an unrelated
+        vision projector silently became every text model's --mmproj.
+        """
+        assert "clip-mmproj.gguf" not in manager.models   # filtered from the registry
+        assert len(manager._mmproj_paths) == 1           # ... but still detected as one
+        assert manager.mmproj_paths == {}, "no name match, so nothing may be paired"
+
+    def test_lone_named_mmproj_still_pairs_via_fallback(self, tmp_path):
+        """The single-projector fallback still works when the name DOES match a model."""
+        from server import ModelManager
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+        (models_dir / "llava-v1.gguf").write_bytes(b"GGUF_HEADER" * 10)
+        (models_dir / "mmproj-llava.gguf").write_bytes(b"GGUF_HEADER" * 5)
+        cfg = _make_cfg({"models": {"root_dir": str(models_dir),
+                                        "save_state_dir": str(tmp_path / "states"),
+                                        "backends_dir": str(tmp_path / "backends")}})
+        mgr = ModelManager(cfg)
+        mgr.scan()
+        assert mgr.mmproj_paths.get("llava-v1.gguf") == models_dir / "mmproj-llava.gguf"
 
     def test_reads_config_sidecar(self, manager):
         cfg_a = manager.models["model-a.gguf"]

@@ -34,7 +34,7 @@ import yaml
 from fastapi import (
     FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 import uvicorn
@@ -646,6 +646,11 @@ class ModelManager:
         self.models: Dict[str, ModelConfig] = {}      # id -> config
         self.gguf_paths: Dict[str, Path] = {}         # id -> path
         self.mmproj_paths: Dict[str, Path] = {}       # id -> mmproj path
+        # Every vision projector found by the last scan. Seeded here (and fingerprinted in
+        # the loop below) so _list_mmproj_files() validates cheaply instead of re-reading
+        # every header on the update_config path.
+        self._mmproj_paths: List[Path] = []
+        self._mmproj_sig: Tuple[Tuple[str, int, int], ...] = ()
         self.loaded: Dict[str, LoadedModel] = {}      # id -> loaded instance
         # Bridge-card engine registry: {} => feature fully inert (no engines: section).
         self.engines = _normalize_engines(cfg)
@@ -875,17 +880,120 @@ class ModelManager:
         return candidate
 
     def _list_mmproj_files(self) -> List[Path]:
-        """Return all .gguf files under root_dir whose name contains 'mmproj' (case-insensitive), sorted for determinism."""
-        return sorted(p for p in self.root_dir.rglob("*.gguf") if "mmproj" in p.name.lower())
+        """Every vision projector under root_dir, sorted for determinism.
 
-    def _pair_mmproj(self, p: Path, cfg: "ModelConfig", mmproj_paths: List[Path]) -> Optional[Path]:
+        ONE detection rule, shared with :meth:`scan`: ``_is_mmproj`` (metadata first,
+        filename as fallback). This used to be a filename-only ``"mmproj" in name`` scan,
+        which meant a projector not named ``mmproj*`` paired correctly at scan time and
+        then silently lost its pairing the next time the user saved that model's config -
+        two rules for one concept.
+
+        Results are cached against a (path, mtime_ns, size) fingerprint of the .gguf tree.
+        Re-validating costs one rglob + a stat per file (~70ms here) versus re-reading
+        every GGUF header (~200ms), while still noticing a projector that was just dropped
+        in - which ``update_config`` relies on. A fingerprint mismatch recomputes, so this
+        can never serve a stale list.
+        """
+        files = sorted(self.root_dir.rglob("*.gguf"))
+        sig: List[Tuple[str, int, int]] = []
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            sig.append((str(p), st.st_mtime_ns, st.st_size))
+        fingerprint = tuple(sig)
+        if fingerprint != self._mmproj_sig:
+            self._mmproj_paths = [p for p in files if self._is_mmproj(p, _read_gguf_info(p))]
+            self._mmproj_sig = fingerprint
+        return list(self._mmproj_paths)
+
+    def _best_mmproj_by_name(self, model_stem: str, candidates: List[Path]) -> Optional[Path]:
+        """Pick the projector whose name shares the longest prefix with the model's.
+
+        Positional heuristic, kept for the multi-projector case. It happily returns a
+        candidate at score 0, which is why the ambiguous single-projector case below uses
+        :meth:`_mmproj_affinity` instead.
+        """
+        p_stem = model_stem.lower()
+        best_match = None
+        best_score = -1
+        for mp in candidates:
+            mp_stem = mp.stem.lower()
+            common_prefix_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
+            if common_prefix_len > best_score:
+                best_score = common_prefix_len
+                best_match = mp
+        return best_match
+
+    @staticmethod
+    def _strip_projector_prefix(stem: str) -> str:
+        """``mmproj-alpha-f16`` -> ``alpha-f16``. Projector stems carry a role prefix
+        that the model's own stem never has, so it must go before comparing."""
+        s = stem.lower()
+        for prefix in ("mmproj-", "mmproj_", "mmprojection-", "mmprojection_"):
+            if s.startswith(prefix):
+                return s[len(prefix):]
+        return s
+
+    def _mmproj_affinity(self, model_stem: str, proj_stem: str) -> int:
+        """How strongly a projector belongs to a model, by normalized stem overlap.
+
+        Returns 0 when there is no real relationship. Used to decide whether attaching a
+        directory's lone projector to one of several models is defensible or a guess -
+        the positional prefix heuristic cannot do this, because "mmproj-" itself creates
+        spurious character collisions (index 2 is 'p' for every projector, so any model
+        with 'p' at index 2 scored above zero).
+        """
+        m = self._strip_projector_prefix(model_stem)
+        p = self._strip_projector_prefix(proj_stem)
+        if not m or not p:
+            return 0
+        if m == p:
+            return 1000
+        if p in m or m in p:
+            # Longer overlap wins, so a better match beats a mere substring hit.
+            return 500 + len(p if p in m else m)
+        return 0
+
+    def _pair_mmproj(self, p: Path, cfg: "ModelConfig", mmproj_paths: List[Path],
+                     *, eligible_siblings: Optional[List[str]] = None,
+                     eligible_others: Optional[List[str]] = None) -> Optional[Path]:
         """Resolve the vision (mmproj) module for a single model.
 
         Single source of truth for the pairing rules; shared by scan() and
         update_config(). Returns the resolved Path or None. Does NOT mutate
-        self.mmproj_paths or cfg — callers apply the mutation so both behave
-        identically to today.
+        self.mmproj_paths or cfg - callers apply the mutation so both behave
+        identically.
+
+        Both ``eligible_*`` arguments are the stems of the OTHER models that could
+        legitimately own a projector (i.e. not auxiliary components):
+
+        ``eligible_siblings`` - same directory. Lets rule 2 detect that a directory's lone
+            projector is contested instead of handing it to every model present.
+        ``eligible_others``   - anywhere in the tree. Lets rule 3 do the same for the
+            "exactly one projector exists" fallback.
+
+        Both default to None, which preserves the historical unconditional behaviour.
+        scan() supplies them; tests and update_config() do not.
         """
+        # Auxiliary components are never AUTO-paired. A draft/MTP model or an audio codec
+        # has no vision tower, so attaching a projector is always wrong - it produced a
+        # real mispairing here: mtp-gemma-4-31B-it.gguf sits next to gemma-4-31B and
+        # inherited its projector, gaining a misleading "vision" tag and a --mmproj it
+        # cannot use. An explicitly configured mmproj_file is still honoured, because that
+        # is the user's decision, not our inference.
+        if (cfg.model_type or MODEL_TYPE_TEXT) in MODEL_TYPE_AUXILIARY and not cfg.mmproj_file:
+            return None
+
+        def _contested(lone: Path, rivals_stems: List[str]) -> Optional[Path]:
+            """Return ``lone`` only if this model is its clear, unique namesake."""
+            mine = self._mmproj_affinity(p.stem, lone.stem)
+            if mine <= 0:
+                return None
+            rivals = [self._mmproj_affinity(s, lone.stem) for s in rivals_stems]
+            return lone if not rivals or mine > max(rivals) else None
+
         paired_mmproj = None
 
         # 1. Check explicit mmproj_file setting
@@ -908,22 +1016,28 @@ class ModelManager:
         if not paired_mmproj:
             sibling_mmprojs = [mp for mp in mmproj_paths if mp.parent == p.parent]
             if len(sibling_mmprojs) == 1:
-                paired_mmproj = sibling_mmprojs[0]
+                lone = sibling_mmprojs[0]
+                if not eligible_siblings:
+                    # Either this is the only eligible model here (the normal case), or
+                    # the caller supplied no sibling context at all (tests/update_config).
+                    paired_mmproj = lone
+                else:
+                    # Contested by other models in this directory: only a clear, unique
+                    # name match justifies handing the projector over.
+                    paired_mmproj = _contested(lone, eligible_siblings)
             elif len(sibling_mmprojs) > 1:
-                p_stem = p.stem.lower()
-                best_match = None
-                best_score = -1
-                for mp in sibling_mmprojs:
-                    mp_stem = mp.stem.lower()
-                    common_prefix_len = sum(1 for a, b in zip(p_stem, mp_stem) if a == b)
-                    if common_prefix_len > best_score:
-                        best_score = common_prefix_len
-                        best_match = mp
-                paired_mmproj = best_match
+                paired_mmproj = self._best_mmproj_by_name(p.stem, sibling_mmprojs)
 
-        # 3. Fallback: single mmproj in root_dir
+        # 3. Fallback: a single projector anywhere in the tree.
+        #    Tree-wide rule, so its ambiguity check must be tree-wide too - previously it
+        #    attached that one projector to EVERY model, bypassing rule 2's directory
+        #    scoping entirely. That was the broadest form of the mispairing bug.
         if not paired_mmproj and len(mmproj_paths) == 1:
-            paired_mmproj = mmproj_paths[0]
+            lone = mmproj_paths[0]
+            if not eligible_others:
+                paired_mmproj = lone
+            else:
+                paired_mmproj = _contested(lone, eligible_others)
 
         return paired_mmproj
 
@@ -1094,13 +1208,23 @@ class ModelManager:
         mmproj_paths = []
         # path -> parsed header, so the metadata pass below never re-opens the file.
         gguf_info: Dict[Path, Dict[str, Any]] = {}
+        sig: List[Tuple[str, int, int]] = []
         for p in all_ggufs:
             info = _read_gguf_info(p)
             gguf_info[p] = info
+            try:
+                st = p.stat()
+                sig.append((str(p), st.st_mtime_ns, st.st_size))
+            except OSError:
+                pass
             if self._is_mmproj(p, info):
                 mmproj_paths.append(p)
             else:
                 model_paths.append(p)
+        # Publish the projector set AND its fingerprint, so _list_mmproj_files() (the
+        # update_config path) starts warm and only recomputes when the tree changes.
+        self._mmproj_paths = list(mmproj_paths)
+        self._mmproj_sig = tuple(sig)
 
         found = {}
         self.gguf_paths = {}
@@ -1114,15 +1238,6 @@ class ModelManager:
             self.gguf_paths[mid] = p
             if mid in self.loaded:
                 self.loaded[mid].config = cfg
-
-        # Auto-pair mmproj files with sibling models
-        for mid, p in self.gguf_paths.items():
-            cfg = found[mid]
-            paired_mmproj = self._pair_mmproj(p, cfg, mmproj_paths)
-            if paired_mmproj:
-                self.mmproj_paths[mid] = paired_mmproj
-                if not cfg.mmproj_file:
-                    cfg.mmproj_file = paired_mmproj.name
 
         self.models = found
         # Apply global default_n_gpu_layers to models that have n_gpu_layers=None
@@ -1138,6 +1253,32 @@ class ModelManager:
                 self._model_sizes[mid] = 0.0
             # Reuse the header already parsed during the partition above.
             self._apply_gguf_info(self.models[mid], path, mid, gguf_info.get(path) or {})
+
+        # Auto-pair vision projectors with sibling models. Runs AFTER classification so
+        # _pair_mmproj knows which models are auxiliary components that must never be
+        # paired, and so it can see the other candidates in each directory.
+        eligible_by_dir: Dict[Path, List[str]] = {}
+        eligible_all: List[str] = []
+        for mid, p in self.gguf_paths.items():
+            if (self.models[mid].model_type or MODEL_TYPE_TEXT) not in MODEL_TYPE_AUXILIARY:
+                eligible_by_dir.setdefault(p.parent, []).append(p.stem)
+                eligible_all.append(p.stem)
+        for mid, p in self.gguf_paths.items():
+            cfg = self.models[mid]
+            ctx = {
+                "eligible_siblings": [s for s in eligible_by_dir.get(p.parent, []) if s != p.stem],
+                "eligible_others": [s for s in eligible_all if s != p.stem],
+            }
+            paired_mmproj = self._pair_mmproj(p, cfg, mmproj_paths, **ctx)
+            if paired_mmproj:
+                self.mmproj_paths[mid] = paired_mmproj
+                if not cfg.mmproj_file:
+                    cfg.mmproj_file = paired_mmproj.name
+            else:
+                # Drop any pairing a previous scan inferred, so a model that has become
+                # ineligible (or lost its projector) does not keep a stale --mmproj.
+                self.mmproj_paths.pop(mid, None)
+
         # Additive bridge-card pass (inert with no engines: section). Runs AFTER the
         # gguf metadata loop; bridge ids never enter self.gguf_paths, so _read_gguf_info
         # is never called on a JSON file (R5). Bridge cards have no GGUF of their own, so
@@ -2558,6 +2699,80 @@ async def get_model_port(model_id: str):
     if not ready:
         raise HTTPException(503, f"Model '{mid}' is not loaded")
     return {"port": port, "model_id": mid}
+
+
+# Headers that describe THIS hop's framing or routing and must not be replayed
+# upstream: the engine sees its own connection, and its own content-length.
+_RAW_STRIP_HEADERS = {
+    "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailer", "transfer-encoding", "upgrade", "content-length",
+    "content-encoding", "accept-encoding",
+}
+
+
+@app.api_route("/v1/raw/{model_id}/{path:path}",
+               methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def raw_passthrough(model_id: str, path: str, request: Request):
+    """Proxy any request straight to a loaded engine's HTTP port.
+
+    Documented in both READMEs (and used there for manual slot save/restore) but never
+    actually registered - every call 404'd. This is that endpoint.
+
+    Reach for it for native llama.cpp endpoints the autoloader does not wrap:
+    ``/tokenize``, ``/detokenize``, ``/slots``, ``/props``, ``/lora-adapters``...
+
+        GET  /v1/raw/<model>/slots
+        POST /v1/raw/<model>/slots/0?action=save&filename=state.bin
+
+    Unlike ``/v1/models/{id}/load`` this does NOT JIT-load: the model must already be
+    resident, because a proxy that silently spends a minute loading a multi-GB model on a
+    typo is worse than a clear 503 telling you to Load first.
+
+    Security: this exposes the engine's full HTTP surface, including slot save/restore
+    that writes files next to the engine. It inherits the autoloader's trust model - bound
+    to launcher.host (127.0.0.1 by default), no auth - so do not expose it on a shared
+    interface. Any request reaching it has already passed the TCP forwarder.
+    """
+    mid = await manager.resolve_model_id(model_id)
+    if not mid:
+        raise HTTPException(404, f"Model not found: {model_id}")
+    async with manager._lock:
+        lm = manager.loaded.get(mid)
+        ready = bool(lm and lm.ready)
+        port = lm.port if lm else None
+    if not ready or port is None:
+        raise HTTPException(503, f"Model '{mid}' is not loaded - POST /v1/models/{mid}/load first")
+
+    url = f"http://127.0.0.1:{port}/{path}"
+    if request.url.query:
+        url += "?" + request.url.query
+
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items()
+               if k.lower() not in _RAW_STRIP_HEADERS}
+
+    try:
+        # Generous timeout: /slots?action=save can take tens of seconds on a big model.
+        upstream = await manager.client.request(
+            request.method, url, content=body or None, headers=headers,
+            timeout=httpx.Timeout(300.0, connect=10.0))
+    except Exception as e:
+        log.warning(f"raw passthrough to {url} failed: {e}")
+        raise HTTPException(502, f"Engine request failed: {e}")
+
+    async def _relay():
+        # Stream so a large body (a saved slot, a props dump) never sits in memory twice.
+        if upstream.request.method == "HEAD":
+            return
+        async for chunk in upstream.aiter_bytes():
+            yield chunk
+
+    resp_headers = {k: v for k, v in upstream.headers.items()
+                    if k.lower() not in _RAW_STRIP_HEADERS}
+    return StreamingResponse(
+        _relay(), status_code=upstream.status_code, headers=resp_headers,
+        media_type=upstream.headers.get("content-type"),
+    )
 
 
 @app.post("/v1/models/{model_id}/interrupt")

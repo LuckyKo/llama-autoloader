@@ -467,6 +467,124 @@ class TestMultiInstancePorts:
             occupied.close()
 
 
+class TestMmprojPairingRules:
+    """Auto-pairing must not hand a projector to a model that cannot use one.
+
+    Regression (found 2026-10-18): a directory holding ONE projector and SEVERAL models
+    gave the projector to all of them, because the rule was "exactly one sibling mmproj ->
+    pair it" with no notion of which models were actually eligible.
+    """
+
+    def _mgr(self, tmp_path):
+        from tests.conftest import build_cfg
+        mgr = ModelManager(build_cfg(tmp_path))
+        return mgr
+
+    def test_single_model_single_projector_still_pairs(self, tmp_path):
+        """The common case must not regress: one model + one projector in a directory."""
+        mgr = self._mgr(tmp_path)
+        root = mgr.root_dir
+        gb.write_gguf(root / "model-a.gguf", name="A", max_ctx=1024)
+        proj = root / "mmproj-a.gguf"
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        mgr.scan()
+        assert mgr.mmproj_paths.get("model-a.gguf") == proj
+
+    def test_auxiliary_type_is_never_auto_paired(self, tmp_path):
+        """A draft/MTP model has no vision tower; it must not inherit its sibling's projector."""
+        mgr = self._mgr(tmp_path)
+        root = mgr.root_dir
+        # 'mtp-' in the name classifies as MODEL_TYPE_DRAFT via the filename rule.
+        draft = root / "mtp-gemma-31B-it.gguf"
+        gb.write_gguf(draft, name="Draft", max_ctx=None)
+        mgr.scan()
+        assert mgr.models["mtp-gemma-31B-it.gguf"].model_type == "draft"
+        proj = root / "mmproj-a.gguf"
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        mgr.scan()
+        assert "mtp-gemma-31B-it.gguf" not in mgr.mmproj_paths, \
+            "a draft model must never be auto-paired a vision projector"
+        argv = mgr.models["mtp-gemma-31B-it.gguf"].to_launch_args(
+            draft, 9001, "", mmproj_full_path=mgr.mmproj_paths.get("mtp-gemma-31B-it.gguf"))
+        assert "--mmproj" not in argv
+
+    def test_explicit_mmproj_file_is_still_honoured_for_auxiliary(self, tmp_path):
+        """An explicit sidecar value is the user's decision - never override it."""
+        mgr = self._mgr(tmp_path)
+        root = mgr.root_dir
+        draft = root / "mtp-gemma-31B-it.gguf"
+        gb.write_gguf(draft, name="Draft", max_ctx=None)
+        proj = root / "mmproj-a.gguf"
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        cfg = mgr.scan() and mgr.models["mtp-gemma-31B-it.gguf"]
+        cfg.mmproj_file = "mmproj-a.gguf"       # user set it deliberately
+        paired = mgr._pair_mmproj(draft, cfg, [proj])
+        assert paired == proj
+
+    def test_lone_projector_not_handed_to_several_models(self, tmp_path):
+        """Two eligible models + one projector: pair on a name match, else leave unpaired."""
+        mgr = self._mgr(tmp_path)
+        root = mgr.root_dir
+        gb.write_gguf(root / "alpha-model.gguf", name="Alpha", max_ctx=1024)
+        gb.write_gguf(root / "beta-model.gguf", name="Beta", max_ctx=1024)
+        proj = root / "mmproj-unrelated.gguf"    # name matches neither model
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        mgr.scan()
+        # No defensible name match -> neither model is silently given the projector.
+        assert mgr.mmproj_paths == {}, \
+            "an unrelated projector must not be attached to every sibling model"
+
+    def test_lone_projector_goes_to_the_named_match(self, tmp_path):
+        """Two eligible models + one projector: a clear name match still wins."""
+        mgr = self._mgr(tmp_path)
+        root = mgr.root_dir
+        gb.write_gguf(root / "alpha-model.gguf", name="Alpha", max_ctx=1024)
+        gb.write_gguf(root / "beta-model.gguf", name="Beta", max_ctx=1024)
+        proj = root / "mmproj-alpha.gguf"         # clearly belongs to alpha-model
+        gb.write_gguf(proj, name="Proj", max_ctx=None)
+        mgr.scan()
+        assert mgr.mmproj_paths.get("alpha-model.gguf") == proj
+        assert "beta-model.gguf" not in mgr.mmproj_paths
+
+    def test_list_mmproj_files_uses_the_same_rule_as_scan(self, tmp_path):
+        """#3: update_config must not apply a different (filename-only) detection rule.
+
+        A projector whose filename says nothing about mmproj but whose header says
+        general.type == "mmproj" must still be found by _list_mmproj_files().
+        """
+        mgr = self._mgr(tmp_path)
+        proj = mgr.root_dir / "proj-F16.gguf"
+        proj.write_bytes(_gguf_with_general_type("mmproj", "clip"))
+        mgr.scan()
+        assert "proj-F16.gguf" not in mgr.models, "must be filtered out of the registry"
+        assert mgr._list_mmproj_files() == [proj], \
+            "update_config must see the same projector set scan() does"
+
+    def test_list_mmproj_files_notices_a_newly_added_projector(self, tmp_path):
+        """The fingerprint cache must not mask a projector dropped in after the scan."""
+        mgr = self._mgr(tmp_path)
+        gb.write_gguf(mgr.root_dir / "model-a.gguf", name="A", max_ctx=1024)
+        mgr.scan()
+        assert mgr._list_mmproj_files() == []
+        late = mgr.root_dir / "mmproj-late.gguf"
+        gb.write_gguf(late, name="Proj", max_ctx=None)
+        assert mgr._list_mmproj_files() == [late], \
+            "a projector added after scan() must be discovered without a rescan"
+
+
+def _gguf_with_general_type(gguf_type: str, arch: str) -> bytes:
+    """A minimal GGUF header carrying general.type / general.architecture as strings."""
+    kvs = [("general.architecture", arch), ("general.type", gguf_type)]
+    buf = bytearray(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kvs)))
+    for key, val in kvs:
+        kb = key.encode("utf-8")
+        vb = val.encode("utf-8")
+        buf += struct.pack("<Q", len(kb)) + kb
+        buf += struct.pack("<I", 8)                       # value type 8 = STRING
+        buf += struct.pack("<Q", len(vb)) + vb
+    return bytes(buf)
+
+
 # ===========================================================================
 # validate_config
 # ===========================================================================
