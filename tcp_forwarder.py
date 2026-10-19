@@ -13,11 +13,14 @@ not yet loaded fall through to the internal FastAPI app (which runs on a separat
 so all existing endpoints keep working unchanged.
 
 Design notes / constraints (see the implementation plan):
-  * ``resolve_model_id_strict`` and ``self.loaded`` are guarded by an ``asyncio.Lock`` and
-    are async-only. We therefore NEVER open a fresh event loop from a worker thread.
-    Instead we schedule the resolution coroutine onto the MAIN running loop with
-    ``asyncio.run_coroutine_threadsafe(...).result(timeout)``. The forwarder must be
-    started only after the main loop is running (it is, from FastAPI's startup hook).
+  * ``resolve_request_model`` (inference routing) and ``self.loaded`` are guarded by an
+    ``asyncio.Lock`` and are async-only. We therefore NEVER open a fresh event loop from
+    a worker thread. Instead we schedule the resolution coroutine onto the MAIN running
+    loop with ``asyncio.run_coroutine_threadsafe(...).result(timeout)``. The forwarder
+    must be started only after the main loop is running (it is, from FastAPI's startup
+    hook). Management endpoints use ``resolve_model_id_strict``, but inference must use
+    the request resolver so an unknown model name falls back to the resident model
+    rather than failing the request.
   * We forward the ORIGINAL raw header bytes verbatim (preserving casing/order and
     ``Content-Length`` / ``Transfer-Encoding: chunked`` / ``Expect: 100-continue``)
     rather than re-encoding headers from a dict.
@@ -576,12 +579,12 @@ class RawTCPForwarder:
                 return True
         return False
 
-    def _resolve_target_port(self, model_id: str) -> Optional[int]:
-        """Look up the llama-server port for a loaded model.
+    def _resolve_request_model(self, model_id: str) -> Optional[str]:
+        """Resolve a request's model on the MAIN event loop (async-only resolver).
 
-        Runs the async ``resolve_model_id_strict`` on the MAIN event loop (never a fresh one)
-        and returns the port only if the model is already loaded AND ready. Returns None
-        otherwise so the caller falls through to FastAPI (which JIT-loads).
+        Uses the manager's ``resolve_request_model`` so an unrecognised inference
+        ``model`` value falls back to the resident model. Returns None when there is
+        no running loop, the resolver fails, or no model can be resolved.
         """
         try:
             main_loop = asyncio.get_running_loop()
@@ -594,16 +597,32 @@ class RawTCPForwarder:
         # Schedule the async-only resolver onto the MAIN loop and block this worker thread
         # until it completes (or times out). This is the safe cross-thread pattern — never
         # a fresh event loop.
-        resolver = getattr(self.model_manager, "resolve_model_id_strict", None)
+        resolver = getattr(self.model_manager, "resolve_request_model", None)
         if resolver is None:
-            # Backwards-compatible with lightweight fakes used by older tests.
-            resolver = self.model_manager.resolve_model_id
+            # Backwards-compatible with lightweight fakes and older managers: the
+            # non-strict resolver is the one that keeps the loaded-model fallback.
+            resolver = (getattr(self.model_manager, "resolve_model_id", None)
+                        or self.model_manager.resolve_model_id_strict)
         coro = resolver(model_id)
         try:
-            resolved_mid = asyncio.run_coroutine_threadsafe(coro, main_loop).result(timeout=5.0)
+            return asyncio.run_coroutine_threadsafe(coro, main_loop).result(timeout=5.0)
         except Exception as e:  # noqa: BLE001
-            log.error(f"Port resolution failed for {model_id!r}: {e}")
+            log.error(f"Model resolution failed for {model_id!r}: {e}")
             return None
+
+    def _resolve_target_port(self, model_id: str) -> Optional[int]:
+        """Look up the llama-server port for a loaded model.
+
+        Resolves via :meth:`_resolve_request_model` on the MAIN event loop (never a fresh
+        one) and returns the port only if that model is already loaded AND ready. Returns
+        None otherwise so the caller can JIT-load the requested model.
+
+        ``resolve_request_model`` (not the strict variant) is deliberate: an inference
+        request naming a model we do not recognise must be served by the already-loaded
+        model instead of failing. Management endpoints stay strict because redirecting
+        them could act on an unrelated resident model.
+        """
+        resolved_mid = self._resolve_request_model(model_id)
         if not resolved_mid:
             return None
 
@@ -625,11 +644,21 @@ class RawTCPForwarder:
         """Trigger a JIT load of ``model_id`` and block until it is ready. Returns the
         llama-server port on success, or None on failure (unknown model / timeout / error).
 
-        Runs the async ``load_model`` on the MAIN event loop (never a fresh one) and blocks
-        this worker thread for up to _JIT_LOAD_TIMEOUT seconds. load_model() is idempotent
-        and concurrency-safe: if another request is already loading the same model it joins
-        that in-flight task rather than double-loading.
+        The request's model is resolved FIRST, so an unknown name that already has a
+        resident fallback joins that model's load instead of trying to load a model
+        that does not exist. Runs the async ``load_model`` on the MAIN event loop
+        (never a fresh one) and blocks this worker thread for up to _JIT_LOAD_TIMEOUT
+        seconds. load_model() is idempotent and concurrency-safe: if another request
+        is already loading the same model it joins that in-flight task rather than
+        double-loading.
         """
+        resolved_mid = self._resolve_request_model(model_id)
+        if not resolved_mid:
+            log.error(f"JIT load for {model_id!r} skipped: no model resolved "
+                      f"(unknown name and no loaded model to fall back to)")
+            return None
+        model_id = resolved_mid
+
         try:
             main_loop = asyncio.get_running_loop()
         except RuntimeError:

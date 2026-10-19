@@ -294,6 +294,52 @@ class TestResolveTargetPort:
         f = RawTCPForwarder(listen_port=19999, internal_api_port=19998, model_manager=mgr)
         assert f._resolve_target_port("nope") is None
 
+    def test_inference_prefers_request_resolver_over_strict(self):
+        """Regression: routing inference through the STRICT resolver dropped the
+        loaded-model fallback, so an unknown ``model`` value produced a failed JIT
+        load (503) instead of reusing the resident model."""
+        lm = _FakeLM(port=9042, ready=True)
+
+        class _Mgr:
+            def __init__(self):
+                self.loaded = {"qwen3": lm}
+                self.calls = []
+
+            async def resolve_request_model(self, model_id):
+                self.calls.append(("request", model_id))
+                return "qwen3"
+
+            async def resolve_model_id_strict(self, model_id):
+                self.calls.append(("strict", model_id))
+                return None
+
+        mgr = _Mgr()
+        f = RawTCPForwarder(listen_port=19999, internal_api_port=19998, model_manager=mgr)
+
+        loop_holder = {}
+
+        def _run_loop():
+            loop = asyncio.new_event_loop()
+            loop_holder["loop"] = loop
+            mgr._main_loop = loop
+            try:
+                loop.run_forever()
+            finally:
+                loop.close()
+
+        t = threading.Thread(target=_run_loop, daemon=True)
+        t.start()
+        while "loop" not in loop_holder:
+            time.sleep(0.01)
+        try:
+            port = f._resolve_target_port("not-a-real-model")
+        finally:
+            loop_holder["loop"].call_soon_threadsafe(loop_holder["loop"].stop)
+            t.join(timeout=5)
+
+        assert port == 9042
+        assert mgr.calls == [("request", "not-a-real-model")]
+
 
 # =========================================================================== CORS / preflight
 # Regression for the CWrite breakage introduced by commit e4cbe26 (raw-TCP passthrough):

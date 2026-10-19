@@ -1513,6 +1513,34 @@ class ModelManager:
         async with self._lock:
             return self._lookup_model_locked(model_id_or_alias)
 
+    async def resolve_request_model(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+        """Resolve the model for an INFERENCE request, tolerating unknown names.
+
+        Inference is not destructive, so an unrecognised ``model`` value (a provider
+        alias, a display name we never learned, or a typo) must NOT fail the request
+        while a model is already resident: route it to that loaded model, which is
+        the historical behaviour clients rely on. Only *loaded* models qualify as a
+        fallback - we never JIT-load a model the request did not name.
+
+        Management/destructive endpoints must keep using
+        :meth:`resolve_model_id_strict`; their explicit references may not be
+        silently redirected to an unrelated resident model.
+        """
+        async with self._lock:
+            match = self._lookup_model_locked(model_id_or_alias)
+            if match:
+                return match
+            if not self.loaded:
+                return None
+
+            # Prefer a ready model; fall back to any resident one so the caller can
+            # reuse its port rather than spawning a second engine.
+            ready_loaded = [m for m, lm in self.loaded.items() if lm.ready]
+            model_id = ready_loaded[0] if ready_loaded else next(iter(self.loaded.keys()))
+            log.debug(f"Model '{model_id_or_alias}' not found in registry; "
+                      f"serving request with loaded model '{model_id}'")
+            return model_id
+
     async def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
         """Resolve a model, with a default fallback for an OMITTED reference.
 

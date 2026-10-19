@@ -26,6 +26,34 @@ async def test_strict_resolution_does_not_fall_back(seeded_manager):
     assert await mgr.resolve_model_id_strict("Alpha Model") == "model-a.gguf"
 
 
+@pytest.mark.asyncio
+async def test_request_resolution_falls_back_to_loaded_model(seeded_manager):
+    """An inference request for an unknown model must use the resident model.
+
+    Regression: routing inference through ``resolve_model_id_strict`` turned an
+    unrecognised ``model`` value into a JIT load of a nonexistent model (503)
+    even though another model was already loaded and could serve the request.
+    """
+    from server import LoadedModel
+
+    mgr = seeded_manager
+    mgr.scan()
+
+    # Nothing is loaded yet: an unknown name has no fallback and must not invent one.
+    assert await mgr.resolve_request_model("does-not-exist.gguf") is None
+
+    lm = LoadedModel(model_id="model-b.gguf", gguf_path=Path("model-b.gguf"),
+                     config=mgr.models["model-b.gguf"], port=19002, process=None)
+    lm.ready = True
+    mgr.loaded["model-b.gguf"] = lm
+
+    assert await mgr.resolve_request_model("does-not-exist.gguf") == "model-b.gguf"
+    # A KNOWN model still resolves to itself rather than the resident fallback.
+    assert await mgr.resolve_request_model("model-a") == "model-a.gguf"
+    # Management/destructive paths keep the strict behaviour.
+    assert await mgr.resolve_model_id_strict("does-not-exist.gguf") is None
+
+
 def test_update_model_config_duplicate_name_does_not_mutate_live(client, seeded_manager):
     """A rejected rename must leave the live registry untouched (no sidecar, no 500 damage)."""
     mgr = seeded_manager
