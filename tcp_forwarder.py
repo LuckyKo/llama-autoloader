@@ -368,6 +368,18 @@ class RawTCPForwarder:
             return None
         method, path = parts[0], parts[1]
 
+        # Compatibility alias: clients whose base URL ends in /api request
+        # /api/v1/models, /api/v1/chat/completions, ... . Our FastAPI app and
+        # llama-server only serve /v1/..., so rewrite the request target BEFORE
+        # routing. This also makes inference requests pipe to the right backend:
+        # without it, /api/v1/chat/completions would fall through to FastAPI and 404.
+        normalized_path = self._normalize_api_prefix(path)
+        if normalized_path != path:
+            path = normalized_path
+            first_line = f"{method} {path} {parts[2]}".encode("utf-8")
+            # Preserve every header byte after the request line.
+            raw_headers = first_line + b"\r\n" + raw_headers.split(b"\r\n", 1)[1]
+
         # Read enough of the body to be confident about the model field: up to
         # min(content_length, _BODY_PREFIX_LIMIT) bytes. _BODY_PREFIX_LIMIT is raised from 4 KiB
         # because AC-style chat bodies carry a long system prompt + history BEFORE the model field;
@@ -566,13 +578,27 @@ class RawTCPForwarder:
         return bytes(prefix)
 
     @staticmethod
+    def _normalize_api_prefix(path: str) -> str:
+        """Map the ``/api/v1`` compatibility prefix onto the canonical ``/v1``.
+
+        Some OpenAI clients are configured with a base URL ending in ``/api`` and
+        therefore request ``/api/v1/models``, ``/api/v1/chat/completions``, etc.
+        Neither FastAPI nor llama-server exposes that extra segment, so without
+        this alias every such request 404s. Only ``/api/v1`` is rewritten; other
+        ``/api/...`` paths (and ``/api/v2/...``) are left untouched.
+        """
+        if path == "/api/v1" or path.startswith("/api/v1/") or path.startswith("/api/v1?"):
+            return path[len("/api"):]
+        return path
+
+    @staticmethod
     def _is_llm_endpoint(path: str) -> bool:
         """True for OpenAI-style generation endpoints that carry a `model` field.
 
         These are the requests we pipe straight to llama-server when the model is loaded.
         Accepts both bare (/chat/completions) and /v1-prefixed forms, plus a trailing path.
         """
-        p = path.split("?", 1)[0].rstrip("/")
+        p = RawTCPForwarder._normalize_api_prefix(path.split("?", 1)[0].rstrip("/"))
         for prefix in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings",
                        "/chat/completions", "/completions", "/embeddings"):
             if p == prefix or p.startswith(prefix + "/"):

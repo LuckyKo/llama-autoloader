@@ -112,6 +112,47 @@ class TestRoutingDecision:
         assert f._is_llm_endpoint("/v1/chat/completions") and f._extract_model(b"") is None
 
 
+# --------------------------------------------------------------------------- /api/v1 compatibility
+class TestApiPrefixAlias:
+    """Clients configured with a base URL ending in /api send /api/v1/... ."""
+
+    def test_normalizes_only_api_v1(self):
+        norm = RawTCPForwarder._normalize_api_prefix
+        assert norm("/api/v1/models") == "/v1/models"
+        assert norm("/api/v1/chat/completions?x=1") == "/v1/chat/completions?x=1"
+        assert norm("/api/v1") == "/v1"
+        assert norm("/api/v1/") == "/v1/"
+        # Canonical and unrelated paths are untouched.
+        assert norm("/v1/models") == "/v1/models"
+        assert norm("/api/v2/models") == "/api/v2/models"
+        assert norm("/apix/v1/models") == "/apix/v1/models"
+
+    def test_api_v1_llm_endpoint_is_recognised(self):
+        assert RawTCPForwarder._is_llm_endpoint("/api/v1/chat/completions")
+        assert RawTCPForwarder._is_llm_endpoint("/api/v1/embeddings?x=1")
+        assert not RawTCPForwarder._is_llm_endpoint("/api/v1/models")
+
+    def test_read_request_rewrites_request_line(self):
+        f = _fwd()
+        client, fwd_side, srv = _loopback_client()
+        req = b"GET /api/v1/models?x=1 HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+        client.sendall(req)
+        try:
+            parsed = _run_with_timeout(lambda: f._read_request(fwd_side), timeout=3.0)
+            assert parsed is not None
+            method, path, raw_headers, _ = parsed
+            assert method == "GET"
+            assert path == "/v1/models?x=1"
+            # The bytes actually forwarded must also carry the canonical path.
+            assert raw_headers.startswith(b"GET /v1/models?x=1 HTTP/1.1\r\n")
+        finally:
+            for s in (client, fwd_side, srv):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
 # --------------------------------------------------------------------------- _read_more_for_model
 class _FakeSock:
     """Minimal blocking-socket stand-in: serves pre-chunked body bytes, then EOF."""
