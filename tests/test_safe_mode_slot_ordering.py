@@ -8,16 +8,20 @@ directly. Covers:
     the FIFO queue and killing the engine (without the drain the save is cut
     mid-write — the orphan ``*.bin.<hash>.tmp`` symptom),
   * the drain is bounded: past the cap the kill proceeds anyway,
-  * a state/load landing right after a deliberate unload is refused with 409
-    instead of silently cold-reloading (and only inside that window),
+  * a state/load landing while a deliberate unload is IN PROGRESS is refused with
+    409 instead of silently cold-reloading — and the flag's lifetime is exactly
+    the teardown, so the legitimate post-unload restore that the safe-mode
+    contract issues right after ``unload_all`` returns 200 IS accepted (the
+    10 s wall-clock window this replaces refused it: KV lost, full reload),
   * _perform_slot_action stops retrying other endpoint formats when the
     engine is unreachable, but still retries them on an HTTP error,
   * the temp sweep removes only stale ``*.bin.<hash>.tmp`` files and never
     touches ``.bin`` state files.
 
-Constants (SLOT_ACTION_DRAIN_TIMEOUT_S / RECENT_UNLOAD_REFUSE_WINDOW_S /
-STATE_TEMP_MAX_AGE_S) are read from the live `server` module — never hardcoded —
-so a change to a bound is visible to these tests.
+Constants (SLOT_ACTION_DRAIN_TIMEOUT_S / STATE_TEMP_MAX_AGE_S) are read from the live
+`server` module — never hardcoded — so a change to a bound is visible to these tests.
+There is no refusal bound any more: the refusal is gated on the model's
+`_unload_in_progress` flag.
 """
 from __future__ import annotations
 
@@ -37,9 +41,9 @@ from server import (
 )
 import httpx
 
-# Assert against the live values, never hardcode: this one is imported, the others
-# are read as server.X or patched inside the test that cares about them.
-RECENT_UNLOAD_REFUSE_WINDOW_S = server.RECENT_UNLOAD_REFUSE_WINDOW_S
+# Assert against the live values, never hardcode: constants are imported or read
+# as server.X inside the test that cares about them. There is no refusal bound
+# any more — the refusal is gated on the model's `_unload_in_progress` flag.
 
 
 @pytest.fixture()
@@ -105,6 +109,27 @@ async def wait_until(pred, what: str, deadline: float = 2.0):
         await asyncio.sleep(0.01)
 
 
+def slow_slot_save(order: list[str], save_secs: float):
+    """An ``_perform_slot_save`` stand-in that stays in flight for ``save_secs``.
+
+    Records ``slot-action-finished`` when it returns, so a test can see whether an
+    unload waited for it before dropping the queue.
+    """
+    async def _save(port, path, timeout=None):
+        await asyncio.sleep(save_secs)
+        order.append("slot-action-finished")
+    return AsyncMock(side_effect=_save)
+
+
+async def start_save_in_flight(mgr, order: list[str]):
+    """Start a state save and wait until it holds a granted ticket (19500 is the
+    fixture model's port). The caller patches ``_perform_slot_save`` around this
+    and awaits the returned task after its own assertions."""
+    save_task = asyncio.create_task(mgr.save_state("m.gguf", "lbl"))
+    await wait_until(lambda: mgr._inflight_slot_actions.get(19500, 0) == 1, "save in flight")
+    return save_task
+
+
 # ===========================================================================
 # Unload drains an in-flight slot action before killing the engine
 # ===========================================================================
@@ -115,14 +140,8 @@ class TestUnloadDrain:
         """A save holding a granted ticket must finish before the queue is dropped."""
         order: list[str] = []
 
-        async def slow_save(port, path, timeout=None):
-            await asyncio.sleep(0.2)
-            order.append("slot-action-finished")
-
-        with patch.object(mgr, "_perform_slot_save", new=AsyncMock(side_effect=slow_save)):
-            save_task = asyncio.create_task(mgr.save_state("m.gguf", "lbl"))
-            await wait_until(lambda: mgr._inflight_slot_actions.get(19500, 0) == 1, "save in flight")
-
+        with patch.object(mgr, "_perform_slot_save", new=slow_slot_save(order, 0.2)):
+            save_task = await start_save_in_flight(mgr, order)
             _watch_queue_removals(mgr, order)
             await mgr.unload_model("m.gguf")
             await save_task
@@ -193,21 +212,54 @@ class TestUnloadDrain:
 
 
 # ===========================================================================
-# load_state refuses to auto-load a deliberately released endpoint
+# load_state refuses ONLY while an unload is in progress; the post-unload
+# restore (the safe-mode contract's own) is accepted
 # ===========================================================================
 
 
-class TestRecentUnloadRefusal:
-    async def test_load_state_refused_after_recent_unload(self, mgr):
+class TestUnloadInProgressRefusal:
+    async def test_load_state_refused_while_unload_in_progress(self, mgr, autoloader_logs):
+        """The guard itself: with the flag set (as an in-progress release does),
+        a state/load is refused instead of cold-reloading the released model.
+        The log line must name the label — the old one carried no caller, which
+        is what made the original 409s attributable only by exclusion."""
         (mgr.save_state_dir / "m.gguf.lbl.bin").write_bytes(b"state")
-        await mgr.unload_model("m.gguf")
+        await mgr.unload_model("m.gguf")  # model out of self.loaded
+        mgr._unload_in_progress.add("m.gguf")  # a deliberate release mid-teardown
         with pytest.raises(HTTPException) as exc:
             await mgr.load_state("m.gguf", "lbl")
         assert exc.value.status_code == 409
-        assert "deliberately released" in exc.value.detail
+        assert "unload in progress" in exc.value.detail
+        assert any("label 'lbl'" in m for m in autoloader_logs), \
+            "the refusal must identify the state label it refused"
 
-    async def test_refusal_window_is_bounded(self, mgr):
-        """Outside the window the old auto-load-before-restore behavior stands."""
+    async def test_flag_lifetime_is_exactly_the_teardown(self, mgr, autoloader_logs):
+        """The flag is set while the teardown runs (armed before the queue drop
+        and the kill) and cleared once they complete — that clear-point is the
+        discriminator between a racing restore and the legitimate one."""
+        order: list[str] = []
+
+        with patch.object(mgr, "_perform_slot_save", new=slow_slot_save(order, 0.2)):
+            save_task = await start_save_in_flight(mgr, order)
+
+            _watch_queue_removals(mgr, order)
+            unload = asyncio.create_task(mgr.unload_model("m.gguf"))
+            await wait_until(lambda: "m.gguf" in mgr._unload_in_progress, "flag armed")
+            assert order == [], "flag must be armed before the teardown drops the queue"
+            await unload
+            await save_task
+
+        assert "m.gguf" not in mgr._unload_in_progress, "flag must clear once the kill completes"
+        assert order == ["slot-action-finished", "queue-dropped"]
+
+    async def test_legitimate_post_unload_restore_is_accepted(self, mgr):
+        """THE missing symmetry the old 10 s window failed: the safe-mode
+        contract's own restore lands right after unload_all returns 200 and must
+        be accepted (the old window refused it → KV lost, full reload + reprocess).
+        """
+        (mgr.save_state_dir / "m.gguf.lbl.bin").write_bytes(b"state")
+        await mgr.unload_model("m.gguf")  # model out of self.loaded, flag cleared
+        assert mgr._unload_in_progress == set(), "a completed unload must not refuse anything"
 
         async def fake_load(model_id):
             lm = MagicMock()
@@ -216,15 +268,11 @@ class TestRecentUnloadRefusal:
             mgr.loaded["m.gguf"] = lm
             return lm
 
-        (mgr.save_state_dir / "m.gguf.lbl.bin").write_bytes(b"state")
-        await mgr.unload_model("m.gguf")  # model out of self.loaded, marker armed
-        mgr._recent_unload["m.gguf"] = time.monotonic() - (RECENT_UNLOAD_REFUSE_WINDOW_S + 1)
-
         load_model = AsyncMock(side_effect=fake_load)
         with patch.object(mgr, "load_model", new=load_model), \
              patch.object(mgr, "_perform_slot_restore", new=AsyncMock()):
             path = await mgr.load_state("m.gguf", "lbl")
-        assert load_model.call_count == 1, "never took the auto-load path"
+        assert load_model.call_count == 1, "the restore must take the pre-existing auto-load path"
         assert path.name == "m.gguf.lbl.bin"
 
 

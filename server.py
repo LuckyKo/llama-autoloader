@@ -26,7 +26,7 @@ import platform
 import threading
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 import psutil
@@ -583,9 +583,12 @@ LEGACY_CARDS_DIRS = ("./strata_cards",)
 # Bounded wait for an in-flight slot action (save/restore) that holds a granted
 # FIFO ticket to finish before an unload drops the queue and kills its engine.
 SLOT_ACTION_DRAIN_TIMEOUT_S = 15.0
-# Window in which a state/load arriving right after a deliberate unload is
-# refused (409) instead of silently cold-reloading the just-released model.
-RECENT_UNLOAD_REFUSE_WINDOW_S = 10.0
+# A state/load landing WHILE a deliberate unload is in progress is refused (409)
+# instead of silently cold-reloading the just-released model. The guard is the
+# unload itself, not a wall-clock window: the safe-mode contract (save -> unload
+# -> command -> restore) legitimately lands its restore right AFTER the unload
+# returns 200, and any window long enough to cover a slow command would also
+# refuse that restore.
 # Age past which the engine's interrupted-save scratch files (*.bin.<hash>.tmp)
 # are swept from states/. Nothing else ever reclaims them.
 STATE_TEMP_MAX_AGE_S = 3600.0
@@ -701,10 +704,13 @@ class ModelManager:
         # and only ever polled by the drain — it is never awaited on, so it cannot
         # participate in a lock cycle.
         self._inflight_slot_actions: Dict[int, int] = {}
-        # model_id -> time.monotonic() of the most recent deliberate unload, so a
-        # state/load landing right after one is refused with 409 instead of
-        # silently cold-reloading the model the caller just released.
-        self._recent_unload: Dict[str, float] = {}
+        # model_ids whose deliberate unload is IN PROGRESS: armed at the start of
+        # _unload_unlocked and cleared only once the queue drop and process kill
+        # complete. A state/load landing during that window is refused with 409
+        # instead of cold-reloading the model the caller just released; a restore
+        # landing after the unload finished is the legitimate safe-mode one and
+        # is allowed through.
+        self._unload_in_progress: Set[str] = set()
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
@@ -1696,10 +1702,10 @@ class ModelManager:
                 self.loaded[model_id].touch()
                 return self.loaded[model_id]
 
-            # A load in flight cancels the "recently released" refusal: a
-            # state/load landing during this load must join it through the
-            # dedup below, not be told the endpoint was deliberately released.
-            self._recent_unload.pop(model_id, None)
+            # A load in flight cancels the "unloading" refusal: a state/load
+            # landing during this load must join it through the dedup below,
+            # not be told the endpoint was deliberately released.
+            self._unload_in_progress.discard(model_id)
 
             if model_id in self._loading_tasks and not self._loading_tasks[model_id].done():
                 task = self._loading_tasks[model_id]
@@ -1857,20 +1863,34 @@ class ModelManager:
             return
         self._invalidate_status()  # Force status cache rebuild on next request
         log.info(f"Unloading {model_id} (port {lm.port})")
-        # The model is gone from self.loaded now, so record the release
-        # immediately: a state/load landing before the refuse window expires
-        # gets a 409 rather than a silent cold reload.
-        # Only DELIBERATE releases arm the window. _unload_unlocked is also
+        # Mark the release as IN PROGRESS: a state/load landing while this
+        # method runs would cold-reload the endpoint the caller just released —
+        # a full model load plus a full prompt reprocess. manager._lock spans
+        # this whole teardown, so no caller can observe the flag mid-unload:
+        # this is a race backstop, not the mechanism that closed BUG_0089
+        # (see .agent_lessons/unload-in-progress-flag-replaces-recent-unload-window.md).
+        # Only DELIBERATE releases set the flag. _unload_unlocked is also
         # reached from a load in flight (force-reload, failed-load and
         # cancelled-load cleanup); a state/load landing during such a load
         # must join it through the load path, not be refused.
         loading_now = self._loading_tasks.get(model_id)
-        if not (loading_now and not loading_now.done()):
-            self._recent_unload[model_id] = time.monotonic()
-        for mid, ts in list(self._recent_unload.items()):
-            if time.monotonic() - ts > RECENT_UNLOAD_REFUSE_WINDOW_S:
-                del self._recent_unload[mid]
+        deliberate = not (loading_now and not loading_now.done())
+        if deliberate:
+            self._unload_in_progress.add(model_id)
+        try:
+            await self._unload_finish(lm, model_id)
+        finally:
+            # Clear the flag only once _unload_finish has run to completion —
+            # queue dropped and process killed. Past that point a state/load is
+            # the legitimate post-command restore of the safe-mode contract and
+            # must be allowed, so this is the discriminator, not a timer.
+            # try/finally: an exception part-way through the teardown must not
+            # leave the flag set forever and refuse every later restore.
+            if deliberate:
+                self._unload_in_progress.discard(model_id)
 
+    async def _unload_finish(self, lm: LoadedModel, model_id: str):
+        """Complete an unload: auto-save, drain, drop the queue, kill, clean up."""
         # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
         # card must never trigger it (even if the global default_auto_save_state is True).
         # NOTE: intentionally NOT routed through the FIFO ticket queue. This is a teardown
@@ -2226,23 +2246,23 @@ class ModelManager:
             lm = self.loaded.get(model_id)
 
         if lm is None or not lm.ready:
-            # This endpoint was deliberately released moments ago. Silently
-            # cold-reloading here is what made a racing/abandoned restore look
-            # like a success while burning a full model load; refuse instead so
-            # the caller can decide (409 = conflict with the release request).
-            released_at = self._recent_unload.get(model_id)
-            if released_at is not None:
-                since = time.monotonic() - released_at
-                if since < RECENT_UNLOAD_REFUSE_WINDOW_S:
-                    log.info(
-                        f"Refusing state restore for '{model_id}': endpoint deliberately released "
-                        f"{since:.1f}s ago"
-                    )
-                    raise HTTPException(
-                        409,
-                        f"endpoint deliberately released: model '{model_id}' was unloaded "
-                        f"{since:.1f}s ago; reload it explicitly if a state restore is intended",
-                    )
+            # This endpoint is being released right now. Silently cold-reloading
+            # here is what made a racing/abandoned restore look like a success
+            # while burning a full model load; refuse instead so the caller can
+            # decide (409 = conflict with the release request). Once the unload
+            # has completed the flag is cleared and the restore is allowed —
+            # that is the legitimate post-command restore of the safe-mode
+            # contract, which by design lands seconds after unload_all returns.
+            if model_id in self._unload_in_progress:
+                log.info(
+                    f"Refusing state restore for '{model_id}' (label '{label}'): an unload of "
+                    f"this endpoint is still in progress"
+                )
+                raise HTTPException(
+                    409,
+                    f"unload in progress: model '{model_id}' is being released; reload it "
+                    f"explicitly if a state restore is intended",
+                )
             log.info(f"Auto-loading model '{model_id}' before state restore")
             try:
                 lm = await asyncio.wait_for(self.load_model(model_id), timeout=60.0)
