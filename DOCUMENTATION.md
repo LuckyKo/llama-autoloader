@@ -72,7 +72,7 @@ gpu:
 launcher:
   base_port: 9001
   host: 127.0.0.1
-  port: 9123
+  port: 9124
 
 llama_server:
   backends_dir: ./backends
@@ -93,7 +93,7 @@ models:
 - **gpu.poll_interval_seconds**: How often to query GPU status via `nvidia-smi` (default: 2)
 - **launcher.base_port**: First port allocated for llama-server instances (default: 9001)
 - **launcher.host**: Host address for the autoloader itself (default: 127.0.0.1)
-- **launcher.port**: Port for the autoloader's REST API and proxy endpoints (default: 9123)
+- **launcher.port**: Port for the autoloader's REST API and proxy endpoints (default: 9124)
 - **llama_server.backends_dir**: Directory containing llama-server builds (subdirectories)
 - **llama_server.binary**: Fallback binary name/path if no backend is selected
 - **llama_server.default_args**: Space-separated string of arguments passed to every llama-server instance
@@ -135,7 +135,7 @@ Each model can have an optional sidecar config file named `model.gguf.json` plac
 | `args` | string | `""` | Extra CLI arguments appended to llama-server command line |
 | `ctx_size` | int | `8192` | Context window size (`--ctx-size`) |
 | `n_gpu_layers` | int | `999` | Number of layers to offload to GPU (`--n-gpu-layers`) |
-| `default` | bool | `false` | Use this model when API requests omit the `model` field |
+| `default` | bool | `false` | Informational default marker; LLM proxy requests must still name a model |
 | `pinned` | bool | `false` | Never auto-unload this model (exempt from LRU eviction) |
 | `auto_save_state` | bool | `false` | Auto save/restore KV cache state on model unload/load |
 | `backend` | string | `""` | Force a specific backend build for this model (folder name in `backends/`) |
@@ -253,7 +253,7 @@ This means model-specific args are appended after global defaults, allowing them
 
 ## API Reference
 
-**Base URL:** `http://127.0.0.1:9123`
+**Base URL:** `http://127.0.0.1:9124`
 
 All endpoints return JSON unless otherwise noted. Models are automatically loaded (JIT) on first inference request if not already loaded.
 
@@ -587,12 +587,12 @@ API. Examples:
 
 ```bash
 # Via autoloader proxy (correct shape: action in query, filename in body)
-curl -X POST 'http://127.0.0.1:9123/v1/raw/mymodel/slots/0?action=save' \
+curl -X POST 'http://127.0.0.1:9124/v1/raw/mymodel/slots/0?action=save' \
   -H "Content-Type: application/json" \
   -d '{"filename":"test.bin"}'
 
 # WRONG -> HTTP 400: filename belongs in the body, not the query string
-curl "http://127.0.0.1:9123/v1/raw/mymodel/slots/0?action=save&filename=test.bin"
+curl "http://127.0.0.1:9124/v1/raw/mymodel/slots/0?action=save&filename=test.bin"
 
 # Direct llama-server (if you know the port)
 curl -X POST 'http://127.0.0.1:9001/slots/0?action=save' \
@@ -727,7 +727,7 @@ Get current autoloader runtime settings.
   "poll_interval_seconds": 2,
   "base_port": 9001,
   "host": "127.0.0.1",
-  "port": 9123,
+  "port": 9124,
   "default_args": "--no-webui --parallel 1 --jinja",
   "selected_backend": "llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.27.0"
 }
@@ -759,7 +759,7 @@ Connect for live status updates. The server pushes a full status snapshot (same 
 
 **Usage:**
 ```javascript
-const ws = new WebSocket("ws://127.0.0.1:9123/ws");
+const ws = new WebSocket("ws://127.0.0.1:9124/ws");
 ws.onmessage = (event) => {
   const status = JSON.parse(event.data);
   console.log(status.loaded_models, status.gpu_info);
@@ -833,12 +833,12 @@ You can manually save and restore slot state using the autoloader's proxy endpoi
 **Via autoloader:**
 ```bash
 # Save state
-curl -X POST http://127.0.0.1:9123/v1/models/mymodel/state/save \
+curl -X POST http://127.0.0.1:9124/v1/models/mymodel/state/save \
   -H "Content-Type: application/json" \
   -d '{"label": "mysave"}'
 
 # Load state
-curl -X POST http://127.0.0.1:9123/v1/models/mymodel/state/load \
+curl -X POST http://127.0.0.1:9124/v1/models/mymodel/state/load \
   -H "Content-Type: application/json" \
   -d '{"label": "mysave"}'
 ```
@@ -864,16 +864,16 @@ Note: If the model is not loaded when restoring state, it will be automatically 
 
 ### Step-by-Step Example: Full Save/Restore Cycle
 
-The following example demonstrates the complete lifecycle. All autoloader endpoints use port **9123**. Direct llama-server calls use the dynamic port returned by the load endpoint (shown as `$PORT`).
+The following example demonstrates the complete lifecycle. All autoloader endpoints use port **9124**. Direct llama-server calls use the dynamic port returned by the load endpoint (shown as `$PORT`).
 
 **Step 0: Ensure clean state**
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/mymodel/unload
+curl -X POST http://127.0.0.1:9124/v1/models/mymodel/unload
 ```
 
 **Step 1: Load model via autoloader**
 ```bash
-RESP=$(curl -s -X POST http://127.0.0.1:9123/v1/models/mymodel/load)
+RESP=$(curl -s -X POST http://127.0.0.1:9124/v1/models/mymodel/load)
 PORT=$(echo $RESP | jq -r '.port')
 echo "Loaded on port $PORT"
 ```
@@ -885,7 +885,7 @@ curl "http://127.0.0.1:$PORT/slots/0?action=reset"
 
 **Step 3: Send initial prompt via autoloader proxy**
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/chat/completions \
+curl -X POST http://127.0.0.1:9124/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mymodel",
@@ -896,7 +896,7 @@ curl -X POST http://127.0.0.1:9123/v1/chat/completions \
 
 **Step 4: Save slot state (via autoloader)**
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/mymodel/state/save \
+curl -X POST http://127.0.0.1:9124/v1/models/mymodel/state/save \
   -H "Content-Type: application/json" \
   -d '{"label": "mysave"}'
 ```
@@ -911,18 +911,18 @@ curl -X POST "http://127.0.0.1:$PORT/slots/0?action=save" \
 
 **Step 5: Unload model**
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/mymodel/unload
+curl -X POST http://127.0.0.1:9124/v1/models/mymodel/unload
 ```
 
 **Step 6: Reload model**
 ```bash
-RESP=$(curl -s -X POST http://127.0.0.1:9123/v1/models/mymodel/load)
+RESP=$(curl -s -X POST http://127.0.0.1:9124/v1/models/mymodel/load)
 PORT=$(echo $RESP | jq -r '.port')
 ```
 
 **Step 7: Restore slot state (via autoloader)**
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/mymodel/state/load \
+curl -X POST http://127.0.0.1:9124/v1/models/mymodel/state/load \
   -H "Content-Type: application/json" \
   -d '{"label": "mysave"}'
 ```
@@ -937,7 +937,7 @@ curl -X POST "http://127.0.0.1:$PORT/slots/0?action=restore" \
 
 **Step 8: Continue conversation via autoloader (should use restored KV cache)**
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/chat/completions \
+curl -X POST http://127.0.0.1:9124/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mymodel",

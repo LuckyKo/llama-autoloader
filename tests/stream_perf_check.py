@@ -16,7 +16,6 @@ available.
 import argparse
 import urllib.request
 import json
-import os
 import time
 
 DEFAULT_BASE = "http://127.0.0.1:9126"
@@ -51,7 +50,7 @@ def main():
         ],
     }).encode()
     req = urllib.request.Request(
-        BASE + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
+        base + "/v1/chat/completions", data=body, headers={"Content-Type": "application/json"})
 
     t0 = time.time()
     r = urllib.request.urlopen(req, timeout=300)

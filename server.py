@@ -12,18 +12,23 @@ llama-autoloader: a JIT model loader + OpenAI-compatible proxy for llama.cpp.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import math
 import os
+import shlex
 import shutil
 import signal
 import socket
 import struct
 import subprocess
+import tempfile
 import time
 import logging
 import platform
+import re
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -32,7 +37,7 @@ import httpx
 import psutil
 import yaml
 from fastapi import (
-    FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect,
+    FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect,
 )
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -52,6 +57,7 @@ from bridge_adapter import _launch_llama, _launch_bridge, _expand_token
 # Per-model FIFO ticket queue: orders LLM requests (TCP forwarder) against state
 # save/restore (FastAPI) so a restore enqueued first runs before the next request.
 from model_queue import ModelQueueRegistry
+from tcp_forwarder import RawTCPForwarder
 
 # Legacy launch template used ONLY when migrating a pre-registry ``strata:`` section into
 # ``engines.strata``. New engines must supply their own ``argv`` (there is no generic default).
@@ -156,15 +162,15 @@ def _read_gguf_info(gguf_path) -> Dict[str, Any]:
                 return empty
 
             def read_str():
-                l = struct.unpack('<Q', f.read(8))[0]
-                return f.read(l).decode('utf-8', errors='replace')
+                length = struct.unpack('<Q', f.read(8))[0]
+                return f.read(length).decode('utf-8', errors='replace')
 
             def skip_val(vtype):
                 if vtype in _GGUF_FIXED_WIDTH:
                     f.seek(_GGUF_FIXED_WIDTH[vtype], 1)
                 elif vtype == 8:
-                    l = struct.unpack('<Q', f.read(8))[0]
-                    f.seek(l, 1)
+                    length = struct.unpack('<Q', f.read(8))[0]
+                    f.seek(length, 1)
                 elif vtype == 9:
                     itype, ilen = struct.unpack('<IQ', f.read(12))
                     if itype in _GGUF_FIXED_WIDTH:
@@ -186,11 +192,16 @@ def _read_gguf_info(gguf_path) -> Dict[str, Any]:
                 elif key == 'general.type' and vtype == 8:
                     gguf_type = read_str()
                 elif key.endswith('.context_length'):
-                    if vtype == 4: max_ctx = struct.unpack('<I', f.read(4))[0]
-                    elif vtype == 10: max_ctx = struct.unpack('<Q', f.read(8))[0]
-                    elif vtype == 5: max_ctx = struct.unpack('<i', f.read(4))[0]
-                    elif vtype == 11: max_ctx = struct.unpack('<q', f.read(8))[0]
-                    else: skip_val(vtype)
+                    if vtype == 4:
+                        max_ctx = struct.unpack('<I', f.read(4))[0]
+                    elif vtype == 10:
+                        max_ctx = struct.unpack('<Q', f.read(8))[0]
+                    elif vtype == 5:
+                        max_ctx = struct.unpack('<i', f.read(4))[0]
+                    elif vtype == 11:
+                        max_ctx = struct.unpack('<q', f.read(8))[0]
+                    else:
+                        skip_val(vtype)
                 else:
                     skip_val(vtype)
                 # Stop as soon as we have everything the callers use. ``gguf_type`` is
@@ -393,6 +404,73 @@ def _classify_model_type(gguf_path: Optional[Path], info: Dict[str, Any],
     return MODEL_TYPE_TEXT
 
 # --------------------------------------------------------------------------
+# Small filesystem / argv helpers
+# --------------------------------------------------------------------------
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """Write ``text`` to ``path`` atomically (temp file + os.replace).
+
+    Config, sidecar and card writes used to truncate the live file before the
+    new content was durable; a crash or a full disk mid-write could leave an
+    unreadable file behind. The temp file lives in the same directory so
+    ``os.replace`` stays atomic on every platform we support.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="\n") as f:
+            f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # Some network/special filesystems do not implement fsync.
+                # os.replace below is still enough to avoid partial files.
+                pass
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _split_launch_args(raw: str) -> List[str]:
+    """Split a user-supplied argv string without breaking quoted Windows paths.
+
+    ``str.split()`` turned ``--lora "C:\\models\\my lora.gguf"`` into two
+    arguments. shlex with ``posix=False`` preserves backslashes but keeps the
+    surrounding quotes, so strip one matching quote pair from each token.
+    """
+    if not raw or not raw.strip():
+        return []
+    if os.name != "nt":
+        return shlex.split(raw)
+    try:
+        parts = shlex.split(raw, posix=False)
+    except ValueError:
+        # Unbalanced quotes: fall back to whitespace splitting rather than
+        # refusing to launch the engine entirely.
+        return raw.split()
+    out: List[str] = []
+    for part in parts:
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in ("'", '"'):
+            part = part[1:-1]
+        out.append(part)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Data models
 # --------------------------------------------------------------------------
 @dataclass
@@ -469,7 +547,9 @@ class ModelConfig:
         sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
         if sidecar.exists():
             try:
-                data = json.loads(sidecar.read_text())
+                # Explicit UTF-8: the Windows default is cp1252, which either
+                # mojibakes or rejects hand-edited/foreign non-ASCII sidecars.
+                data = json.loads(sidecar.read_text(encoding="utf-8-sig"))
                 # Merge with defaults so missing fields don't break things.
                 base = cls.default_for(gguf_path)
                 for k, v in data.items():
@@ -488,7 +568,7 @@ class ModelConfig:
     def save(self, gguf_path: Path) -> None:
         sidecar = gguf_path.with_suffix(gguf_path.suffix + ".json")
         data = {k: v for k, v in asdict(self).items() if k not in self.DERIVED_FIELDS}
-        sidecar.write_text(json.dumps(data, indent=2))
+        _atomic_write_text(sidecar, json.dumps(data, indent=2, ensure_ascii=False))
 
     def save_engine_card(self, card_path: Path) -> None:
         """Write the editable card-overlay fields to a bridge card file.
@@ -511,7 +591,10 @@ class ModelConfig:
             # Self-describing: lets each card file record its engine config path.
             "engine_config": self.engine_config,
         }
-        card_path.write_text(json.dumps(card, indent=2))
+        _atomic_write_text(
+            card_path,
+            json.dumps(card, indent=2, ensure_ascii=False),
+        )
 
     def to_launch_args(self, model_path: Path, port: int, extra_default_args: str, mmproj_full_path: Optional[Path] = None, slot_save_dir: Optional[Path] = None, model_id: Optional[str] = None) -> List[str]:
         """Build argv for llama-server."""
@@ -530,9 +613,9 @@ class ModelConfig:
         if slot_save_dir:
             argv += ["--slot-save-path", str(slot_save_dir)]
         if extra_default_args:
-            argv += extra_default_args.split()
+            argv += _split_launch_args(extra_default_args)
         if self.args:
-            argv += self.args.split()
+            argv += _split_launch_args(self.args)
         return argv
 
 
@@ -548,6 +631,10 @@ class LoadedModel:
     ready: bool = False
     pid: int = 0
     state_path: Optional[Path] = None
+    # In-flight LLM requests currently being relayed to this engine. Used by
+    # both the idle reaper and LRU eviction so a long generation is never
+    # killed just because another model wants the slot.
+    active_requests: int = 0
 
     def touch(self):
         self.last_used = time.time()
@@ -873,6 +960,10 @@ class ModelManager:
                 exe = b_dir / "llama-server"
             if exe.exists():
                 return str(exe)
+            log.warning(
+                "Model backend '%s' was configured but not found under %s; "
+                "falling back to the global/default backend",
+                model_cfg.backend, self.backends_dir)
 
         # Priority 2: Global selected backend
         if self.selected_backend:
@@ -882,6 +973,10 @@ class ModelManager:
                 exe = b_dir / "llama-server"
             if exe.exists():
                 return str(exe)
+            log.warning(
+                "selected_backend '%s' was configured but not found under %s; "
+                "falling back to the first available/default binary",
+                self.selected_backend, self.backends_dir)
 
         # Priority 3: First available scanned backend
         scanned = self.list_backends()
@@ -1021,6 +1116,26 @@ class ModelManager:
             return 500 + len(p if p in m else m)
         return 0
 
+    def _mmproj_pairing_context(self, mid: str, p: Path,
+                                model_type: Optional[str] = None) -> Dict[str, List[str]]:
+        """Eligibility context for :meth:`_pair_mmproj` (single source for scan/update).
+
+        A projector is contested when several non-auxiliary models could claim it;
+        passing the siblings/others lets ``_pair_mmproj`` refuse an ambiguous match.
+        """
+        eligible_by_dir: Dict[Path, List[str]] = {}
+        eligible_all: List[str] = []
+        for other_mid, other_path in self.gguf_paths.items():
+            other_type = (model_type if other_mid == mid else
+                          (self.models[other_mid].model_type or MODEL_TYPE_TEXT))
+            if other_type not in MODEL_TYPE_AUXILIARY:
+                eligible_by_dir.setdefault(other_path.parent, []).append(other_path.stem)
+                eligible_all.append(other_path.stem)
+        return {
+            "eligible_siblings": [s for s in eligible_by_dir.get(p.parent, []) if s != p.stem],
+            "eligible_others": [s for s in eligible_all if s != p.stem],
+        }
+
     def _pair_mmproj(self, p: Path, cfg: "ModelConfig", mmproj_paths: List[Path],
                      *, eligible_siblings: Optional[List[str]] = None,
                      eligible_others: Optional[List[str]] = None) -> Optional[Path]:
@@ -1040,7 +1155,8 @@ class ModelManager:
             "exactly one projector exists" fallback.
 
         Both default to None, which preserves the historical unconditional behaviour.
-        scan() supplies them; tests and update_config() do not.
+        scan() and update_config() both supply them via
+        :meth:`_mmproj_pairing_context`; tests may omit them.
         """
         # Auxiliary components are never AUTO-paired. A draft/MTP model or an audio codec
         # has no vision tower, so attaching a projector is always wrong - it produced a
@@ -1303,6 +1419,12 @@ class ModelManager:
 
         for p in model_paths:
             mid = p.name  # use filename as id
+            if mid in found:
+                log.warning(
+                    "Duplicate model filename '%s': keeping %s and skipping %s "
+                    "(model ids are filenames; rename one file to expose both)",
+                    mid, self.gguf_paths.get(mid), p)
+                continue
             cfg = ModelConfig.load(p)
             found[mid] = cfg
             self.gguf_paths[mid] = p
@@ -1327,23 +1449,15 @@ class ModelManager:
         # Auto-pair vision projectors with sibling models. Runs AFTER classification so
         # _pair_mmproj knows which models are auxiliary components that must never be
         # paired, and so it can see the other candidates in each directory.
-        eligible_by_dir: Dict[Path, List[str]] = {}
-        eligible_all: List[str] = []
-        for mid, p in self.gguf_paths.items():
-            if (self.models[mid].model_type or MODEL_TYPE_TEXT) not in MODEL_TYPE_AUXILIARY:
-                eligible_by_dir.setdefault(p.parent, []).append(p.stem)
-                eligible_all.append(p.stem)
         self.mmproj_source = {}
         for mid, p in self.gguf_paths.items():
             cfg = self.models[mid]
-            ctx = {
-                "eligible_siblings": [s for s in eligible_by_dir.get(p.parent, []) if s != p.stem],
-                "eligible_others": [s for s in eligible_all if s != p.stem],
-            }
             # Read provenance BEFORE pairing: the write two lines below stamps an inferred
             # name into cfg.mmproj_file, which would make "auto" look "explicit" forever.
             explicit = bool((cfg.mmproj_file or "").strip())
-            paired_mmproj = self._pair_mmproj(p, cfg, mmproj_paths, **ctx)
+            paired_mmproj = self._pair_mmproj(
+                p, cfg, mmproj_paths,
+                **self._mmproj_pairing_context(mid, p))
             if paired_mmproj:
                 self.mmproj_paths[mid] = paired_mmproj
                 self.mmproj_source[mid] = "explicit" if explicit else "auto"
@@ -1367,24 +1481,49 @@ class ModelManager:
                  f"types: {counts}")
         return list(self.models.keys())
 
-    async def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+    def _lookup_model_locked(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+        """Exact id / stem / display-name lookup. Caller must hold ``self._lock``."""
+        if not model_id_or_alias:
+            return None
+        if model_id_or_alias in self.models:
+            return model_id_or_alias
+        # Match without .gguf suffix, stem, or lowercased name
+        target_lower = model_id_or_alias.lower()
+        for mid, cfg in self.models.items():
+            stem = Path(mid).stem.lower()
+            # Order: exact filename -> stem/full id -> editable display name.
+            # gguf_name is intentionally NOT a request alias here: it is the
+            # GGUF's internal general.name, shared across quants of the same
+            # base model, so using it would let one model silently resolve to
+            # another (cross-model collision). It stays display-only metadata.
+            if target_lower == stem or target_lower == mid.lower():
+                return mid
+            if cfg.name and target_lower == cfg.name.lower():
+                return mid
+        return None
+
+    async def resolve_model_id_strict(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+        """Resolve an EXPLICIT model reference, or return None.
+
+        Destructive/management endpoints and explicit ``model`` fields must use
+        this variant: silently substituting a different model for a typo is how
+        DELETE/raw/port/state calls ended up acting on an unrelated resident
+        model. Only :meth:`resolve_model_id` keeps the "omitted model" fallback.
+        """
         async with self._lock:
-            if model_id_or_alias:
-                if model_id_or_alias in self.models:
-                    return model_id_or_alias
-                # Match without .gguf suffix, stem, or lowercased name
-                target_lower = model_id_or_alias.lower()
-                for mid, cfg in self.models.items():
-                    stem = Path(mid).stem.lower()
-                    # Order: exact filename -> stem/full id -> editable display name.
-                    # gguf_name is intentionally NOT a request alias here: it is the
-                    # GGUF's internal general.name, shared across quants of the same
-                    # base model, so using it would let one model silently resolve to
-                    # another (cross-model collision). It stays display-only metadata.
-                    if target_lower == stem or target_lower == mid.lower():
-                        return mid
-                    if cfg.name and target_lower == cfg.name.lower():
-                        return mid
+            return self._lookup_model_locked(model_id_or_alias)
+
+    async def resolve_model_id(self, model_id_or_alias: Optional[str]) -> Optional[str]:
+        """Resolve a model, with a default fallback for an OMITTED reference.
+
+        Use this only when ``None``/empty means "pick a sensible default" (for
+        example an OpenAI request without a ``model`` field). Explicit endpoint
+        paths must use :meth:`resolve_model_id_strict`.
+        """
+        async with self._lock:
+            match = self._lookup_model_locked(model_id_or_alias)
+            if match:
+                return match
 
             # Fallback resolution (for generic model names, missing model param, or unmatched aliases)
             if self.loaded:
@@ -1474,7 +1613,7 @@ class ModelManager:
         return out
 
     async def get_config(self, model_id_or_alias: str) -> Optional[ModelConfig]:
-        mid = await self.resolve_model_id(model_id_or_alias)
+        mid = await self.resolve_model_id_strict(model_id_or_alias)
         if not mid:
             return None
         await self._ensure_gguf_name(mid)
@@ -1511,7 +1650,7 @@ class ModelManager:
             self._apply_gguf_info(cfg, path, mid, info)
 
     async def update_config(self, model_id_or_alias: str, new_cfg: ModelConfig) -> ModelConfig:
-        mid = await self.resolve_model_id(model_id_or_alias)
+        mid = await self.resolve_model_id_strict(model_id_or_alias)
         if not mid:
             raise KeyError(model_id_or_alias)
         async with self._lock:
@@ -1520,6 +1659,11 @@ class ModelManager:
             cfg = self.models[mid]
             is_bridge = cfg.is_bridge
             path = None if is_bridge else self.gguf_paths[mid]
+            # Provenance must be read BEFORE we overwrite the config: the previous
+            # scan stamps an inferred filename into mmproj_file, so inferring
+            # "explicit" from that field alone made every edit flip auto -> explicit.
+            previous_source = self.mmproj_source.get(mid, "")
+            previous_file = (cfg.mmproj_file or "").strip()
             # Uniqueness guard: `name` is now the retrieval key, so it must stay
             # unique (case-insensitive). Reject a name already used by ANOTHER model.
             if new_cfg.name:
@@ -1542,19 +1686,28 @@ class ModelManager:
             new_cfg.model_type = new_cfg.type_override or MODEL_TYPE_TEXT
             await asyncio.to_thread(new_cfg.save_engine_card, save_path)
         else:
+            # Re-derive the effective type first: _pair_mmproj uses model_type to
+            # refuse auxiliary components (draft/MTP/audio), exactly like scan().
+            info = await asyncio.to_thread(_read_gguf_info, path)
+            new_cfg.model_type = _classify_model_type(path, info, new_cfg.type_override)
             # Pair mmproj OUTSIDE the lock BEFORE saving, so an auto-filled
             # mmproj_file is written to the sidecar (matches scan() behavior).
-            mmprojs = self._list_mmproj_files()
-            # Provenance before the fill below, same reason as in scan().
-            explicit = bool((new_cfg.mmproj_file or "").strip())
-            paired = self._pair_mmproj(path, new_cfg, mmprojs)
+            mmprojs = await asyncio.to_thread(self._list_mmproj_files)
+            requested_file = (new_cfg.mmproj_file or "").strip()
+            # An auto-filled field is not an explicit choice. Treat it as explicit
+            # only when the caller actually changed it, or when the previous
+            # provenance was already explicit.
+            explicit = bool(requested_file) and (
+                previous_source == "explicit"
+                or previous_source == ""
+                or requested_file != previous_file
+            )
+            paired = self._pair_mmproj(
+                path, new_cfg, mmprojs,
+                **self._mmproj_pairing_context(mid, path, new_cfg.model_type))
             paired_source = ("explicit" if explicit else "auto") if paired is not None else ""
             if paired is not None and not new_cfg.mmproj_file:
                 new_cfg.mmproj_file = paired.name
-            # Re-derive the effective type so a just-changed override (or a reset back to
-            # "Auto-detect") lands on the card without waiting for the next rescan.
-            info = await asyncio.to_thread(_read_gguf_info, path)
-            new_cfg.model_type = _classify_model_type(path, info, new_cfg.type_override)
             await asyncio.to_thread(new_cfg.save, path)
 
         async with self._lock:
@@ -1574,10 +1727,23 @@ class ModelManager:
     # ---------------- sanitization ----------------
     @staticmethod
     def sanitize_safe_string(s: str) -> str:
-        """Strip path separators and parent references from user-supplied strings."""
-        if not s:
-            return s
-        return s.replace("\\", "").replace("/", "").replace("..", "").strip()
+        """Strip path separators/parent refs and make the result safe as a filename.
+
+        Used for state-file names and derived engine configs. Windows rejects
+        ``<>:"|?*`` and control characters, ignores trailing dots/spaces, and
+        treats names like ``CON``/``NUL`` as devices; an empty result used to
+        produce paths such as ``.json``.
+        """
+        if s is None:
+            return "_"
+        cleaned = str(s).replace("\\", "").replace("/", "").replace("..", "").strip()
+        cleaned = re.sub(r'[<>:"|?*\x00-\x1f]', "_", cleaned)
+        cleaned = cleaned.rstrip(" .")
+        if not cleaned:
+            return "_"
+        if cleaned.upper().split(".")[0] in _WINDOWS_RESERVED_NAMES:
+            cleaned = "_" + cleaned
+        return cleaned
 
     # Alias for backwards compatibility with existing call sites
     @staticmethod
@@ -1681,18 +1847,45 @@ class ModelManager:
         candidates = [
             (mid, lm) for mid, lm in self.loaded.items()
             if mid != target_model_id and not lm.config.pinned
+            and lm.active_requests == 0
         ]
         if not candidates:
-            log.warning("Max loaded models limit reached, but all loaded models are pinned or target!")
+            log.warning(
+                "Max loaded models limit reached, but every other model is pinned, "
+                "busy (active request), or the target itself; loading without evicting")
             return
         candidates.sort(key=lambda item: item[1].last_used)
         lru_id, lru_lm = candidates[0]
         log.info(f"Auto-evicting LRU model {lru_id} (last used {round(time.time() - lru_lm.last_used, 1)}s ago) to free slot")
         await self._unload_unlocked(lru_id)
 
+    # ---- active-request tracking (called from forwarder worker threads) ----
+    def note_request_start(self, port: int) -> None:
+        """Mark one in-flight request for the resident model on ``port``."""
+        # Snapshot: this runs on a forwarder thread while the event loop may
+        # unload a model. Iterating the live dict could raise "changed size".
+        for lm in list(self.loaded.values()):
+            if lm.port == port:
+                lm.active_requests += 1
+                lm.touch()
+                return
+
+    def note_request_end(self, port: int) -> None:
+        """Release an in-flight request and refresh ``last_used`` on completion.
+
+        Touching at the END matters for long generations: otherwise a request
+        that started just before the idle timeout could be reaped while it is
+        still streaming.
+        """
+        for lm in list(self.loaded.values()):
+            if lm.port == port:
+                lm.active_requests = max(0, lm.active_requests - 1)
+                lm.touch()
+                return
+
     async def load_model(self, model_id_input: str, force: bool = False) -> LoadedModel:
         """Load (JIT) a model with non-blocking concurrency for other requests."""
-        model_id = await self.resolve_model_id(model_id_input)
+        model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise KeyError(f"Unknown model: {model_id_input}")
 
@@ -1975,11 +2168,21 @@ class ModelManager:
             raise asyncio.CancelledError
 
     async def unload_model(self, model_id_input: str):
-        mid = await self.resolve_model_id(model_id_input)
+        mid = await self.resolve_model_id_strict(model_id_input)
         if not mid:
             return
         async with self._lock:
             await self._unload_unlocked(mid)
+
+    async def unload_model_exact(self, model_id: str):
+        """Unload a specific registry id without name/stem resolution.
+
+        Used by delete after the card has already been claimed/removed from
+        ``self.models``: calling the resolving variant at that point would find
+        nothing and silently leave the engine process running.
+        """
+        async with self._lock:
+            await self._unload_unlocked(model_id)
 
     async def unload_all(self):
         async with self._lock:
@@ -2200,7 +2403,7 @@ class ModelManager:
         return await self._perform_slot_action("restore", port, state_path, timeout)
 
     async def save_state(self, model_id_input: str, label: str = "default") -> Path:
-        model_id = await self.resolve_model_id(model_id_input)
+        model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise HTTPException(400, "Model not loaded")
         async with self._lock:
@@ -2238,7 +2441,7 @@ class ModelManager:
         return state_path
 
     async def load_state(self, model_id_input: str, label: str = "default") -> Path:
-        model_id = await self.resolve_model_id(model_id_input)
+        model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise HTTPException(404, f"Unknown model: {model_id_input}")
 
@@ -2265,7 +2468,10 @@ class ModelManager:
                 )
             log.info(f"Auto-loading model '{model_id}' before state restore")
             try:
-                lm = await asyncio.wait_for(self.load_model(model_id), timeout=60.0)
+                # Bridge engines legitimately take up to ready_timeout_seconds
+                # (600s by default); the old fixed 60s timeout cancelled them.
+                load_timeout = self.ready_timeout_for(model_id) + 30.0
+                lm = await asyncio.wait_for(self.load_model(model_id), timeout=load_timeout)
             except asyncio.TimeoutError:
                 raise HTTPException(504, f"Timeout loading model '{model_id}' for state restore")
             except Exception as e:
@@ -2273,7 +2479,9 @@ class ModelManager:
                 raise HTTPException(503, f"Failed to load model before state restore: {e}")
 
         async with self._lock:
-            lm = self.loaded[model_id]
+            lm = self.loaded.get(model_id)
+        if lm is None or not lm.ready:
+            raise HTTPException(503, f"Model '{model_id}' is no longer loaded")
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
@@ -2297,7 +2505,9 @@ class ModelManager:
         return state_path
 
     async def list_states(self, model_id_input: str) -> List[str]:
-        model_id = await self.resolve_model_id(model_id_input) or model_id_input
+        model_id = await self.resolve_model_id_strict(model_id_input)
+        if not model_id:
+            raise HTTPException(404, f"Unknown model: {model_id_input}")
         mid_clean = self._sanitize_model_id(model_id)
         out = []
         for p in self.save_state_dir.glob(f"{mid_clean}.*.bin"):
@@ -2307,7 +2517,9 @@ class ModelManager:
 
     async def delete_state(self, model_id_input: str, label: str) -> None:
         """Delete a state file for the given model and label."""
-        model_id = await self.resolve_model_id(model_id_input) or model_id_input
+        model_id = await self.resolve_model_id_strict(model_id_input)
+        if not model_id:
+            raise HTTPException(404, f"Unknown model: {model_id_input}")
         mid_clean = self._sanitize_model_id(model_id)
         label_clean = self._sanitize_label(label)
         state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
@@ -2472,7 +2684,7 @@ class ModelManager:
                     now = time.time()
                     to_unload = []
                     for mid, lm in list(self.loaded.items()):
-                        if lm.config.pinned or not lm.ready:
+                        if lm.config.pinned or not lm.ready or lm.active_requests > 0:
                             continue
                         if now - lm.last_used > self.idle_timeout:
                             to_unload.append(mid)
@@ -2519,14 +2731,32 @@ class ModelManager:
 # --------------------------------------------------------------------------
 CONFIG_PATH = os.environ.get("AUTOLOADER_CONFIG", "config.yaml")
 try:
-    with open(CONFIG_PATH) as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         CFG = yaml.safe_load(f)
     ModelManager.validate_config(CFG)
 except Exception as e:
     raise RuntimeError(f"Failed to load config from '{CONFIG_PATH}': {e}") from e
 manager = ModelManager(CFG)
 
-app = FastAPI(title="llama-autoloader", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(app):
+    await manager.start()
+    # Capture the main running loop for cross-thread async lookups (forwarder threads).
+    manager._main_loop = asyncio.get_running_loop()
+    # Start the raw TCP forwarder on the MAIN port. It must come up before uvicorn is
+    # asked to bind, but we run uvicorn on the INTERNAL port so there is no collision.
+    global _forwarder
+    _forwarder = RawTCPForwarder(manager.port, INTERNAL_API_PORT, manager)
+    _forwarder.start()
+    try:
+        yield
+    finally:
+        if _forwarder is not None:
+            _forwarder.stop()
+        await manager.stop()
+
+
+app = FastAPI(title="llama-autoloader", version="0.1.0", lifespan=_lifespan)
 
 # ---------------------------------------------------------------------------
 # CORS — ROUND-9 FIX (SSE end-of-stream burst root cause)
@@ -2761,8 +2991,11 @@ async def select_backend(body: SelectBackendPayload):
     cfg_yaml = manager.cfg
     cfg_yaml["llama_server"]["selected_backend"] = body.backend
     try:
-        with open(CONFIG_PATH, "w") as f:
-            yaml.dump(cfg_yaml, f, default_flow_style=False)
+        _atomic_write_text(
+            CONFIG_PATH,
+            yaml.safe_dump(cfg_yaml, default_flow_style=False, sort_keys=False,
+                           allow_unicode=True),
+        )
     except OSError as e:
         log.warning(f"Failed to persist backend selection to {CONFIG_PATH}: {e}")
     log.info(f"Global backend selected: '{body.backend}' -> resolved binary: '{manager.resolve_binary(None)}'")
@@ -2798,28 +3031,48 @@ async def update_settings(request: Request):
 
     if "idle_timeout_seconds" in body:
         v = body["idle_timeout_seconds"]
-        if not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
             errors.append("'idle_timeout_seconds' must be > 0")
     if "max_loaded_models" in body:
         v = body["max_loaded_models"]
-        if not isinstance(v, int) or v < 1:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
             errors.append("'max_loaded_models' must be >= 1")
     if "save_state_max_keep" in body:
         v = body["save_state_max_keep"]
-        if not isinstance(v, int) or v < 1:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1:
             errors.append("'save_state_max_keep' must be >= 1")
     if "poll_interval_seconds" in body:
         v = body["poll_interval_seconds"]
-        if not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
             errors.append("'poll_interval_seconds' must be > 0")
     if "base_port" in body:
         v = body["base_port"]
-        if not isinstance(v, int) or v < 1024 or v > 65535:
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1024 or v > 65535:
             errors.append("'base_port' must be 1024-65535")
     if "auto_save_state" in body:
         v = body["auto_save_state"]
         if not isinstance(v, bool):
             errors.append("'auto_save_state' must be a boolean")
+    if "host" in body:
+        v = body["host"]
+        if not isinstance(v, str) or not v.strip() or any(c.isspace() for c in v.strip()):
+            errors.append("'host' must be a non-empty hostname/IP without whitespace")
+    if "port" in body:
+        v = body["port"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 1 or v > 65535:
+            errors.append("'port' must be 1-65535")
+    if "default_args" in body and not isinstance(body["default_args"], str):
+        errors.append("'default_args' must be a string")
+    if "selected_backend" in body:
+        v = body["selected_backend"]
+        if not isinstance(v, str):
+            errors.append("'selected_backend' must be a string")
+        elif v:
+            backend_ids = [b["id"] for b in manager.list_backends()]
+            if v not in backend_ids:
+                errors.append(
+                    f"'selected_backend' '{v}' is not an installed backend "
+                    f"(available: {backend_ids})")
 
     if errors:
         raise HTTPException(400, "; ".join(errors))
@@ -2851,8 +3104,11 @@ async def update_settings(request: Request):
         manager.next_port = max(manager.base_port, manager.next_port)
         changed.append("base_port")
 
-    # Persist changes to config.yaml
-    if changed:
+    # Persist changes to config.yaml. host/port are included even when they are
+    # the ONLY fields supplied: they cannot be applied at runtime, so a restart
+    # is the only way they take effect, and the old `if changed` gate silently
+    # dropped them (the response said "restart required" but nothing was saved).
+    if changed or "host" in body or "port" in body:
         cfg = manager.cfg
         if "idle_timeout_seconds" in body:
             cfg["models"]["idle_timeout_seconds"] = body["idle_timeout_seconds"]
@@ -2871,12 +3127,15 @@ async def update_settings(request: Request):
         if "base_port" in body:
             cfg["launcher"]["base_port"] = body["base_port"]
         if "host" in body:
-            cfg["launcher"]["host"] = body["host"]
+            cfg["launcher"]["host"] = body["host"].strip()
         if "port" in body:
             cfg["launcher"]["port"] = body["port"]
         try:
-            with open(CONFIG_PATH, "w") as f:
-                yaml.dump(cfg, f, default_flow_style=False)
+            _atomic_write_text(
+                CONFIG_PATH,
+                yaml.safe_dump(cfg, default_flow_style=False, sort_keys=False,
+                               allow_unicode=True),
+            )
         except OSError as e:
             log.warning(f"Failed to persist settings to {CONFIG_PATH}: {e}")
 
@@ -2944,7 +3203,7 @@ async def list_models():
 
 @app.get("/v1/models/{model_id}")
 async def get_model(model_id: str):
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, "Model not found")
     cfg = await manager.get_config(mid)
@@ -2966,7 +3225,7 @@ async def get_model_port(model_id: str):
     Unknown model -> 404. Known but not loaded -> 503 (client should fall back
     to the proxy path, which triggers a JIT load).
     """
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, f"Model not found: {model_id}")
     async with manager._lock:
@@ -3010,7 +3269,7 @@ async def raw_passthrough(model_id: str, path: str, request: Request):
     to launcher.host (127.0.0.1 by default), no auth - so do not expose it on a shared
     interface. Any request reaching it has already passed the TCP forwarder.
     """
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, f"Model not found: {model_id}")
     async with manager._lock:
@@ -3029,20 +3288,24 @@ async def raw_passthrough(model_id: str, path: str, request: Request):
                if k.lower() not in _RAW_STRIP_HEADERS}
 
     try:
-        # Generous timeout: /slots?action=save can take tens of seconds on a big model.
-        upstream = await manager.client.request(
+        # Build + send with stream=True so the response body is relayed as it
+        # arrives. `client.request(...)` used to buffer the ENTIRE response
+        # (including SSE and large slot dumps) before StreamingResponse saw it.
+        upstream_req = manager.client.build_request(
             request.method, url, content=body or None, headers=headers,
             timeout=httpx.Timeout(300.0, connect=10.0))
+        upstream = await manager.client.send(upstream_req, stream=True)
     except Exception as e:
         log.warning(f"raw passthrough to {url} failed: {e}")
         raise HTTPException(502, f"Engine request failed: {e}")
 
     async def _relay():
-        # Stream so a large body (a saved slot, a props dump) never sits in memory twice.
-        if upstream.request.method == "HEAD":
-            return
-        async for chunk in upstream.aiter_bytes():
-            yield chunk
+        try:
+            if request.method != "HEAD":
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+        finally:
+            await upstream.aclose()
 
     resp_headers = {k: v for k, v in upstream.headers.items()
                     if k.lower() not in _RAW_STRIP_HEADERS}
@@ -3066,7 +3329,7 @@ async def interrupt_model(model_id: str, hard: bool = False):
     behaviour of unloading (killing + reclaiming) the resident process, guaranteeing the GPU
     stops at the cost of a fresh JIT load next time.
     """
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, f"Model not found: {model_id}")
 
@@ -3097,10 +3360,16 @@ async def interrupt_model(model_id: str, hard: bool = False):
 
 @app.put("/v1/models/{model_id}/config")
 async def update_model_config(model_id: str, body: ModelConfigUpdate):
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, "Unknown model")
-    cfg = await manager.get_config(mid)
+    cfg_live = await manager.get_config(mid)
+    if cfg_live is None:
+        raise HTTPException(404, "Unknown model")
+    # Validate/edit a COPY: the old code mutated the live config in place, so a
+    # rejected field (e.g. a duplicate name) left the in-memory registry dirty
+    # even though the request returned 500 and nothing was persisted.
+    cfg = copy.deepcopy(cfg_live)
     for k, v in body.model_dump(exclude_none=True).items():
         if k == "model_type":
             # Maps the API/WebUI field onto the PERSISTED override, not onto the derived
@@ -3123,19 +3392,22 @@ async def update_model_config(model_id: str, body: ModelConfigUpdate):
     if cfg.max_ctx_size and cfg.ctx_size and cfg.ctx_size > cfg.max_ctx_size:
         log.info(f"Capping ctx_size ({cfg.ctx_size}) to max_ctx_size ({cfg.max_ctx_size}) for model {mid}")
         cfg.ctx_size = cfg.max_ctx_size
-    await manager.update_config(mid, cfg)
-    return asdict(cfg)
+    saved = await manager.update_config(mid, cfg)
+    return asdict(saved)
 
 @app.post("/v1/models/{model_id}/vision/toggle")
 async def toggle_vision_ep(model_id: str):
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, "Unknown model")
-    cfg = await manager.get_config(mid)
-    manager._require_llama_engine(cfg)
+    cfg_live = await manager.get_config(mid)
+    if cfg_live is None:
+        raise HTTPException(404, "Unknown model")
+    manager._require_llama_engine(cfg_live)
+    cfg = copy.deepcopy(cfg_live)
     cfg.use_mmproj = not cfg.use_mmproj
-    await manager.update_config(mid, cfg)
-    return {"id": mid, "use_mmproj": cfg.use_mmproj, "mmproj_file": cfg.mmproj_file}
+    saved = await manager.update_config(mid, cfg)
+    return {"id": mid, "use_mmproj": saved.use_mmproj, "mmproj_file": saved.mmproj_file}
 
 @app.post("/v1/models/engine")
 async def add_engine_card_ep(body: EngineCardCreate):
@@ -3163,6 +3435,14 @@ async def add_engine_card_ep(body: EngineCardCreate):
     if cfg is None:
         raise HTTPException(400, f"not a valid {body.engine} engine config: {body.engine_config}")
     mid = manager._sanitize_model_id(cfg_path.stem)
+    if not mid or mid == "_":
+        raise HTTPException(400, "engine_config must have a non-empty file stem (model id)")
+    if body.name:
+        target_name = body.name.lower()
+        for other_mid, other_cfg in manager.models.items():
+            if other_cfg.name and other_cfg.name.lower() == target_name:
+                raise HTTPException(
+                    409, f"Model name '{body.name}' is already used by '{other_mid}'")
     async with manager._lock:
         if mid in manager.models:
             raise HTTPException(409, f"Model id '{mid}' already exists")
@@ -3278,14 +3558,17 @@ async def load_model_ep(model_id: str):
 
 @app.post("/v1/models/{model_id}/unload")
 async def unload_model_ep(model_id: str):
-    await manager.unload_model(model_id)
-    return {"id": model_id, "unloaded": True}
+    mid = await manager.resolve_model_id_strict(model_id)
+    if not mid:
+        raise HTTPException(404, f"Model not found: {model_id}")
+    await manager.unload_model_exact(mid)
+    return {"id": mid, "unloaded": True}
 
 @app.delete("/v1/models/{model_id}")
 async def delete_model_ep(model_id: str):
     """Delete an engine bridge card (user-added). Llama/GGUF models and auto-discovered
     engine cards cannot be deleted through this endpoint (remove their source file instead)."""
-    mid = await manager.resolve_model_id(model_id)
+    mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, f"Model not found: {model_id}")
 
@@ -3307,13 +3590,13 @@ async def delete_model_ep(model_id: str):
     # State is claimed; do the blocking/disk side effects OUTSIDE the lock.
     # Make sure the resident process (if any) is stopped and its derived config removed.
     try:
-        await manager.unload_model(mid)
+        await manager.unload_model_exact(mid)
     except Exception as e:
         log.warning(f"Unload before delete failed for {mid}: {e}")
 
     # Remove the card file (and any legacy copy) so a rescan won't re-add it.
     cards_dir = manager._cards_dir_for(engine)
-    for d in [cards_dir] + [Path(p) for p in getattr(manager, "LEGACY_CARDS_DIRS", ())]:
+    for d in [cards_dir] + [Path(p) for p in LEGACY_CARDS_DIRS]:
         try:
             (d / f"{mid}.json").unlink(missing_ok=True)
         except OSError as e:
@@ -3334,8 +3617,6 @@ async def unload_all_ep():
 # ---------- state save / load ----------
 @app.post("/v1/models/{model_id}/state/save")
 async def save_state_ep(model_id: str, body: StateLabel):
-    mid = await manager.resolve_model_id(model_id)
-    cfg = await manager.get_config(mid) if mid else None
     # State save/restore is supported by both llama.cpp and Strata engines.
     # (Previously gated to llama-only; Strata's serve exposes the same /slots/0?action=save endpoint.)
     try:
@@ -3350,8 +3631,6 @@ async def save_state_ep(model_id: str, body: StateLabel):
 
 @app.post("/v1/models/{model_id}/state/load")
 async def load_state_ep(model_id: str, body: StateLabel):
-    mid = await manager.resolve_model_id(model_id)
-    cfg = await manager.get_config(mid) if mid else None
     # State save/restore is supported by both llama.cpp and Strata engines.
     try:
         p = await manager.load_state(model_id, body.label)
@@ -3405,7 +3684,6 @@ async def ws(websocket: WebSocket):
 # Raw TCP forwarder: owns the MAIN client-facing port. Streaming requests are piped
 # straight to llama-server (no ASGI/uvicorn/httpx relay); everything else falls through
 # to this FastAPI app, which now runs on an INTERNAL port. See tcp_forwarder.py.
-from tcp_forwarder import RawTCPForwarder  # noqa: E402
 
 # The app binds THREE things: the main client-facing port (forwarder), an internal
 # FastAPI/uvicorn port, and a base port for spawned engines. All three must be distinct
@@ -3424,8 +3702,12 @@ def _port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
+            # Connecting to a wildcard address is meaningless on most stacks;
+            # probe loopback instead. A service bound to 0.0.0.0 is still
+            # reachable there, which is the common "another instance" case.
+            probe_host = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
             s.settimeout(0.5)
-            return s.connect_ex((host, port)) == 0
+            return s.connect_ex((probe_host, port)) == 0
         except OSError:
             return False
 
@@ -3457,24 +3739,6 @@ def _resolve_internal_port(desired: int, explicit: bool, host: str = "127.0.0.1"
     raise SystemExit(
         f"[start] No free internal port in {desired + 1}..{desired + max_tries} "
         f"on {host}. Pass --internal-port explicitly.")
-
-
-@app.on_event("startup")
-async def _startup():
-    await manager.start()
-    # Capture the main running loop for cross-thread async lookups (forwarder threads).
-    manager._main_loop = asyncio.get_running_loop()
-    # Start the raw TCP forwarder on the MAIN port. It must come up before uvicorn is
-    # asked to bind, but we run uvicorn on the INTERNAL port so there is no collision.
-    global _forwarder
-    _forwarder = RawTCPForwarder(manager.port, INTERNAL_API_PORT, manager)
-    _forwarder.start()
-
-@app.on_event("shutdown")
-async def _shutdown():
-    if _forwarder is not None:
-        _forwarder.stop()
-    await manager.stop()
 
 
 # --------------------------------------------------------------------------
@@ -3596,8 +3860,13 @@ if __name__ == "__main__":
 
     _wanted_internal = (args.internal_port if args.internal_port is not None
                         else int(os.environ.get("AUTOLOADER_INTERNAL_PORT", _DEFAULT_INTERNAL_PORT)))
+    # The internal FastAPI/uvicorn port is an implementation detail: only the
+    # loopback forwarder talks to it. Bind it to 127.0.0.1 even when --host is
+    # 0.0.0.0, otherwise the unauthenticated management API (and /v1/raw) would
+    # be exposed on every interface while the forwarder itself stays loopback.
+    _internal_bind_host = "127.0.0.1"
     INTERNAL_API_PORT, _auto_advanced_from = _resolve_internal_port(
-        _wanted_internal, explicit=args.internal_port is not None, host=args.host)
+        _wanted_internal, explicit=args.internal_port is not None, host=_internal_bind_host)
 
     # Fail fast and legibly on the one collision we must NOT paper over: if the main port
     # is taken, this instance has nothing to offer. Raw bind errors here are cryptic.
@@ -3608,7 +3877,7 @@ if __name__ == "__main__":
             f"(and --internal-port / --base-port so this instance stays independent).")
     if _auto_advanced_from is not None:
         log.warning(
-            f"Internal port {_auto_advanced_from} is already in use on {args.host} "
+            f"Internal port {_auto_advanced_from} is already in use on {_internal_bind_host} "
             f"(another instance?) - using {INTERNAL_API_PORT} instead. "
             f"Pin it for reproducible restarts with --internal-port {INTERNAL_API_PORT}.")
     if _port_in_use(manager.base_port, args.host):
@@ -3620,7 +3889,7 @@ if __name__ == "__main__":
     log.info("=" * 72)
     log.info("llama-autoloader instance")
     log.info(f"  WebUI + OpenAI API : http://{args.host}:{manager.port}   (raw TCP forwarder)")
-    log.info(f"  Internal FastAPI    : {INTERNAL_API_PORT}   (forwarder falls back here)")
+    log.info(f"  Internal FastAPI    : http://{_internal_bind_host}:{INTERNAL_API_PORT}   (loopback only)")
     log.info(f"  Engine port range   : {manager.base_port}+   (one port per model)")
     log.info(f"  Models root         : {manager.root_dir}")
     log.info(f"  Shared on disk      : states={manager.save_state_dir}  cards={manager.cards_dir}  temp={manager.temp_dir}")
@@ -3632,4 +3901,4 @@ if __name__ == "__main__":
     # The MAIN client-facing port (args.port) is owned by the RawTCPForwarder (started in
     # _startup). uvicorn/FastAPI runs on an INTERNAL port for management + non-streaming
     # requests only. This removes the ASGI layer from the streaming data path entirely.
-    uvicorn.run(app, host=args.host, port=INTERNAL_API_PORT, reload=False, use_colors=False, http=_http_backend)
+    uvicorn.run(app, host=_internal_bind_host, port=INTERNAL_API_PORT, reload=False, use_colors=False, http=_http_backend)

@@ -21,7 +21,7 @@ suite passes without either. See "Mock / fake backend" below.
 | File | Purpose |
 |------|---------|
 | `tests/__init__.py` | Makes `tests/` a package (so `from tests import gguf_bytes` works). |
-| `tests/gguf_bytes.py` | GGUF byte builders: `_make_dummy_gguf(name, max_ctx, ctx_vtype=...)` plus helpers to emit arbitrary KV fields of any GGUF value type. Reuses the exact byte layout proven in `test_server.py::_make_dummy_gguf`. |
+| `tests/gguf_bytes.py` | GGUF byte builders: `make_dummy_gguf(name, max_ctx, ctx_vtype=...)` plus helpers to emit arbitrary KV fields of any GGUF value type. Reuses the exact byte layout proven in `test_server.py::_make_dummy_gguf`. |
 | `tests/conftest.py` | Fixtures: `build_cfg`, `isolated_manager`, `seeded_manager`, `client`. |
 | `tests/test_regression.py` | Regression tests (plan §3). |
 | `tests/test_e2e_startup.py` | E2E startup tests (plan §4). |
@@ -85,7 +85,7 @@ The load path is exercised without a real binary in two ways:
 
 ## Notes / limitations
 
-- The existing `test_server.py` (59 tests) is untouched and remains green.
+- The root-level `test_server.py` suite is untouched and remains green.
 - Windows-specific: the suite reuses a single shared asyncio event loop for sync
   tests to avoid Winsock buffer exhaustion, and uses a listening socket (no
   `SO_REUSEADDR`) to make port-availability checks fail deterministically.

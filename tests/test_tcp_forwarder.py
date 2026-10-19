@@ -19,7 +19,6 @@ _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-import tcp_forwarder  # noqa: E402
 from tcp_forwarder import RawTCPForwarder, _inject_cors_headers  # noqa: E402
 
 
@@ -105,7 +104,6 @@ class TestRoutingDecision:
 
     def test_non_llm_path_goes_to_api(self):
         f = _fwd()
-        body = b'{"model": "qwen3"}'
         # Management path: even with a model field, it is not an LLM endpoint.
         assert not f._is_llm_endpoint("/v1/models")
 
@@ -885,3 +883,45 @@ class TestTertiaryNoHang:
                 s.close()
             except OSError:
                 pass
+
+
+class TestConnectionClose:
+    """The pipe is per-connection; keep-alive must not leak into a second request."""
+
+    def test_force_connection_close_rewrites_keepalive(self):
+        raw = (b"POST /v1/chat/completions HTTP/1.1\r\n"
+               b"Host: a\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\n\r\n")
+        out = RawTCPForwarder._force_connection_close(raw)
+        assert b"Connection: close" in out
+        assert b"keep-alive" not in out.lower()
+        assert b"Keep-Alive:" not in out
+
+    def test_force_connection_close_preserves_websocket_upgrade(self):
+        raw = (b"GET /ws HTTP/1.1\r\nHost: a\r\n"
+               b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+        assert RawTCPForwarder._force_connection_close(raw) == raw
+
+
+class TestDeclaredBodyTimeout:
+    def test_declared_content_length_stall_times_out(self, monkeypatch):
+        """A client that declares a body and sends none must not pin the thread forever."""
+        import tcp_forwarder as tf
+        monkeypatch.setattr(tf, "_BODY_READ_TIMEOUT", 0.4)
+        f = _fwd()
+        client, fwd_side, srv = _loopback_client()
+        try:
+            client.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: a\r\nContent-Length: 100\r\n\r\n")
+            start = time.monotonic()
+            parsed = _run_with_timeout(lambda: f._read_request(fwd_side), timeout=3.0)
+            elapsed = time.monotonic() - start
+            assert parsed is None
+            assert elapsed < 2.5
+        finally:
+            for s in (client, fwd_side, srv):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+

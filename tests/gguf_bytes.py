@@ -27,6 +27,7 @@ The parser reads ``general.name`` (STRING) and any key ending in
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -140,7 +141,7 @@ def make_gguf_unknown_vtype(unknown_vtype: int = 13) -> bytes:
 # ---------------------------------------------------------------------------
 
 def write_gguf(path, name: Optional[str] = None, max_ctx: Optional[int] = None,
-               ctx_vtype: int = UINT32, skip_fields: Optional[List[Tuple[str, int, bytes]]] = None) -> "path":
+               ctx_vtype: int = UINT32, skip_fields: Optional[List[Tuple[str, int, bytes]]] = None) -> Path:
     """Write a dummy GGUF file at ``path`` and return the path for chaining."""
     if skip_fields is not None:
         data = make_gguf_with_skips(name=name, max_ctx=max_ctx, skip_fields=skip_fields)

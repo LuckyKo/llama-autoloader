@@ -37,7 +37,7 @@ Edit `config.yaml`:
 ```yaml
 launcher:
   host: 127.0.0.1
-  port: 9123
+  port: 9124
   base_port: 9001          # first port assigned to spawned llama-servers
 
 llama_server:
@@ -62,10 +62,10 @@ gpu:
 ```bash
 python server.py
 # or
-python server.py --host 127.0.0.1 --port 9123
+python server.py --host 127.0.0.1 --port 9124
 ```
 
-Open **http://127.0.0.1:9123** in your browser for the WebUI dashboard.
+Open **http://127.0.0.1:9124** in your browser for the WebUI dashboard.
 
 ---
 
@@ -173,7 +173,7 @@ Each model can have an optional sidecar JSON file (`<model>.gguf.json`) placed n
 | `args`             | string   | `""`    | Extra CLI arguments appended to `llama-server`                              |
 | `ctx_size`         | int      | `8192`  | Context window size (`--ctx-size`)                                          |
 | `n_gpu_layers`     | int      | `999`   | GPU layers to offload (`--n-gpu-layers`)                                    |
-| `default`          | bool     | `false` | Use this model when API requests omit the `model` field                     |
+| `default`          | bool     | `false` | Informational default marker; LLM proxy requests must still name a model |
 | `pinned`           | bool     | `false` | Never auto-unload this model (exempt from LRU eviction)                     |
 | `auto_save_state`  | bool     | `false` | Auto save/restore KV cache state on model unload/load                       |
 | `backend`          | string   | `""`    | Force a specific backend build for this model (folder name in `backends/`)   |
@@ -265,7 +265,7 @@ per-tick refresh.
 
 ## API Reference
 
-Base URL: `http://127.0.0.1:9123`
+Base URL: `http://127.0.0.1:9124`
 
 All endpoints return JSON unless otherwise noted. Models are automatically loaded (JIT) on first inference request if not already loaded.
 
@@ -273,14 +273,14 @@ All endpoints return JSON unless otherwise noted. Models are automatically loade
 
 ### OpenAI-Compatible Endpoints
 
-These endpoints are fully compatible with the OpenAI API format. Point any OpenAI-compatible client at `http://127.0.0.1:9123` and it will work.
+These endpoints are fully compatible with the OpenAI API format. Point any OpenAI-compatible client at `http://127.0.0.1:9124` and it will work.
 
 #### `POST /v1/chat/completions`
 
 Chat completion (streaming and non-streaming). Auto-loads the requested model if needed.
 
 ```bash
-curl http://127.0.0.1:9123/v1/chat/completions \
+curl http://127.0.0.1:9124/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "MyModel-Q4_K_M.gguf",
@@ -289,14 +289,16 @@ curl http://127.0.0.1:9123/v1/chat/completions \
   }'
 ```
 
-> **Note:** If `model` is omitted, the model marked as `default: true` will be used.
+> **Note:** LLM proxy requests must include a `model` field. The raw-TCP forwarder rejects
+> requests it cannot route instead of guessing (which previously risked sending a request
+> to an unrelated model). Management/status endpoints do not need it.
 
 #### `POST /v1/completions`
 
 Text completion (OpenAI legacy format).
 
 ```bash
-curl http://127.0.0.1:9123/v1/completions \
+curl http://127.0.0.1:9124/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "MyModel-Q4_K_M.gguf",
@@ -310,7 +312,7 @@ curl http://127.0.0.1:9123/v1/completions \
 Generate embeddings for input text.
 
 ```bash
-curl http://127.0.0.1:9123/v1/embeddings \
+curl http://127.0.0.1:9124/v1/embeddings \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "MyModel-Q4_K_M.gguf",
@@ -327,7 +329,7 @@ curl http://127.0.0.1:9123/v1/embeddings \
 List all discovered models with their current status.
 
 ```bash
-curl http://127.0.0.1:9123/v1/models
+curl http://127.0.0.1:9124/v1/models
 ```
 
 **Response:**
@@ -369,7 +371,7 @@ curl http://127.0.0.1:9123/v1/models
 Get detailed info and full config for a specific model.
 
 ```bash
-curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf
+curl http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf
 ```
 
 **Response:**
@@ -395,7 +397,7 @@ curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf
 Update a model's sidecar config. Only include the fields you want to change.
 
 ```bash
-curl -X PUT http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/config \
+curl -X PUT http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/config \
   -H 'Content-Type: application/json' \
   -d '{
     "ctx_size": 16384,
@@ -415,7 +417,7 @@ return the card to auto-detection. An unknown value is rejected with **400**.
 Get the raw TCP port of a loaded model's `llama-server` (bypass the autoloader data path). Returns 503 when known but not loaded.
 
 ```bash
-curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/port
+curl http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/port
 ```
 
 ---
@@ -427,7 +429,7 @@ curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/port
 Explicitly load (pre-warm) a model without sending an inference request.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/load
+curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/load
 ```
 
 **Response:**
@@ -445,7 +447,7 @@ curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/load
 Unload a model and terminate its `llama-server` process.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/unload
+curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/unload
 ```
 
 #### `POST /v1/models/{model_id}/interrupt`
@@ -453,8 +455,8 @@ curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/unload
 Cancel in-flight generation without unloading the model. Soft by default; add `?hard=true` to kill+unload.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt
-curl -X POST 'http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt?hard=true'
+curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/interrupt
+curl -X POST 'http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/interrupt?hard=true'
 ```
 
 #### `DELETE /v1/models/{model_id}`
@@ -462,7 +464,7 @@ curl -X POST 'http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/interrupt?hard
 Delete an engine bridge card (user-added). Unloads it first if loaded. Llama/GGUF models cannot be deleted via this endpoint.
 
 ```bash
-curl -X DELETE http://127.0.0.1:9123/v1/models/strata-coder-iq3_xxs
+curl -X DELETE http://127.0.0.1:9124/v1/models/strata-coder-iq3_xxs
 ```
 
 #### `POST /v1/unload_all`
@@ -470,7 +472,7 @@ curl -X DELETE http://127.0.0.1:9123/v1/models/strata-coder-iq3_xxs
 Unload all currently loaded models.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/unload_all
+curl -X POST http://127.0.0.1:9124/v1/unload_all
 ```
 
 #### `POST /v1/scan`
@@ -478,7 +480,7 @@ curl -X POST http://127.0.0.1:9123/v1/unload_all
 Re-scan the models directory for new/removed `.gguf` files.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/scan
+curl -X POST http://127.0.0.1:9124/v1/scan
 ```
 
 ---
@@ -496,7 +498,7 @@ Toggle the vision projector (`--mmproj`) on or off for a model.
 > `mmproj_file` explicitly to override any of this.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/vision/toggle
+curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/vision/toggle
 ```
 
 **Response:**
@@ -519,7 +521,7 @@ Save and restore KV cache state (slot 0) for fast context resumption.
 #### `POST /v1/models/{model_id}/state/save`
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/save \
+curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/state/save \
   -H 'Content-Type: application/json' \
   -d '{"label": "my-session"}'
 ```
@@ -527,7 +529,7 @@ curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/save \
 #### `POST /v1/models/{model_id}/state/load`
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/load \
+curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/state/load \
   -H 'Content-Type: application/json' \
   -d '{"label": "my-session"}'
 ```
@@ -537,7 +539,7 @@ curl -X POST http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/load \
 List all saved state labels for a model.
 
 ```bash
-curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state
+curl http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/state
 ```
 
 **Response:**
@@ -553,7 +555,7 @@ curl http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state
 Delete a saved state label for a model.
 
 ```bash
-curl -X DELETE http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/my-session
+curl -X DELETE http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/state/my-session
 ```
 
 ---
@@ -565,7 +567,7 @@ curl -X DELETE http://127.0.0.1:9123/v1/models/MyModel-Q4_K_M.gguf/state/my-sess
 List all available `llama-server` builds detected in the `backends/` directory.
 
 ```bash
-curl http://127.0.0.1:9123/v1/backends
+curl http://127.0.0.1:9124/v1/backends
 ```
 
 **Response:**
@@ -594,7 +596,7 @@ curl http://127.0.0.1:9123/v1/backends
 Set the global active backend. All models without a per-model override will use this build.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/backend/select \
+curl -X POST http://127.0.0.1:9124/v1/backend/select \
   -H 'Content-Type: application/json' \
   -d '{"backend": "llama.cpp-win-x86_64-nvidia-cuda12-avx2-2.23.1"}'
 ```
@@ -616,7 +618,7 @@ Pass `{"backend": ""}` to reset to auto-detect.
 List configured bridge engines with readiness status.
 
 ```bash
-curl http://127.0.0.1:9123/v1/engines
+curl http://127.0.0.1:9124/v1/engines
 ```
 
 ### Vision Projectors
@@ -669,7 +671,7 @@ indistinguishable from a right one.
 Register a bridge card for any configured engine.
 
 ```bash
-curl -X POST http://127.0.0.1:9123/v1/models/engine \
+curl -X POST http://127.0.0.1:9124/v1/models/engine \
   -H 'Content-Type: application/json' \
   -d '{"engine":"strata","engine_config":"N:/work/WD/Strata/coder-iq3_xxs.json"}'
 ```
@@ -687,7 +689,7 @@ curl -X POST http://127.0.0.1:9123/v1/models/engine \
 Simple health check.
 
 ```bash
-curl http://127.0.0.1:9123/health
+curl http://127.0.0.1:9124/health
 ```
 
 **Response:**
@@ -703,7 +705,7 @@ curl http://127.0.0.1:9123/health
 Full system status including GPU info, RAM, loaded models, backends, and per-model resource usage.
 
 ```bash
-curl http://127.0.0.1:9123/v1/status
+curl http://127.0.0.1:9124/v1/status
 ```
 
 **Response:**
@@ -711,7 +713,7 @@ curl http://127.0.0.1:9123/v1/status
 {
   "launcher": {
     "host": "127.0.0.1",
-    "port": 9123,
+    "port": 9124,
     "binary": "N:\\...\\llama-server.exe",
     "selected_backend": "",
     "backends": [...]
@@ -765,7 +767,7 @@ Get current runtime settings.
 Partial update (idle timeout, max loaded models, auto-save state, poll interval, default args, base port, selected backend). Persists to `config.yaml`; `host`/`port` changes require restart.
 
 ```bash
-curl -X PUT http://127.0.0.1:9123/v1/settings \
+curl -X PUT http://127.0.0.1:9124/v1/settings \
   -H 'Content-Type: application/json' \
   -d '{"max_loaded_models": 2, "idle_timeout_seconds": 1800}'
 ```
@@ -787,15 +789,15 @@ Forward any request directly to a loaded model's `llama-server` instance. Useful
 
 ```bash
 # Tokenize text
-curl -X POST http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/tokenize \
+curl -X POST http://127.0.0.1:9124/v1/raw/MyModel-Q4_K_M.gguf/tokenize \
   -H 'Content-Type: application/json' \
   -d '{"content": "Hello world"}'
 
 # Get slot info
-curl http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/slots
+curl http://127.0.0.1:9124/v1/raw/MyModel-Q4_K_M.gguf/slots
 
 # Save slot 0 (action in query, filename in body)
-curl -X POST 'http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/slots/0?action=save' \
+curl -X POST 'http://127.0.0.1:9124/v1/raw/MyModel-Q4_K_M.gguf/slots/0?action=save' \
   -H 'Content-Type: application/json' -d '{"filename": "state.bin"}'
 ```
 
@@ -808,7 +810,7 @@ curl -X POST 'http://127.0.0.1:9123/v1/raw/MyModel-Q4_K_M.gguf/slots/0?action=sa
 Connect via WebSocket for real-time status updates (pushed every 1 second). The payload is identical to `GET /v1/status`.
 
 ```javascript
-const ws = new WebSocket('ws://127.0.0.1:9123/ws');
+const ws = new WebSocket('ws://127.0.0.1:9124/ws');
 ws.onmessage = (ev) => {
   const status = JSON.parse(ev.data);
   console.log('GPU usage:', status.gpus[0]?.used_mb, 'MB');
@@ -826,7 +828,7 @@ ws.onmessage = (ev) => {
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://127.0.0.1:9123/v1",
+    base_url="http://127.0.0.1:9124/v1",
     api_key="not-needed"
 )
 
@@ -844,7 +846,7 @@ for chunk in response:
 
 Set the API endpoint to:
 ```
-http://127.0.0.1:9123
+http://127.0.0.1:9124
 ```
 API type: **OpenAI-compatible**. No API key required.
 
@@ -856,7 +858,7 @@ API type: **OpenAI-compatible**. No API key required.
     "title": "Local LLM",
     "provider": "openai",
     "model": "MyModel-Q4_K_M.gguf",
-    "apiBase": "http://127.0.0.1:9123/v1",
+    "apiBase": "http://127.0.0.1:9124/v1",
     "apiKey": "not-needed"
   }]
 }

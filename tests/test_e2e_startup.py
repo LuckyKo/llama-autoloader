@@ -590,7 +590,7 @@ class TestDeleteModelEndpoint:
         """
         mgr = seeded_manager
         mid = "race-card"
-        monkeypatch.setattr(mgr, "resolve_model_id", AsyncMock(return_value=mid))
+        monkeypatch.setattr(mgr, "resolve_model_id_strict", AsyncMock(return_value=mid))
         assert mid not in mgr.models  # already claimed by the "other" delete
 
         r = client.delete(f"/v1/models/{mid}")

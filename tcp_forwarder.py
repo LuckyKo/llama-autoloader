@@ -13,7 +13,7 @@ not yet loaded fall through to the internal FastAPI app (which runs on a separat
 so all existing endpoints keep working unchanged.
 
 Design notes / constraints (see the implementation plan):
-  * ``resolve_model_id`` and ``self.loaded`` are guarded by an ``asyncio.Lock`` and
+  * ``resolve_model_id_strict`` and ``self.loaded`` are guarded by an ``asyncio.Lock`` and
     are async-only. We therefore NEVER open a fresh event loop from a worker thread.
     Instead we schedule the resolution coroutine onto the MAIN running loop with
     ``asyncio.run_coroutine_threadsafe(...).result(timeout)``. The forwarder must be
@@ -70,6 +70,19 @@ _CORS_HEADERS = (
 # client may be waiting for our response before sending more body bytes, so an unbounded read
 # could hang). Cleared before the pipe phase; the AC fast path always carries a Content-Length.
 _READ_PHASE_TIMEOUT = 5.0
+
+# Every connection now gets a read deadline. Previously the header loop had NO timeout and the
+# body loop only timed out when Content-Length was absent, so a client that connected and stalled
+# (or declared a body and never sent it) pinned a worker thread forever.
+_HEADER_READ_TIMEOUT = max(0.1, float(os.environ.get("AUTOLOADER_HEADER_TIMEOUT", "30")))
+_BODY_READ_TIMEOUT = max(0.1, float(os.environ.get("AUTOLOADER_BODY_TIMEOUT", "30")))
+
+# Cap on simultaneously-handled connections. Each one is a thread; without a cap a few stalled
+# clients (or a local misbehaving tool) could exhaust the process's threads/descriptors.
+_MAX_CONNECTIONS = max(1, int(os.environ.get("AUTOLOADER_MAX_CONNECTIONS", "256")))
+
+# How long an LLM request waits for its model's FIFO ticket before returning 503.
+_QUEUE_WAIT_TIMEOUT = max(0.1, float(os.environ.get("AUTOLOADER_QUEUE_TIMEOUT", "300")))
 
 # Sentinel label passed to _pipe_to_backend to mark the LLM->llama-server fast path (vs
 # "fastapi" for management traffic). The CORS-injection gate keys off this value.
@@ -131,6 +144,7 @@ class RawTCPForwarder:
         # Used by cancel_active() to perform a soft (connection-close) interrupt without unloading.
         self._active_conns: Dict[int, set] = {}
         self._active_lock = threading.Lock()
+        self._conn_sem = threading.BoundedSemaphore(_MAX_CONNECTIONS)
 
     def cancel_active(self, port: int) -> int:
         """Best-effort cancel of in-flight requests bound to ``port``.
@@ -202,8 +216,34 @@ class RawTCPForwarder:
                 continue
             except OSError:
                 break  # socket closed during shutdown
-            t = threading.Thread(target=self._handle_connection, args=(client_sock,), daemon=True)
-            t.start()
+            if not self._conn_sem.acquire(blocking=False):
+                log.warning("Forwarder connection limit reached (%d); rejecting client",
+                            _MAX_CONNECTIONS)
+                try:
+                    self._send_error_response(client_sock, 503, "Too many concurrent connections")
+                finally:
+                    try:
+                        client_sock.close()
+                    except OSError:
+                        pass
+                continue
+            t = threading.Thread(target=self._run_connection, args=(client_sock,), daemon=True)
+            try:
+                t.start()
+            except Exception as e:  # noqa: BLE001
+                self._conn_sem.release()
+                try:
+                    client_sock.close()
+                except OSError:
+                    pass
+                log.error("Failed to start connection handler: %s", e)
+                continue
+
+    def _run_connection(self, client_sock: socket.socket) -> None:
+        try:
+            self._handle_connection(client_sock)
+        finally:
+            self._conn_sem.release()
 
     # ------------------------------------------------------------------ connection
     def _handle_connection(self, client_sock: socket.socket) -> None:
@@ -212,6 +252,10 @@ class RawTCPForwarder:
             if parsed is None:
                 return  # already closed inside _read_request
             method, path, raw_headers, body_prefix = parsed
+            # One request per client connection. Without this, a keep-alive client's
+            # SECOND request travelled through the still-open pipe to the first
+            # request's backend, so a request for model B could be answered by model A.
+            raw_headers = self._force_connection_close(raw_headers)
 
             # LLM data path: only OpenAI-style generation endpoints carry a `model` field and
             # are piped straight to llama-server. All other requests (management/status/state,
@@ -254,9 +298,8 @@ class RawTCPForwarder:
                     # so a state restore enqueued before this request runs first (fixes the
                     # full-reprocess race). No per-request log: this is the hot path.
                     queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
-                    with queue.ticket(timeout=300.0):
-                        self._pipe_to_backend(client_sock, raw_headers,
-                                              body_prefix, target_port, _LLAMA_SERVER_LABEL)
+                    self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
+                                           target_port, model_id, queue)
                     return
                 # Model not loaded -> JIT load it, wait for readiness, then pipe.
                 log.info(f"Model '{model_id}' not loaded; triggering JIT load...")
@@ -265,9 +308,8 @@ class RawTCPForwarder:
                     # Acquire the ticket only AFTER the model is loaded and ready, so the
                     # load itself is never gated by the queue.
                     queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
-                    with queue.ticket(timeout=300.0):
-                        self._pipe_to_backend(client_sock, raw_headers,
-                                              body_prefix, target_port, _LLAMA_SERVER_LABEL)
+                    self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
+                                           target_port, model_id, queue)
                     return
                 # JIT load failed (unknown model / timeout / spawn error).
                 log.error(f"JIT load failed for '{model_id}' on {method} {path}")
@@ -293,10 +335,17 @@ class RawTCPForwarder:
         ``\\r\\n\\r\\n`` and is forwarded verbatim to preserve original header casing/order
         and framing headers.
         """
+        try:
+            sock.settimeout(_HEADER_READ_TIMEOUT)
+        except (OSError, AttributeError):
+            pass
         header_data = b""
         while b"\r\n\r\n" not in header_data:
             try:
                 chunk = sock.recv(4096)
+            except (socket.timeout, TimeoutError):
+                log.warning("Timed out reading request headers (%.0fs)", _HEADER_READ_TIMEOUT)
+                return None
             except OSError:
                 return None
             if not chunk:
@@ -321,10 +370,13 @@ class RawTCPForwarder:
         # because AC-style chat bodies carry a long system prompt + history BEFORE the model field;
         # if it still isn't in this prefix, LLM endpoints get one more bounded read (see
         # _read_more_for_model). The remainder of the body always flows through the pipe later.
+        raw_cl = self._header_value(raw_headers, "content-length")
+        has_content_length = raw_cl is not None
         try:
-            content_length = int(self._header_value(raw_headers, "content-length"))
+            content_length = int(raw_cl) if has_content_length else 0
         except (ValueError, TypeError):
             content_length = 0
+            has_content_length = False
 
         # Expect: 100-continue — tell the client to go ahead BEFORE reading its body, or it will
         # wait for our interim response and we would deadlock. Only sent when actually requested.
@@ -335,41 +387,88 @@ class RawTCPForwarder:
             except OSError:
                 return None
 
-        # Bound the READ phase only when there is no Content-Length: a chunked / no-length client
-        # may be holding back body bytes until it sees our response, so an unbounded read could hang.
-        # A timeout here just stops us from blocking indefinitely; the pipe phase below restores
-        # blocking mode (no timeout). The AC fast path always carries a Content-Length, so this is
-        # a no-op for it.
-        bounded_read = content_length == 0
-        if bounded_read:
-            try:
-                sock.settimeout(_READ_PHASE_TIMEOUT)
-            except OSError:
-                pass
+        # Bound the READ phase for EVERY request, not just chunked/no-length ones.
+        # A client that declares Content-Length and then stalls used to pin this
+        # worker thread forever. The timeout is cleared before the pipe phase
+        # (Windows select cannot mix with settimeout). No-length/chunked clients
+        # keep the shorter historical bound because they may wait for our response.
+        read_timeout = _BODY_READ_TIMEOUT if content_length else _READ_PHASE_TIMEOUT
+        try:
+            sock.settimeout(read_timeout)
+        except (OSError, AttributeError):
+            pass
 
-        if self._is_llm_endpoint(path):
-            target = min(content_length, _BODY_PREFIX_LIMIT) if content_length else _BODY_PREFIX_LIMIT
+        if self._is_llm_endpoint(path) and not has_content_length:
+            # Chunked / no Content-Length: scan up to the prefix cap for "model".
+            target = _BODY_PREFIX_LIMIT
         else:
+            # An explicit Content-Length (including 0) bounds the body exactly.
             target = min(content_length, _BODY_PREFIX_LIMIT)
+        timed_out = False
         while len(body_prefix) < target:
             try:
                 chunk = sock.recv(4096)
             except (socket.timeout, TimeoutError):
-                break  # bounded read phase timed out; stop waiting for more body bytes
+                timed_out = True
+                break
             except OSError:
                 break
             if not chunk:
                 break
             body_prefix += chunk
 
-        # Restore blocking mode before the pipe phase (Windows select can't mix with settimeout).
-        if bounded_read:
+        # A declared body that did not fully arrive is a broken request: do not
+        # forward a truncated body and then wait forever in the pipe.
+        if timed_out and content_length and len(body_prefix) < target:
+            log.warning("Timed out reading request body (declared %d bytes, got %d)",
+                        content_length, len(body_prefix))
             try:
                 sock.settimeout(None)
-            except OSError:
+            except (OSError, AttributeError):
                 pass
+            return None
+
+        # Restore blocking mode before the pipe phase (Windows select can't mix with settimeout).
+        try:
+            sock.settimeout(None)
+        except (OSError, AttributeError):
+            pass
+
+        # If the first recv already swallowed a pipelined second request, discard
+        # it. Connection: close forces the client to retry it on a new connection;
+        # forwarding it here would send it to THIS request's model.
+        if has_content_length and len(body_prefix) > content_length:
+            log.warning("Discarding %d pipelined byte(s) after request body",
+                        len(body_prefix) - content_length)
+            body_prefix = body_prefix[:content_length]
 
         return method, path, raw_headers, body_prefix
+
+    @staticmethod
+    def _force_connection_close(raw_headers: bytes) -> bytes:
+        """Return request headers with ``Connection: close`` and no keep-alive tokens.
+
+        The forwarder's pipe is per-connection, not per-request. Advertising close
+        makes the backend (and FastAPI) end the connection after the response, so a
+        second request from a keep-alive client can never travel to the first
+        request's model.
+        """
+        head, sep, rest = raw_headers.partition(b"\r\n\r\n")
+        if not sep:
+            return raw_headers
+        # Never rewrite a protocol upgrade (WebSocket): it needs the original
+        # Connection/Upgrade headers, and it is a single long-lived stream rather
+        # than a keep-alive HTTP connection.
+        if re.search(rb"(?im)^upgrade\s*:", head):
+            return raw_headers
+        lines = head.split(b"\r\n")
+        kept = [lines[0]]
+        for line in lines[1:]:
+            if re.match(rb"^(connection|keep-alive|proxy-connection)\s*:", line, re.IGNORECASE):
+                continue
+            kept.append(line)
+        kept.append(b"Connection: close")
+        return b"\r\n".join(kept) + b"\r\n\r\n" + rest
 
     @staticmethod
     def _header_value(raw_headers: bytes, name: str) -> Optional[str]:
@@ -421,21 +520,46 @@ class RawTCPForwarder:
         return what we have (caller will 400), but normal requests finish far below it.
         """
         prefix = bytearray(body_prefix)
-        while True:
-            model_id = self._extract_model(bytes(prefix))
-            if model_id:
-                break
-            if len(prefix) >= _MODEL_SCAN_HARD_CAP:
-                log.warning(f"_read_more_for_model hit hard cap ({len(prefix)}B) without finding "
-                            f"'model'; returning partial body for caller to reject")
-                break
+        try:
+            content_length = int(self._header_value(raw_headers, "content-length"))
+        except (ValueError, TypeError):
+            content_length = 0
+        try:
+            sock.settimeout(_BODY_READ_TIMEOUT if content_length else _READ_PHASE_TIMEOUT)
+        except (OSError, AttributeError):
+            pass
+        try:
+            while True:
+                model_id = self._extract_model(bytes(prefix))
+                if model_id:
+                    break
+                if len(prefix) >= _MODEL_SCAN_HARD_CAP:
+                    log.warning(f"_read_more_for_model hit hard cap ({len(prefix)}B) without finding "
+                                f"'model'; returning partial body for caller to reject")
+                    break
+                if content_length and len(prefix) >= content_length:
+                    break  # complete declared body; no model field anywhere
+                try:
+                    want = 65536
+                    if content_length:
+                        want = min(want, content_length - len(prefix))
+                    chunk = sock.recv(want)
+                except (socket.timeout, TimeoutError):
+                    log.warning("Timed out reading request body while locating 'model'")
+                    break
+                except OSError:
+                    break
+                if not chunk:
+                    break  # EOF / peer closed (full body received or client aborted)
+                prefix.extend(chunk)
+                if content_length:
+                    # Never swallow bytes belonging to a pipelined second request.
+                    del prefix[content_length:]
+        finally:
             try:
-                chunk = sock.recv(65536)
-            except OSError:
-                break
-            if not chunk:
-                break  # EOF / peer closed (full body received or client aborted)
-            prefix.extend(chunk)
+                sock.settimeout(None)
+            except (OSError, AttributeError):
+                pass
         return bytes(prefix)
 
     @staticmethod
@@ -455,7 +579,7 @@ class RawTCPForwarder:
     def _resolve_target_port(self, model_id: str) -> Optional[int]:
         """Look up the llama-server port for a loaded model.
 
-        Runs the async ``resolve_model_id`` on the MAIN event loop (never a fresh one)
+        Runs the async ``resolve_model_id_strict`` on the MAIN event loop (never a fresh one)
         and returns the port only if the model is already loaded AND ready. Returns None
         otherwise so the caller falls through to FastAPI (which JIT-loads).
         """
@@ -470,7 +594,11 @@ class RawTCPForwarder:
         # Schedule the async-only resolver onto the MAIN loop and block this worker thread
         # until it completes (or times out). This is the safe cross-thread pattern — never
         # a fresh event loop.
-        coro = self.model_manager.resolve_model_id(model_id)
+        resolver = getattr(self.model_manager, "resolve_model_id_strict", None)
+        if resolver is None:
+            # Backwards-compatible with lightweight fakes used by older tests.
+            resolver = self.model_manager.resolve_model_id
+        coro = resolver(model_id)
         try:
             resolved_mid = asyncio.run_coroutine_threadsafe(coro, main_loop).result(timeout=5.0)
         except Exception as e:  # noqa: BLE001
@@ -540,7 +668,42 @@ class RawTCPForwarder:
         """
         return socket.create_connection(("127.0.0.1", target_port), timeout=10)
 
+    def _pipe_with_ticket(self, client_sock: socket.socket, raw_headers: bytes,
+                          body_prefix: bytes, target_port: int, model_id: str,
+                          queue) -> None:
+        """Acquire the model's FIFO ticket, then pipe; surface busy timeouts as 503."""
+        try:
+            with queue.ticket(timeout=_QUEUE_WAIT_TIMEOUT):
+                self._pipe_to_backend(client_sock, raw_headers,
+                                      body_prefix, target_port, _LLAMA_SERVER_LABEL)
+        except TimeoutError:
+            log.warning(f"Queue wait timed out for model '{model_id}' on port {target_port}")
+            self._send_error_response(
+                client_sock, 503,
+                f"Model '{model_id}' is busy (queue wait exceeded {_QUEUE_WAIT_TIMEOUT:.0f}s)")
+        except RuntimeError as e:
+            log.error(f"Queue unavailable for model '{model_id}': {e}")
+            self._send_error_response(
+                client_sock, 503, f"Model '{model_id}' queue is unavailable")
+
     def _pipe_to_backend(self, client_sock: socket.socket, raw_headers: bytes,
+                          body_prefix: bytes, target_port: int, label: str) -> None:
+        """Track the request as active, then run the raw pipe.
+
+        The active counter is what stops the idle reaper / LRU eviction from
+        unloading a model in the middle of a long generation.
+        """
+        tracking = label == _LLAMA_SERVER_LABEL
+        if tracking and self.model_manager is not None:
+            self.model_manager.note_request_start(target_port)
+        try:
+            self._pipe_to_backend_inner(
+                client_sock, raw_headers, body_prefix, target_port, label)
+        finally:
+            if tracking and self.model_manager is not None:
+                self.model_manager.note_request_end(target_port)
+
+    def _pipe_to_backend_inner(self, client_sock: socket.socket, raw_headers: bytes,
                           body_prefix: bytes, target_port: int, label: str) -> None:
         """Forward the request (reconstructed verbatim) to a backend and pipe bidirectionally."""
         try:
@@ -683,6 +846,13 @@ class RawTCPForwarder:
                         except OSError:
                             pass
                         open_socks.remove(sock)
+                        # Close the EOF side explicitly. Leaving it in no list meant
+                        # the finally block never closed it; CPython's refcounting
+                        # usually did, but that is not a contract.
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
                     else:
                         try:
                             other.sendall(data)
