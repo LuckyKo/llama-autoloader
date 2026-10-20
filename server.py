@@ -39,7 +39,7 @@ import yaml
 from fastapi import (
     FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect,
 )
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict
 import uvicorn
@@ -638,6 +638,24 @@ class LoadedModel:
 
     def touch(self):
         self.last_used = time.time()
+
+
+@dataclass
+class UnloadResult:
+    """Outcome of one unload request.
+
+    Unloading is only successful when the engine process is actually gone; a
+    termination that cannot be verified is a failure, because every caller
+    (safe-mode, VRAM seams, LRU eviction) treats a successful unload as a
+    guarantee that the memory was released.
+    """
+    model_id: str
+    unloaded: bool
+    pid: int = 0
+    reason: str = ""
+
+    def failure(self) -> Dict[str, Any]:
+        return {"model": self.model_id, "pid": self.pid, "reason": self.reason}
 
 
 @dataclass
@@ -2077,11 +2095,18 @@ class ModelManager:
         async with self._lock:
             await self._unload_unlocked(model_id)
 
-    async def _unload_unlocked(self, model_id: str):
-        """Unload a model (caller must hold self._lock)."""
+    async def _unload_unlocked(self, model_id: str) -> Optional[UnloadResult]:
+        """Unload a model (caller must hold self._lock).
+
+        Returns ``None`` when the model was not resident. Otherwise the result's
+        ``unloaded`` flag says whether the engine process is verifiably gone. On a
+        failed kill the model is put back into ``self.loaded``: the registry must
+        never claim an engine was released while its process is still running, and
+        callers can retry the unload.
+        """
         lm = self.loaded.pop(model_id, None)
         if lm is None:
-            return
+            return None
         self._invalidate_status()  # Force status cache rebuild on next request
         log.info(f"Unloading {model_id} (port {lm.port})")
         # Mark the release as IN PROGRESS: a state/load landing while this
@@ -2099,7 +2124,20 @@ class ModelManager:
         if deliberate:
             self._unload_in_progress.add(model_id)
         try:
-            await self._unload_finish(lm, model_id)
+            killed, kill_reason = await self._unload_finish(lm, model_id)
+            if not killed:
+                self.loaded.setdefault(model_id, lm)
+                # The queue was dropped before the kill; restore it so the still-
+                # resident engine keeps its FIFO ordering for future requests.
+                try:
+                    self.queue_registry.get_or_create(lm.port, model_id)
+                except Exception as e:  # noqa: BLE001 - tracking correctness comes first
+                    log.warning(f"Could not restore FIFO queue for {model_id} after failed unload: {e}")
+                self._invalidate_status()
+                log.error(f"Unload of {model_id} failed: process {lm.pid} is still "
+                          f"running ({kill_reason}); keeping the model tracked")
+                return UnloadResult(model_id, False, lm.pid, kill_reason)
+            return UnloadResult(model_id, True, lm.pid)
         finally:
             # Clear the flag only once _unload_finish has run to completion —
             # queue dropped and process killed. Past that point a state/load is
@@ -2110,8 +2148,13 @@ class ModelManager:
             if deliberate:
                 self._unload_in_progress.discard(model_id)
 
-    async def _unload_finish(self, lm: LoadedModel, model_id: str):
-        """Complete an unload: auto-save, drain, drop the queue, kill, clean up."""
+    async def _unload_finish(self, lm: LoadedModel, model_id: str) -> Tuple[bool, str]:
+        """Complete an unload: auto-save, drain, drop the queue, kill, clean up.
+
+        Returns ``(killed, reason)``. ``killed`` is False when the engine process
+        could not be verified dead; every other cleanup step is best-effort and
+        never changes that verdict.
+        """
         # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
         # card must never trigger it (even if the global default_auto_save_state is True).
         # NOTE: intentionally NOT routed through the FIFO ticket queue. This is a teardown
@@ -2145,11 +2188,20 @@ class ModelManager:
         # ticket is granted to a port that is about to die and any waiters are woken.
         self.queue_registry.remove(lm.port)
 
-        # Kill entire process group reliably across platforms
-        def _kill_proc():
+        # Kill entire process group reliably across platforms. This function
+        # VERIFIES the outcome instead of trusting a successful call: a refusal
+        # (AccessDenied) or a process that survives kill must surface as a
+        # failure, never as a silent no-op.
+        def _kill_proc() -> Tuple[bool, str]:
+            # Fake/legacy entries may not carry a real pid. There is nothing to
+            # kill, and probing pid 0/system processes is unsafe.
+            if not lm.pid or lm.pid <= 0:
+                return True, ""
+
             try:
                 parent = psutil.Process(lm.pid)
                 children = parent.children(recursive=True)
+                targets = children + [parent]
                 # Terminate children first, then parent
                 for child in children:
                     try:
@@ -2157,29 +2209,58 @@ class ModelManager:
                     except psutil.NoSuchProcess:
                         pass
                 parent.terminate()
-                gone, alive = psutil.wait_procs(children + [parent], timeout=3)
+                _gone, alive = psutil.wait_procs(targets, timeout=3)
                 for p in alive:
                     try:
                         p.kill()
                     except psutil.NoSuchProcess:
                         pass
+                _gone, alive = psutil.wait_procs(alive, timeout=3)
+                if alive:
+                    pids = ", ".join(str(p.pid) for p in alive)
+                    return False, f"process(es) {pids} still alive after terminate/kill"
+                return True, ""
             except psutil.NoSuchProcess:
-                pass
+                return True, ""  # already gone
             except Exception as e:
-                log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {e}")
-                # Fallback: kill the process group directly
-                try:
-                    if platform.system() == "Windows":
-                        # Send CTRL+C to the process group on Windows
-                        os.kill(lm.pid, os.CTRL_C_EVENT)
-                    else:
-                        # Kill the entire process group on Unix
-                        os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
-                    lm.process.kill()
-                except Exception:
-                    pass
+                primary_error = e
 
-        await asyncio.to_thread(_kill_proc)
+            log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {primary_error}")
+            # Fallback: kill the process group directly
+            fallback_error = None
+            try:
+                if platform.system() == "Windows":
+                    # Send CTRL+C to the process group on Windows
+                    os.kill(lm.pid, os.CTRL_C_EVENT)
+                else:
+                    # Kill the entire process group on Unix
+                    os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
+                lm.process.kill()
+            except Exception as e:  # noqa: BLE001 - reported below via verification
+                fallback_error = e
+
+            # The fallback's calls may succeed without actually stopping the
+            # engine. Verify by observation; "cannot verify" is a failure because
+            # callers rely on a successful unload to mean memory was freed.
+            try:
+                proc = psutil.Process(lm.pid)
+                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                    reason = f"{primary_error}; process {lm.pid} is still running"
+                    if fallback_error is not None:
+                        reason += f" (fallback error: {fallback_error})"
+                    return False, reason
+            except psutil.NoSuchProcess:
+                return True, ""
+            except Exception as e:  # noqa: BLE001
+                reason = f"{primary_error}; could not verify termination: {e}"
+                if fallback_error is not None:
+                    reason += f" (fallback error: {fallback_error})"
+                return False, reason
+            return True, ""
+
+        killed, kill_reason = await asyncio.to_thread(_kill_proc)
+        if not killed:
+            log.error(f"Process termination failed for {model_id} (pid {lm.pid}): {kill_reason}")
 
         # Bridge cards only: remove the derived config we wrote at launch. The path is
         # deterministic, so this also covers LRU-evict, force-reload, and timeout-failure
@@ -2195,14 +2276,16 @@ class ModelManager:
             # unload itself succeeded; only the caller's cancellation is preserved.
             raise asyncio.CancelledError
 
-    async def unload_model(self, model_id_input: str):
+        return killed, kill_reason
+
+    async def unload_model(self, model_id_input: str) -> Optional[UnloadResult]:
         mid = await self.resolve_model_id_strict(model_id_input)
         if not mid:
-            return
+            return None
         async with self._lock:
-            await self._unload_unlocked(mid)
+            return await self._unload_unlocked(mid)
 
-    async def unload_model_exact(self, model_id: str):
+    async def unload_model_exact(self, model_id: str) -> Optional[UnloadResult]:
         """Unload a specific registry id without name/stem resolution.
 
         Used by delete after the card has already been claimed/removed from
@@ -2210,13 +2293,23 @@ class ModelManager:
         nothing and silently leave the engine process running.
         """
         async with self._lock:
-            await self._unload_unlocked(model_id)
+            return await self._unload_unlocked(model_id)
 
-    async def unload_all(self):
+    async def unload_all(self) -> Dict[str, Any]:
+        """Unload every resident model and report which ones actually went away.
+
+        A kill that cannot be verified is reported in ``failed`` (and the model
+        remains tracked), so callers never mistake an attempted unload for a
+        released one. Returns the same shape as the HTTP endpoint:
+        ``{"unloaded_all": bool, "unloaded": [...], "failed": [{model, pid, reason}]}``.
+        """
         async with self._lock:
             ids = list(self.loaded.keys())
-            for mid in ids:
-                await self._unload_unlocked(mid)
+            results = [await self._unload_unlocked(mid) for mid in ids]
+
+        unloaded = [r.model_id for r in results if r is not None and r.unloaded]
+        failed = [r.failure() for r in results if r is not None and not r.unloaded]
+        return {"unloaded_all": not failed, "unloaded": unloaded, "failed": failed}
 
     # ---------------- GPU info ----------------
     def gpus(self) -> List[GPUInfo]:
@@ -3376,9 +3469,15 @@ async def interrupt_model(model_id: str, hard: bool = False):
 
         if hard:
             try:
-                await manager._unload_unlocked(mid)
+                result = await manager._unload_unlocked(mid)
+                if result is not None and not result.unloaded:
+                    raise HTTPException(
+                        500, f"Interrupt failed for {model_id}: "
+                             f"process {result.pid} is still running ({result.reason})")
                 return {"status": "interrupted", "model_id": mid, "mode": "hard",
                         "cancelled_requests": cancelled}
+            except HTTPException:
+                raise
             except Exception as e:
                 log.warning(f"Interrupt (hard) failed for {model_id}: {e}")
                 raise HTTPException(500, f"Interrupt failed for {model_id}: {e}")
@@ -3589,7 +3688,16 @@ async def unload_model_ep(model_id: str):
     mid = await manager.resolve_model_id_strict(model_id)
     if not mid:
         raise HTTPException(404, f"Model not found: {model_id}")
-    await manager.unload_model_exact(mid)
+    result = await manager.unload_model_exact(mid)
+    if result is not None and not result.unloaded:
+        # The process survived termination: do NOT report success. The model stays
+        # tracked so /v1/models still shows it and a retry can be issued.
+        return JSONResponse(status_code=500, content={
+            "id": mid,
+            "unloaded": False,
+            "pid": result.pid,
+            "reason": result.reason,
+        })
     return {"id": mid, "unloaded": True}
 
 @app.delete("/v1/models/{model_id}")
@@ -3639,8 +3747,12 @@ async def delete_model_ep(model_id: str):
 
 @app.post("/v1/unload_all")
 async def unload_all_ep():
-    await manager.unload_all()
-    return {"unloaded_all": True}
+    result = await manager.unload_all()
+    if result["failed"]:
+        # 200 here used to mean "all engines evicted". Returning 200 with failed
+        # entries would preserve that dangerous ambiguity for existing callers.
+        return JSONResponse(status_code=500, content=result)
+    return result
 
 # ---------- state save / load ----------
 @app.post("/v1/models/{model_id}/state/save")

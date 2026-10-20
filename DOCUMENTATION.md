@@ -384,7 +384,9 @@ Load a model on demand (JIT). Returns immediately when the process starts, not n
 
 #### `POST /v1/models/{model_id}/unload`
 
-Unload a model. Forces the llama-server process to terminate.
+Unload a model. Forces the llama-server process to terminate. Returns **500** if
+the process could not be verifiably terminated; the model then stays tracked as
+loaded so the unload can be retried.
 
 **Response Schema:**
 ```json
@@ -393,6 +395,11 @@ Unload a model. Forces the llama-server process to terminate.
   "unloaded": true
 }
 ```
+
+**Error Responses:**
+- `404 Not Found`: Model ID not recognized.
+- `500 Internal Server Error`: Process termination could not be verified. Body:
+  `{"id": "...", "unloaded": false, "pid": 1234, "reason": "..."}`.
 
 #### `POST /v1/models/{model_id}/interrupt`
 
@@ -468,9 +475,27 @@ Unload all currently loaded models.
 **Response Schema:**
 ```json
 {
-  "unloaded_all": true
+  "unloaded_all": true,
+  "unloaded": ["model-a.gguf"],
+  "failed": []
 }
 ```
+
+If any engine process survives termination, the endpoint returns **500** with
+`unloaded_all: false` and one `failed` entry per surviving model:
+
+```json
+{
+  "unloaded_all": false,
+  "unloaded": [],
+  "failed": [
+    {"model": "model-a.gguf", "pid": 1234, "reason": "process 1234 is still running"}
+  ]
+}
+```
+
+Surviving models remain tracked as loaded (`/v1/models` shows `loaded: true`),
+so callers can retry the unload rather than assuming the memory was freed.
 
 ### State Management Endpoints
 

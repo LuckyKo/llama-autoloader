@@ -25,6 +25,7 @@ suite passes without either. See "Mock / fake backend" below.
 | `tests/conftest.py` | Fixtures: `build_cfg`, `isolated_manager`, `seeded_manager`, `client`. |
 | `tests/test_regression.py` | Regression tests (plan §3). |
 | `tests/test_e2e_startup.py` | E2E startup tests (plan §4). |
+| `tests/test_unload_reporting.py` | Unload failures must report non-200 and keep the surviving engine tracked (BUG_0102). |
 
 A root-level `conftest.py` excludes the pre-existing ad-hoc scripts
 (`test_direct.py`, `test_kv_cache_reuse.py`, `test_kv_fix.py`, `test_slot_restore.py`)

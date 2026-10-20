@@ -444,7 +444,9 @@ curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/load
 
 #### `POST /v1/models/{model_id}/unload`
 
-Unload a model and terminate its `llama-server` process.
+Unload a model and terminate its `llama-server` process. Returns **500** if the
+process could not be verifiably terminated; the model then stays listed as loaded
+so the unload can be retried.
 
 ```bash
 curl -X POST http://127.0.0.1:9124/v1/models/MyModel-Q4_K_M.gguf/unload
@@ -469,7 +471,20 @@ curl -X DELETE http://127.0.0.1:9124/v1/models/strata-coder-iq3_xxs
 
 #### `POST /v1/unload_all`
 
-Unload all currently loaded models.
+Unload all currently loaded models. The response reports per-model outcomes:
+
+```json
+{
+  "unloaded_all": true,
+  "unloaded": ["model-a.gguf"],
+  "failed": []
+}
+```
+
+If any engine process survives termination the endpoint returns **500** with
+`unloaded_all: false` and a `failed` entry per model (`model`, `pid`, `reason`).
+Those models stay tracked as loaded, so callers can retry and `/v1/models`
+remains truthful.
 
 ```bash
 curl -X POST http://127.0.0.1:9124/v1/unload_all
