@@ -67,6 +67,131 @@ def _make_kill_fail(monkeypatch):
     monkeypatch.setattr(server.os, "killpg", _refuse, raising=False)
 
 
+class _ChildDenied:
+    """A child whose terminate() is denied, but which then exits."""
+
+    def __init__(self, pid=27344):
+        self.pid = pid
+
+    def terminate(self):
+        raise psutil.AccessDenied(self.pid)
+
+    def kill(self):
+        raise psutil.AccessDenied(self.pid)
+
+    def is_running(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return psutil.STATUS_ZOMBIE
+
+
+class _ParentStops:
+    """Parent that records terminate() and is gone afterwards."""
+
+    def __init__(self, pid, child):
+        self.pid = pid
+        self.child = child
+        self.terminate_called = False
+
+    def children(self, recursive=True):  # noqa: ARG002 - psutil API
+        return [self.child]
+
+    def terminate(self):
+        self.terminate_called = True
+
+    def kill(self):
+        self.terminate_called = True
+
+    def is_running(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return psutil.STATUS_ZOMBIE
+
+
+@pytest.mark.asyncio
+async def test_child_access_denied_does_not_skip_parent_termination(
+        isolated_manager, monkeypatch):
+    """One protected child must not abort termination of the engine parent."""
+    mgr = isolated_manager
+    lm = _add_resident(mgr)
+    parent = _ParentStops(lm.pid, _ChildDenied())
+
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: parent)
+    monkeypatch.setattr(server.psutil, "wait_procs",
+                        lambda procs, timeout: ([], []))
+    with monkeypatch.context() as m:
+        m.setattr(server.platform, "system", lambda: "Linux")
+        # Force the process-group fallback to fail if it is reached; the parent
+        # terminate path above must already have done the job.
+        m.setattr(server.os, "getpgid", lambda pid: pid, raising=False)
+        m.setattr(server.os, "killpg",
+                  lambda *a, **k: (_ for _ in ()).throw(psutil.AccessDenied(lm.pid)),
+                  raising=False)
+        result = await mgr.unload_model("immortal.gguf")
+
+    assert result is not None and result.unloaded is True
+    assert parent.terminate_called, "parent was never terminated after child AccessDenied"
+
+
+class _ParentNeverStops:
+    """Parent that survives psutil termination until Popen.kill()."""
+
+    def __init__(self, pid, child):
+        self.pid = pid
+        self.child = child
+        self.alive = True
+
+    def children(self, recursive=True):  # noqa: ARG002 - psutil API
+        raise psutil.AccessDenied(self.child.pid)
+
+    def terminate(self):
+        raise psutil.AccessDenied(self.pid)
+
+    def kill(self):
+        raise psutil.AccessDenied(self.pid)
+
+    def is_running(self) -> bool:
+        return self.alive
+
+    def status(self) -> str:
+        return psutil.STATUS_RUNNING if self.alive else psutil.STATUS_ZOMBIE
+
+
+class _PopenKillsParent:
+    def __init__(self, parent):
+        self.parent = parent
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+        self.parent.alive = False
+
+
+@pytest.mark.asyncio
+async def test_windows_fallback_uses_popen_kill_not_missing_os_ctrl_c(
+        isolated_manager, monkeypatch):
+    """The old ``os.CTRL_C_EVENT`` fallback never existed; Popen.kill must run."""
+    mgr = isolated_manager
+    lm = _add_resident(mgr)
+    parent = _ParentNeverStops(lm.pid, _ChildDenied())
+    popen = _PopenKillsParent(parent)
+    lm.process = popen
+
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: parent)
+    # Primary terminate/kill attempt leaves the parent alive; fallback must finish it.
+    monkeypatch.setattr(server.psutil, "wait_procs",
+                        lambda procs, timeout: ([], list(procs)))
+
+    with monkeypatch.context() as m:
+        m.setattr(server.platform, "system", lambda: "Windows")
+        result = await mgr.unload_model("immortal.gguf")
+
+    assert popen.killed, "Windows fallback never called Popen.kill()"
+    assert result is not None and result.unloaded is True
+
+
 @pytest.mark.asyncio
 async def test_unload_all_reports_failure_and_keeps_model_tracked(isolated_manager, monkeypatch):
     mgr = isolated_manager

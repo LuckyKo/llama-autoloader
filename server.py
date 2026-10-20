@@ -2694,64 +2694,134 @@ class ModelManager:
             if not lm.pid or lm.pid <= 0:
                 return True, ""
 
+            primary_error: Optional[BaseException] = None
+            parent = None
+            children = []
             try:
                 parent = psutil.Process(lm.pid)
-                children = parent.children(recursive=True)
-                targets = children + [parent]
-                # Terminate children first, then parent
-                for child in children:
-                    try:
-                        child.terminate()
-                    except psutil.NoSuchProcess:
-                        pass
-                parent.terminate()
-                _gone, alive = psutil.wait_procs(targets, timeout=3)
-                for p in alive:
-                    try:
-                        p.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-                _gone, alive = psutil.wait_procs(alive, timeout=3)
-                if alive:
-                    pids = ", ".join(str(p.pid) for p in alive)
-                    return False, f"process(es) {pids} still alive after terminate/kill"
-                return True, ""
             except psutil.NoSuchProcess:
                 return True, ""  # already gone
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - fallback below still gets a chance
                 primary_error = e
 
-            log.warning(f"Process termination failed for {model_id} (pid {lm.pid}): {primary_error}")
-            # Fallback: kill the process group directly
-            fallback_error = None
-            try:
-                if platform.system() == "Windows":
-                    # Send CTRL+C to the process group on Windows
-                    os.kill(lm.pid, os.CTRL_C_EVENT)
-                else:
-                    # Kill the entire process group on Unix
-                    os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
-                lm.process.kill()
-            except Exception as e:  # noqa: BLE001 - reported below via verification
-                fallback_error = e
+            if parent is not None:
+                try:
+                    children = parent.children(recursive=True)
+                except psutil.NoSuchProcess:
+                    children = []
+                except Exception as e:  # noqa: BLE001
+                    # One inaccessible grandchild must not abort the whole teardown.
+                    # Try direct children so the parent and its accessible children
+                    # are still terminated; the fallback below handles the rest.
+                    primary_error = primary_error or e
+                    try:
+                        children = parent.children(recursive=False)
+                    except psutil.NoSuchProcess:
+                        children = []
+                    except Exception as direct_error:  # noqa: BLE001
+                        primary_error = primary_error or direct_error
+                        children = []
 
-            # The fallback's calls may succeed without actually stopping the
-            # engine. Verify by observation; "cannot verify" is a failure because
-            # callers rely on a successful unload to mean memory was freed.
-            try:
-                proc = psutil.Process(lm.pid)
-                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                    reason = f"{primary_error}; process {lm.pid} is still running"
-                    if fallback_error is not None:
-                        reason += f" (fallback error: {fallback_error})"
-                    return False, reason
-            except psutil.NoSuchProcess:
-                return True, ""
-            except Exception as e:  # noqa: BLE001
-                reason = f"{primary_error}; could not verify termination: {e}"
+            targets = ([parent] if parent is not None else []) + children
+
+            # Terminate children first, then parent. Catch AccessDenied/ZombieProcess
+            # per process: a single protected or already-exiting descendant should
+            # not prevent the rest of the tree (especially the engine parent) from
+            # being stopped.
+            for proc in children:
+                try:
+                    proc.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    primary_error = primary_error or e
+            if parent is not None:
+                try:
+                    parent.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    primary_error = primary_error or e
+
+            alive = []
+            if targets:
+                try:
+                    _gone, alive = psutil.wait_procs(targets, timeout=3)
+                except Exception as e:  # noqa: BLE001
+                    primary_error = primary_error or e
+                    alive = list(targets)
+                for proc in alive:
+                    try:
+                        proc.kill()
+                    except psutil.NoSuchProcess:
+                        pass
+                    except Exception as e:  # noqa: BLE001
+                        primary_error = primary_error or e
+                try:
+                    _gone, alive = psutil.wait_procs(alive, timeout=3)
+                except Exception as e:  # noqa: BLE001
+                    primary_error = primary_error or e
+
+            # Force-kill when the normal path left a process alive or when psutil
+            # could not even open the parent. On Windows Popen.kill() is
+            # TerminateProcess; the old ``os.CTRL_C_EVENT`` fallback did not exist
+            # (it is a ``signal`` constant) and therefore never ran.
+            fallback_error: Optional[BaseException] = None
+            if alive or parent is None:
+                if primary_error is not None:
+                    log.warning(f"Process termination needed a fallback for {model_id} "
+                                f"(pid {lm.pid}): {primary_error}")
+                if platform.system() == "Windows":
+                    try:
+                        lm.process.kill()
+                    except Exception as e:  # noqa: BLE001 - reported via verification
+                        fallback_error = e
+                else:
+                    try:
+                        os.killpg(os.getpgid(lm.pid), signal.SIGKILL)
+                    except Exception as e:  # noqa: BLE001 - Popen.kill is the backstop
+                        fallback_error = e
+                    try:
+                        lm.process.kill()
+                    except Exception as e:  # noqa: BLE001
+                        fallback_error = fallback_error or e
+
+            # Verify by observation; "cannot verify" is a failure because callers rely
+            # on a successful unload to mean memory was freed. Re-check the known
+            # targets and, if we never opened the parent, a fresh handle by pid.
+            verify_error: Optional[BaseException] = None
+            verify_targets = list(targets)
+            if parent is None:
+                try:
+                    verify_targets = [psutil.Process(lm.pid)]
+                except psutil.NoSuchProcess:
+                    return True, ""
+                except Exception as e:  # noqa: BLE001
+                    verify_error = e
+                    verify_targets = []
+            remaining = []
+            for proc in verify_targets:
+                try:
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        remaining.append(proc.pid)
+                except psutil.NoSuchProcess:
+                    pass
+                except Exception as e:  # noqa: BLE001
+                    verify_error = verify_error or e
+
+            if remaining or verify_error is not None:
+                reason_parts = []
+                if primary_error is not None:
+                    reason_parts.append(str(primary_error))
+                if remaining:
+                    reason_parts.append(
+                        f"process(es) {', '.join(str(pid) for pid in remaining)} "
+                        f"still running")
+                if verify_error is not None:
+                    reason_parts.append(f"could not verify termination: {verify_error}")
                 if fallback_error is not None:
-                    reason += f" (fallback error: {fallback_error})"
-                return False, reason
+                    reason_parts.append(f"fallback error: {fallback_error}")
+                return False, "; ".join(reason_parts) or "process still running"
             return True, ""
 
         killed, kill_reason = await asyncio.to_thread(_kill_proc)
