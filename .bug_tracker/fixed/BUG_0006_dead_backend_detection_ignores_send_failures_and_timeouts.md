@@ -46,7 +46,7 @@ Split the policy by stage:
 Keep the “no retry after partial send” distinction in the code and tests; do not simply widen
 `_is_connection_refused` to catch every `OSError`.
 
-## Fix implemented
+## Fix (implemented)
 
 - Connect failures are now classified by stage:
   - `_is_connection_refused` keeps the existing immediate `_BackendUnreachable` behavior.

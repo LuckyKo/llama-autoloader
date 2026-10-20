@@ -41,7 +41,7 @@ Two defects in the same termination path:
 The result was a guaranteed unload failure whenever one descendant was inaccessible, even though
 the engine parent itself was killable.
 
-## Fix implemented
+## Fix (implemented)
 
 - Process enumeration is now best-effort: if recursive child enumeration fails, the code retries
   with direct children and continues instead of aborting the whole teardown.
@@ -56,7 +56,7 @@ the engine parent itself was killable.
 - If psutil cannot even open the parent, the fallback still kills by Popen handle and then verifies
   with a fresh psutil handle.
 
-## Tests
+## Verification
 
 `tests/test_unload_reporting.py`:
 - `test_child_access_denied_does_not_skip_parent_termination` — one child raises `AccessDenied`;
@@ -65,8 +65,6 @@ the engine parent itself was killable.
   the Windows fallback must call `Popen.kill()` and not `os.CTRL_C_EVENT`.
 - Existing BUG_0102 tests still verify that a genuinely immortal process returns 500 and stays
   tracked.
-
-## Verification
 
 - Full suite: **391 passed**.
 - The production sequence now has a working unload step; a caller should still treat a

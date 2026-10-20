@@ -107,7 +107,7 @@ class _FakeManager:
 
 class _RecoveringManager(_FakeManager):
     def recovery_in_progress(self, dead_port: int,
-                             expected_generation=None) -> bool:  # noqa: ARG002
+                             expected_generation: int = 0) -> bool:  # noqa: ARG002
         return dead_port == 9001
 
 

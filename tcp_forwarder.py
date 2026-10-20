@@ -45,6 +45,38 @@ from typing import Callable, Dict, Optional, Tuple
 
 log = logging.getLogger("autoloader")
 
+# Engine generation tokens are manager-assigned and always >= 1. LEGACY_GENERATION
+# (0) is the backwards-compatible "unknown instance" form: match by port only. This
+# is the single definition shared by both modules — server.py imports it from here,
+# because server.py already imports this module (the reverse import would be cyclic).
+LEGACY_GENERATION = 0
+
+
+def gen_matches(recorded: int, expected_generation: int) -> bool:
+    """True if the recorded generation matches, or the expectation is legacy (<= 0).
+
+    Single source of truth for every comparison between a stored engine token and a
+    caller's expectation, in the manager and the forwarder, so the two modules cannot
+    drift apart. One-sided by design: an engine that carries no token must NOT be
+    treated as the specific instance a caller routed to (that would let recovery
+    mistake a tokenless resident for a healthy replacement). Callers read the token
+    themselves — the forwarder must tolerate registry entries without the attribute.
+    """
+    return (expected_generation <= LEGACY_GENERATION
+            or recorded == expected_generation)
+
+
+def failure_record_applies(recorded: int, expected_generation: int) -> bool:
+    """True if a stored RecoveryFailure guards the engine the caller expected.
+
+    Deliberately broader than :func:`gen_matches`: a failure record can legitimately
+    carry exactly 0 when the token could not be resolved (the model was not in the
+    registry when the failure was written). Such a record is model-level state and
+    must keep suppressing retries for that model, whatever generation asks.
+    """
+    return gen_matches(recorded, expected_generation) or recorded == LEGACY_GENERATION
+
+
 # How much of the request body we read up-front to extract `model`. AC-style chat bodies carry
 # a long system prompt + history BEFORE the model field, so 4 KiB was not enough and extraction
 # failed -> the request silently fell through to FastAPI (404). 16 KiB covers realistic small
@@ -305,8 +337,8 @@ class RawTCPForwarder:
 
     # ------------------------------------------------------------- liveness checks
     def _find_engine(self, port: int,
-                     generation: int = 0) -> Optional[Tuple[str, object]]:
-        """Snapshot the loaded model matching ``(port, generation)``.
+                     expected_generation: int = LEGACY_GENERATION) -> Optional[Tuple[str, object]]:
+        """Snapshot the loaded model matching ``(port, expected_generation)``.
 
         Runs on forwarder worker/watchdog threads. ``self.loaded`` is only mutated on
         the main event loop, so iterating a list copy is the safe cross-thread read
@@ -322,7 +354,7 @@ class RawTCPForwarder:
         for mid, lm in items:
             if getattr(lm, "port", None) != port:
                 continue
-            if generation > 0 and int(getattr(lm, "generation", 0) or 0) != generation:
+            if not gen_matches(int(getattr(lm, "generation", 0) or 0), expected_generation):
                 continue
             return mid, lm
         return None
@@ -388,6 +420,54 @@ class RawTCPForwarder:
                 self._liveness_probe_locks[key] = lock
             return lock
 
+    def _retire_liveness_state(self, key: Tuple[int, int]) -> None:
+        """Drop all per-(port, generation) liveness bookkeeping.
+
+        Generations increment forever, so a key is never overwritten by a newer
+        instance and must be popped explicitly. Mirrors _cancel_unresponsive_active,
+        which already pops the per-key active-connection entries unconditionally:
+        these maps hold scalars, so there is no inner container to test for emptiness.
+
+        Safe because the state is already unreadable once the engine is gone:
+        _check_engine_liveness returns early on ``ready`` False, and _find_engine
+        stops matching a generation that the manager has replaced. A generation of
+        0 means "any instance" in _find_engine; every registered engine carries
+        generation >= 1, so a 0 key can only come from an unresolved caller and
+        retiring it just resets that port's probe state.
+
+        Callers: _handle_confirmed_hang (a hang proves the instance dead) and
+        _liveness_watchdog (the registry no longer contains the instance, which
+        covers plain unloads, LRU eviction and reloads).
+        """
+        with self._liveness_lock:
+            self._liveness_last_probe.pop(key, None)
+            self._liveness_probe_locks.pop(key, None)
+            self._liveness_failures.pop(key, None)
+
+    def _retire_stale_liveness_state(self, items) -> None:
+        """Retire liveness state for ``(port, generation)`` pairs not in ``items``.
+
+        Covers the retirements that never confirm a hang: a plain unload, an LRU
+        eviction, or a completed reload. ``_liveness_probe_locks`` is the authoritative
+        key set because ``_liveness_probe_lock`` is the only writer of these dicts
+        and runs before any timestamp or failure count is recorded for a key.
+
+        The key snapshot is taken under ``_liveness_lock``: request threads insert
+        probe locks concurrently, and iterating a dict whose size changes raises
+        RuntimeError, which would silently kill the watchdog thread. The retires
+        themselves run outside that block (``threading.Lock`` is not reentrant).
+        """
+        live = set()
+        for _mid, lm in items:
+            port = int(getattr(lm, "port", 0) or 0)
+            if port > 0:
+                live.add((port, int(getattr(lm, "generation", 0) or 0)))
+        with self._liveness_lock:
+            keys = list(self._liveness_probe_locks)
+        for key in keys:
+            if key not in live:
+                self._retire_liveness_state(key)
+
     def _schedule_recovery(self, model_id: str, port: int,
                            generation: int = 0) -> None:
         """Start the shared manager recovery without blocking the calling thread.
@@ -428,6 +508,15 @@ class RawTCPForwarder:
             except Exception as e:  # noqa: BLE001 - recovery failures are reported by manager
                 log.error(f"Background recovery for '{model_id}' on port {port} "
                           f"(generation {generation}) failed: {e}")
+            finally:
+                # Drop the marker only once the recovery has actually run. The set
+                # exists to coalesce *concurrent* schedules for one generation; while
+                # it is held, a later _schedule_recovery for the same key is a no-op,
+                # so retaining it after completion would suppress every retry for
+                # that generation forever. Repeat attempts are bounded manager-side
+                # by the in-flight recovery dedup and the BUG_0007 cooldown.
+                with self._liveness_lock:
+                    self._scheduled_recoveries.discard(key)
 
         future.add_done_callback(_done)
 
@@ -445,6 +534,10 @@ class RawTCPForwarder:
             lm.ready = False
         log.error(f"Engine for '{mid}' on port {port} (generation {generation}) "
                   f"is unresponsive: {reason}; evicting and reloading")
+        # This generation is retired here, so its liveness bookkeeping is dead
+        # state: without this, every reload cycle leaks a probe lock and two
+        # dict entries for a key that is never probed again.
+        self._retire_liveness_state((port, generation))
         self._schedule_recovery(mid, port, generation)
         if cancel_connections:
             # Watchdog path: abort the active pipes to bound the client's wait, sending
@@ -490,6 +583,12 @@ class RawTCPForwarder:
             healthy = self._probe_engine_health(port)
             now = time.monotonic()
             with self._liveness_lock:
+                if key not in self._liveness_probe_locks:
+                    # Retired while this probe was in flight (the engine was
+                    # confirmed dead or unloaded concurrently). Re-writing the
+                    # timestamp/counter would resurrect dead state, so stop here;
+                    # a retired engine is not a liveness failure for this caller.
+                    return True
                 self._liveness_last_probe[key] = now
                 if healthy:
                     self._liveness_failures.pop(key, None)
@@ -518,6 +617,13 @@ class RawTCPForwarder:
                 items = list(manager.loaded.items())
             except Exception:  # noqa: BLE001 - manager shutting down / fake
                 continue
+
+            # Retire liveness bookkeeping for generations the registry no longer
+            # holds. A plain unload, an LRU eviction or a completed reload drops the
+            # entry without ever confirming a hang, so _handle_confirmed_hang alone
+            # does not cover them.
+            self._retire_stale_liveness_state(items)
+
             for mid, lm in items:
                 if not self._running:
                     break
@@ -533,19 +639,20 @@ class RawTCPForwarder:
                 except Exception as e:  # noqa: BLE001 - watchdog must never die
                     log.warning(f"Liveness watchdog error for '{mid}' on port {port}: {e}")
 
-    def cancel_active(self, port: int, generation: Optional[int] = None) -> int:
+    def cancel_active(self, port: int,
+                      expected_generation: int = LEGACY_GENERATION) -> int:
         """Best-effort cancel of in-flight requests bound to one engine instance.
 
         Closes the underlying upstream (and client) sockets. For a recent llama-server build this
         causes generation to stop ("srv stop: cancel task"), while leaving the resident model loaded.
-        Passing ``generation`` targets only that instance; omitting it keeps the legacy
-        port-wide behavior. Returns the number of connections cancelled.
+        Passing ``expected_generation`` targets only that instance; the legacy 0 form keeps
+        the port-wide behavior. Returns the number of connections cancelled.
         """
         with self._active_lock:
-            if generation is None:
+            if expected_generation == LEGACY_GENERATION:
                 keys = [key for key in self._active_conns if key[0] == port]
             else:
-                keys = [(port, generation)]
+                keys = [(port, expected_generation)]
             pairs = []
             for key in keys:
                 pairs.extend(self._active_conns.pop(key, ()))
@@ -758,7 +865,7 @@ class RawTCPForwarder:
                 retry_after = self._recovery_retry_after(model_id)
                 if retry_after is not None:
                     self._send_recovery_error(
-                        client_sock, model_id, None, 0,
+                        client_sock, model_id, None, LEGACY_GENERATION,
                         f"Model '{model_id}' recovery is cooling down after a failed reload")
                     return
                 # Model not loaded -> JIT load it, wait for readiness, then pipe.
@@ -776,7 +883,7 @@ class RawTCPForwarder:
                 # JIT load failed (unknown model / timeout / spawn error / cooldown).
                 log.error(f"JIT load failed for '{model_id}' on {method} {path}")
                 self._send_recovery_error(
-                    client_sock, model_id, None, 0,
+                    client_sock, model_id, None, LEGACY_GENERATION,
                     f"Failed to load model '{model_id}'")
                 return
             # Non-LLM endpoint -> forward to FastAPI.
@@ -1134,7 +1241,7 @@ class RawTCPForwarder:
         return target[0] if target else None
 
     def _recover_dead_backend(self, model_id: str, dead_port: int,
-                              expected_generation: int = 0) -> Optional[Tuple[int, int]]:
+                              expected_generation: int = LEGACY_GENERATION) -> Optional[Tuple[int, int]]:
         """Ask the manager to evict/reload one engine; return its ``(port, generation)``.
 
         ``expected_generation`` identifies the exact instance that refused the connection
@@ -1201,7 +1308,7 @@ class RawTCPForwarder:
         return None
 
     def _recovery_retry_after(self, model_id: str, dead_port: Optional[int] = None,
-                              generation: int = 0) -> Optional[float]:
+                              expected_generation: int = LEGACY_GENERATION) -> Optional[float]:
         """Seconds until a suppressed recovery may be retried, if any.
 
         The manager owns the per-model failure state (BUG_0007); this is a plain
@@ -1213,7 +1320,7 @@ class RawTCPForwarder:
         if method is None:
             return None
         try:
-            remaining = method(model_id, dead_port, generation)
+            remaining = method(model_id, dead_port, expected_generation)
         except Exception:  # noqa: BLE001 - observability must never break the error path
             return None
         if remaining is None:
@@ -1225,10 +1332,10 @@ class RawTCPForwarder:
         return remaining if remaining > 0 else None
 
     def _send_recovery_error(self, sock: socket.socket, model_id: str,
-                             dead_port: Optional[int], generation: int,
+                             dead_port: Optional[int], expected_generation: int,
                              message: str) -> None:
         """Send a 503, adding a standard ``Retry-After`` header during a cooldown."""
-        remaining = self._recovery_retry_after(model_id, dead_port, generation)
+        remaining = self._recovery_retry_after(model_id, dead_port, expected_generation)
         if remaining is None:
             self._send_error_response(sock, 503, message)
             return
@@ -1307,7 +1414,7 @@ class RawTCPForwarder:
 
     def _pipe_with_ticket(self, client_sock: socket.socket, raw_headers: bytes,
                           body_prefix: bytes, target_port: int, model_id: str,
-                          queue, expected_generation: int = 0,
+                          queue, expected_generation: int = LEGACY_GENERATION,
                           _recovery_attempts: int = 0) -> None:
         """Acquire the model's FIFO ticket, then pipe; surface busy timeouts as 503.
 
@@ -1369,11 +1476,10 @@ class RawTCPForwarder:
             # requests still waiting on it. They are not doomed: join the recovery and
             # retry once on the replacement port instead of surfacing a spurious 503.
             active = getattr(self.model_manager, "recovery_in_progress", None)
-            # Generation 0 is the legacy/fake "unknown instance" form: match any
+            # The legacy 0 form (LEGACY_GENERATION) means "unknown instance": match any
             # recovery on the port, as before.
-            active_generation = expected_generation if expected_generation > 0 else None
             if (_recovery_attempts < 1 and active is not None
-                    and active(target_port, active_generation)):
+                    and active(target_port, expected_generation)):
                 try:
                     recovered = self._wait_for_recovery(
                         model_id, target_port, expected_generation)

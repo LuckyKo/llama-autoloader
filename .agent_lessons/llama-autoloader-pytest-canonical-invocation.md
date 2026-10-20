@@ -5,6 +5,8 @@ confidence: verified
 author: coder_ui_builder_20261006_112342.jsonl
 contributors:
   - coder_loader-slots-build_20261009_070016.jsonl
+  - reviewer_lru-eviction-review_20261020_155658.jsonl
+  - coder_polish-coder-a_20261020_164840.jsonl
 ---
 
 # `python -m pytest -q` at the repo root FAILS collection — use the explicit paths
@@ -40,6 +42,40 @@ Baseline for 2026-10-06 is **216 passed** (~70 s). After the Strata bridge-card 
 setting (2026-10-09): **245 passed** (+7). Use the counts, not the exit code, to detect regressions.
 ⚠️ Quoted baselines go stale fast in this repo — re-verify the pre-change count with a
 `--collect-only` run before trusting a "N passed" figure from a plan.
+
+## Addendum 2026-10-20 @ 3926acecf917796ed2fbf2a0073d97685a863219
+
+`pytest.ini` `norecursedirs` now includes **`temp`** (and `_harness`):
+
+```
+norecursedirs = *.egg backends states static temp _harness __pycache__ .git
+```
+
+So the "neither mechanism covers `temp/`" diagnosis above no longer holds — a bare
+`python -m pytest -q` at the repo root no longer dies on `temp/test_kv_fix.py`. The
+explicit-path invocation is still the safe habit (and still required for anything
+placed in a *new* directory), but the specific failure mode described above is fixed.
+The "0 tests run can look like a broken feature" trap remains valid for any
+collection error.
+
+## Addendum 2026-10-20 @ d977c82bd3202cdc8ed7523190be478c211e6165
+
+Current full-suite count for the canonical invocation is **397 passed in ~125 s**
+(`python -m pytest tests/ test_server.py -q -n 0`). The older counts above are historical only.
+
+**Do not add `-x` to this invocation.** Measured: an `-x` run aborted at ~64% with
+`ERROR at setup of tests/test_safe_mode_slot_ordering.py::TestSlotActionRetry::test_read_timeout_still_tries_other_formats`
+→ `OSError: [WinError 10055]` inside `asyncio`'s `socket.socketpair()` while *constructing a new
+event loop*. That is Windows socket-queue/ephemeral-port exhaustion accumulated across thousands of
+sequential event loops — **`-n 0` does not prevent it**, so serial mode is not evidence the cause is
+code. It passed in isolation (`1 passed in 0.39s`), and the same event also emits a harmless
+`AttributeError: 'ProactorEventLoop' object has no attribute '_ssock'`
+`PytestUnraisableExceptionWarning` from the aborted loop's `__del__` — noise, not a second failure.
+
+The trap is the reported count: `255 passed, 1 error` under `-x` is a **truncated** figure — the
+remaining ~142 tests never ran, so a real regression later in collection order would be invisible.
+Correct move after hitting it: re-run the same selection WITHOUT `-x` for complete coverage, then
+report that number.
 
 ## Related
 

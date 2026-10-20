@@ -119,6 +119,23 @@ llama-autoloader instance
 
 ---
 
+## Environment Variables
+
+Tunables that have no `config.yaml` key are read from the process environment. All values are optional and fall back to the defaults shown; they are read at startup.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `AUTOLOADER_INTERNAL_PORT` | 1235 | Internal FastAPI / uvicorn port (see Running Multiple Instances) |
+| `AUTOLOADER_JIT_LOAD_TIMEOUT` | 300 | Seconds to wait for a JIT load before giving up |
+| `AUTOLOADER_MAX_RECOVERY_WAITERS` | 32 | Cap on forwarder threads waiting on one engine's recovery; beyond the cap a retryable 503 is returned |
+| `AUTOLOADER_LIVENESS_SILENCE` | 10 | Seconds of backend silence before a liveness check is triggered on an in-flight request |
+| `AUTOLOADER_LIVENESS_FAILURES` | 2 | Consecutive failed `/health` probes before an engine is declared dead |
+| `AUTOLOADER_LIVENESS_PROBE_INTERVAL` | 10 | Minimum seconds between `/health` probes per engine (prevents a health-check stampede) |
+| `AUTOLOADER_RECOVERY_BACKOFF_BASE` | 5 | Base seconds for exponential recovery backoff (doubled per consecutive failure) |
+| `AUTOLOADER_RECOVERY_BACKOFF_MAX` | 300 | Cap on recovery backoff in seconds |
+
+---
+
 ## Directory Structure
 
 ```
@@ -268,6 +285,8 @@ per-tick refresh.
 Base URL: `http://127.0.0.1:9124`
 
 All endpoints return JSON unless otherwise noted. Models are automatically loaded (JIT) on first inference request if not already loaded.
+
+> The raw-TCP forwarder also accepts `/api/v1` as an alias for `/v1`, so `/api/v1/chat/completions`, `/api/v1/models`, etc. route identically to their `/v1/...` forms.
 
 ---
 
@@ -765,9 +784,22 @@ curl http://127.0.0.1:9124/v1/status
       "last_used_s_ago": 3.2,
       "ready": true
     }
+  ],
+  "recovery_failures": [
+    {
+      "model": "MyModel-Q4_K_M.gguf",
+      "port": 9001,
+      "generation": 3,
+      "attempts": 2,
+      "reason": "engine exited during load",
+      "failed_at": 1234.5,
+      "retry_after_s": 12.4
+    }
   ]
 }
 ```
+
+`recovery_failures` is a list (sorted by model) with one entry per model currently under a recovery cooldown: `model`, `port`, `generation`, `attempts` (consecutive failed reloads), `reason` (last failure), `failed_at` (monotonic timestamp of the failure), and `retry_after_s` (seconds remaining before the next attempt). It is an empty list when no model is in a failed-recovery state. The forwarder also sends a `Retry-After` header on recovery/JIT 503 responses.
 
 ---
 
@@ -887,7 +919,7 @@ API type: **OpenAI-compatible**. No API key required.
 2. **JIT Load** — When an API request arrives for a model that isn't loaded, spawns a `llama-server` subprocess on an available port
 3. **Proxy** — Forwards the request to the model's `llama-server` process and streams the response back
 4. **Idle Reaper** — A background task checks every 10 seconds and unloads models that have been idle longer than `idle_timeout_seconds`
-5. **LRU Eviction** — If `max_loaded_models` is reached, the least-recently-used unpinned model is unloaded before loading a new one
+5. **LRU Eviction** — If `max_loaded_models` is reached, the least-recently-used unpinned model (excluding pinned, busy, and mid-load models) is unloaded before loading a new one. If no eligible model can be evicted, or the eviction fails, the load is refused with an error rather than proceeding over surviving processes.
 6. **Dead-Backend Recovery** — If a resident engine dies silently, the next LLM request detects the refused connection, evicts/reloads that model once (shared by concurrent requests), and retries the request instead of returning a permanent 502
 
 ---

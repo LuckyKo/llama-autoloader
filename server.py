@@ -57,7 +57,8 @@ from bridge_adapter import _launch_llama, _launch_bridge, _expand_token
 # Per-model FIFO ticket queue: orders LLM requests (TCP forwarder) against state
 # save/restore (FastAPI) so a restore enqueued first runs before the next request.
 from model_queue import ModelQueueRegistry
-from tcp_forwarder import RawTCPForwarder
+from tcp_forwarder import (LEGACY_GENERATION, RawTCPForwarder,
+                          failure_record_applies, gen_matches)
 
 # Legacy launch template used ONLY when migrating a pre-registry ``strata:`` section into
 # ``engines.strata``. New engines must supply their own ``argv`` (there is no generic default).
@@ -1973,7 +1974,7 @@ class ModelManager:
             (mid, lm) for mid, lm in self.loaded.items()
             if mid != target_model_id and not lm.config.pinned
             and lm.active_requests == 0
-            and not (self._loading_tasks.get(mid) and not self._loading_tasks[mid].done())
+            and not self._is_loading(mid)
         ]
         if not candidates:
             log.warning(
@@ -1987,15 +1988,25 @@ class ModelManager:
         return await self._unload_unlocked(lru_id)
 
     # ---- active-request tracking (called from forwarder worker threads) ----
+    def _gen_matches(self, recorded: int, expected_generation: int) -> bool:
+        """True if the recorded engine token matches, or the caller's expectation is legacy (<= 0).
+
+        Thin wrapper over the module-level :func:`gen_matches` (tcp_forwarder.py) so manager-side
+        engine-identity checks share one definition with the forwarder. NOT used for RecoveryFailure
+        records -- those go through the deliberately broader failure_record_applies, whose own
+        token may be unresolvable and must still guard the model.
+        """
+        return gen_matches(recorded, expected_generation)
+
     def note_request_start(self, port: int,
-                           generation: int = 0) -> Optional[LoadedModel]:
+                           expected_generation: int = LEGACY_GENERATION) -> Optional[LoadedModel]:
         """Mark one in-flight request and return the EXACT engine instance.
 
-        ``generation`` narrows the match to the instance the forwarder routed to.
+        ``expected_generation`` narrows the match to the instance the forwarder routed to.
         The returned object is the end() token: a late request from a dead engine
         must decrement its own instance, never a replacement that reused the port.
 
-        ``generation <= 0`` is the backwards-compatible fake/legacy form: match by
+        The legacy 0 form is the backwards-compatible fake/legacy form: match by
         port only. Real engines always carry a manager-assigned positive generation.
         """
         # Snapshot: this runs on a forwarder thread while the event loop may
@@ -2003,7 +2014,7 @@ class ModelManager:
         for lm in list(self.loaded.values()):
             if lm.port != port:
                 continue
-            if generation > 0 and lm.generation != generation:
+            if not self._gen_matches(lm.generation, expected_generation):
                 continue
             lm.active_requests += 1
             lm.touch()
@@ -2038,6 +2049,15 @@ class ModelManager:
             lock = asyncio.Lock()
             self._model_locks[model_id] = lock
         return lock
+
+    def _is_loading(self, model_id: str) -> bool:
+        """True if a load task for this model is in flight (caller must hold ``_lock``).
+
+        A finished-but-unpruned task entry is not "loading": the finally clause
+        pops it, and a stale entry must never gate eviction or unload marking.
+        """
+        task = self._loading_tasks.get(model_id)
+        return task is not None and not task.done()
 
     async def load_model(self, model_id_input: str, force: bool = False,
                          respect_recovery_cooldown: bool = True) -> LoadedModel:
@@ -2100,7 +2120,7 @@ class ModelManager:
             # not be told the endpoint was deliberately released.
             self._unload_in_progress.discard(model_id)
 
-            if model_id in self._loading_tasks and not self._loading_tasks[model_id].done():
+            if self._is_loading(model_id):
                 task = self._loading_tasks[model_id]
             else:
                 task = asyncio.create_task(self._do_load_model(model_id, force=force))
@@ -2119,18 +2139,24 @@ class ModelManager:
             log.info(f"Cleared failed-recovery backoff for '{model_id}'")
 
     def _record_recovery_failure(self, model_id: str, dead_port: int,
-                                 generation: int = 0, reason: str = "") -> RecoveryFailure:
+                                 expected_generation: int = LEGACY_GENERATION,
+                                 reason: str = "") -> RecoveryFailure:
         """Record one failed recovery and arm exponential backoff (BUG_0007).
 
         Runs on the main event loop. Existing state is never replaced by a *shorter*
         cooldown: repeated deterministic failures grow the delay up to the cap.
+
+        ``expected_generation`` is the engine the caller was recovering. With the
+        legacy 0 form the token is resolved from the registry entry instead, so the
+        stored record carries a concrete generation whenever one is knowable.
         """
         previous = self._recovery_failures.get(model_id)
         attempts = (previous.attempts + 1) if previous else 1
         exponent = min(attempts - 1, 20)
         delay = min(_RECOVERY_BACKOFF_MAX_S, _RECOVERY_BACKOFF_BASE_S * (2 ** exponent))
         now_mono = time.monotonic()
-        if generation <= 0:
+        generation = expected_generation
+        if expected_generation <= LEGACY_GENERATION:
             current = self.loaded.get(model_id)
             generation = int(getattr(current, "generation", 0) or 0) if current else 0
         failure = RecoveryFailure(
@@ -2149,7 +2175,7 @@ class ModelManager:
 
     def recovery_retry_after(self, model_id_hint: str = "",
                              dead_port: Optional[int] = None,
-                             expected_generation: int = 0) -> Optional[float]:
+                             expected_generation: int = LEGACY_GENERATION) -> Optional[float]:
         """Seconds remaining on a model's failed-recovery cooldown, or None.
 
         Safe to call from forwarder worker threads: it only snapshots dict values and
@@ -2164,9 +2190,10 @@ class ModelManager:
                 resolved_hint = self._lookup_model_locked(model_id_hint)
             except Exception:  # noqa: BLE001 - concurrent registry mutation
                 resolved_hint = None
+        # Deliberately the broader record rule, not _gen_matches: a failure recorded
+        # without a resolvable token still guards this model (see failure_record_applies).
         for rec in list(self._recovery_failures.values()):
-            if (expected_generation > 0
-                    and rec.generation not in (0, expected_generation)):
+            if not failure_record_applies(rec.generation, expected_generation):
                 continue
             matched = dead_port is not None and rec.dead_port == dead_port
             if not matched and model_id_hint:
@@ -2197,7 +2224,7 @@ class ModelManager:
         return out
 
     async def recover_dead_model(self, model_id_hint: str, dead_port: int,
-                                 expected_generation: int = 0,
+                                 expected_generation: int = LEGACY_GENERATION,
                                  force: bool = False) -> Optional[LoadedModel]:
         """Evict and reload the resident model whose engine refused a connection.
 
@@ -2256,15 +2283,15 @@ class ModelManager:
             self._recovery_tasks.pop(task_key, None)
 
     def recovery_in_progress(self, dead_port: int,
-                             expected_generation: Optional[int] = None) -> bool:
+                             expected_generation: int = LEGACY_GENERATION) -> bool:
         """True while a dead-backend recovery owns ``dead_port``.
 
-        With ``expected_generation``, only that engine generation counts; without it,
-        any active recovery for the port counts. Called by forwarder worker threads:
-        ``dict.get`` and ``Task.done()`` are safe reads from another thread; no manager
-        lock is needed (and cannot be taken here).
+        With a concrete ``expected_generation``, only that engine generation counts;
+        with the legacy 0 form, any active recovery for the port counts. Called by
+        forwarder worker threads: ``dict.get`` and ``Task.done()`` are safe reads from
+        another thread; no manager lock is needed (and cannot be taken here).
         """
-        if expected_generation is not None:
+        if expected_generation != LEGACY_GENERATION:
             task = self._recovery_tasks.get((dead_port, expected_generation))
             return task is not None and not task.done()
         return any(
@@ -2293,7 +2320,7 @@ class ModelManager:
         return model_id_hint
 
     async def _recover_dead_model_impl(self, model_id_hint: str, dead_port: int,
-                                       expected_generation: int = 0) -> Optional[LoadedModel]:
+                                       expected_generation: int = LEGACY_GENERATION) -> Optional[LoadedModel]:
         """Do one dead-backend eviction/reload (``recover_dead_model`` dedups calls).
 
         BUG_0005: the slow drain/kill runs OUTSIDE ``self._lock``. Only the fast
@@ -2360,8 +2387,7 @@ class ModelManager:
                             # A newer generation on the same (stable) port is a healthy
                             # replacement from a concurrent load/restore; unloading it here
                             # would kill the fix instead of the failure.
-                            if (expected_generation > 0
-                                    and lm.generation != expected_generation):
+                            if not self._gen_matches(lm.generation, expected_generation):
                                 log.info(
                                     f"Recovery for {reload_mid} on port {dead_port} skipped: "
                                     f"port now has engine generation {lm.generation} "
@@ -2389,12 +2415,14 @@ class ModelManager:
                         killed, kill_reason = await self._unload_finish(
                             detached_lm, reload_mid)
                     except BaseException as exc:
-                        # BUG_0005: the teardown above runs OUTSIDE self._lock, so the
+                        # BUG_0009: the teardown above runs OUTSIDE self._lock, so the
                         # pop made by _begin_unload_locked must be undone if it aborts:
                         # routing, LRU eviction and the next recovery pass all key off
                         # self.loaded. The entry comes back with ready=False, so idle_reaper
                         # will not reclaim it (it skips not-ready entries) -- that is
                         # deliberate; only the next recovery/unload pass can.
+                        # Unconditional restore (unlike _unload_unlocked's liveness-gated
+                        # handler): ready was forced False above, so this entry can't route.
                         # The flag is cleared before re-inserting on purpose: a cancelled
                         # lock acquire must never leave _unload_in_progress set forever.
                         if deliberate:
@@ -2448,6 +2476,20 @@ class ModelManager:
             self._clear_recovery_failure(reload_mid)
             return lm
 
+    def _require_engine_gone(self, result: Optional[UnloadResult],
+                             context: str) -> None:
+        """Refuse a load when a preceding unload/eviction left its process running.
+
+        Shared by the force-reload and LRU-eviction guards in _do_load_model: both
+        must abort rather than spawn a replacement engine into a slot whose previous
+        process was not verifiably killed (same contract as unload). ``context`` is
+        the caller's own prefix; a ``None`` result means nothing was attempted and
+        is never an error.
+        """
+        if result is not None and not result.unloaded:
+            raise RuntimeError(
+                f"{context}: process {result.pid} is still running ({result.reason})")
+
     async def _do_load_model(self, model_id: str, force: bool = False) -> LoadedModel:
         if not model_id or not model_id.strip():
             raise ValueError("Model ID must be a non-empty string")
@@ -2460,15 +2502,14 @@ class ModelManager:
                     # the registry slot. If the kill cannot be verified, refuse the load
                     # rather than leaking a second engine (same contract as unload).
                     result = await self._unload_unlocked(model_id)
-                    if result is not None and not result.unloaded:
-                        raise RuntimeError(
-                            f"Cannot reload {model_id}: previous engine process "
-                            f"{result.pid} is still running ({result.reason})")
+                    self._require_engine_gone(
+                        result, f"Cannot reload {model_id} after unloading "
+                        f"the previous engine")
                 evict_result = await self._evict_lru_if_needed(model_id)
-                if evict_result is not None and not evict_result.unloaded:
-                    raise RuntimeError(
-                        f"Cannot load {model_id}: LRU eviction of {evict_result.model_id} "
-                        f"failed — process {evict_result.pid} is still running ({evict_result.reason})")
+                self._require_engine_gone(
+                    evict_result,
+                    f"Cannot load {model_id}: LRU eviction of "
+                    f"{evict_result.model_id if evict_result else model_id} failed")
                 cfg = self.models[model_id]
                 port = self._allocate_port(model_id)
                 # Engine dispatch: bridge cards build their own argv/cwd/env from the engine
@@ -2625,8 +2666,7 @@ class ModelManager:
         # reached from a load in flight (force-reload, failed-load and
         # cancelled-load cleanup); a state/load landing during such a load
         # must join it through the load path, not be refused.
-        loading_now = self._loading_tasks.get(model_id)
-        deliberate = not (loading_now and not loading_now.done())
+        deliberate = not self._is_loading(model_id)
         if deliberate:
             self._unload_in_progress.add(model_id)
         return lm, deliberate
@@ -2684,6 +2724,8 @@ class ModelManager:
             # either before the kill (process alive, must stay visible to routing
             # and LRU) or at _unload_finish's own re-raise after a verified
             # kill (dead, must NOT come back as a routable ready=True entry).
+            # Unlike the recovery handler (which forces ready=False before detaching),
+            # a normal unload can abort with the model still ready=True — hence this gate.
             # The caller already holds self._lock (contract), so the restore runs
             # directly — re-acquiring would deadlock. setdefault matches the
             # sibling restores in _finalize_unload_locked / recovery.

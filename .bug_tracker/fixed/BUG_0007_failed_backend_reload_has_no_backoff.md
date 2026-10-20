@@ -47,7 +47,7 @@ Add per-model recovery failure state:
 
 Do not suppress forever: a manual “load now”/force action should bypass the cooldown.
 
-## Fix implemented
+## Fix (implemented)
 
 - Added `RecoveryFailure` state keyed by resolved model id:
   `(model_id, dead_port, generation, attempts, reason, failed_at, retry_at)`.

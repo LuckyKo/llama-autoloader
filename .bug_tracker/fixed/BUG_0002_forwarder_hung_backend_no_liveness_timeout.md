@@ -60,7 +60,7 @@ Add a bounded liveness path that does not falsely kill legitimate long prompt ev
 Do not implement this as a simple “no bytes for N seconds” timeout without accounting for long
 prompt eval; that would kill healthy cold requests.
 
-## Fix implemented
+## Fix (implemented)
 
 - `RawTCPForwarder` now runs a daemon liveness watchdog while accepting connections. It probes
   every resident `ready` engine's `/health` with a short connect/read timeout.

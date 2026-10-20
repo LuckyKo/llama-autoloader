@@ -133,6 +133,39 @@ def test_liveness_requires_consecutive_failures_and_marks_engine_unready(monkeyp
     assert f._check_engine_liveness(lm.port, lm.generation) is False
     assert lm.ready is False
     assert scheduled == [("m.gguf", 19555, 7)]
+    # The generation is retired here, so its liveness bookkeeping must not survive:
+    # these dicts are keyed by a monotonically increasing generation, so anything
+    # left behind leaks one entry (including a Lock) per reload cycle.
+    assert not f._liveness_probe_locks
+    assert not f._liveness_last_probe
+    assert not f._liveness_failures
+
+
+def test_watchdog_retires_liveness_state_for_unloaded_generation(monkeypatch):
+    mgr = _FakeManager()
+    mgr.models = {}
+    gone = _add_resident(mgr, model_id="gone.gguf", port=19560, generation=12)
+    kept = _add_resident(mgr, model_id="kept.gguf", port=19561, generation=13)
+    mgr.loaded["gone.gguf"] = gone
+    mgr.loaded["kept.gguf"] = kept
+    f = _fwd(mgr)
+
+    monkeypatch.setattr(tf, "_LIVENESS_PROBE_INTERVAL", 0.0)
+    monkeypatch.setattr(f, "_probe_engine_health", lambda port: False)
+    for lm in (gone, kept):
+        assert f._check_engine_liveness(lm.port, lm.generation) is True
+    assert (gone.port, gone.generation) in f._liveness_probe_locks
+
+    # A plain unload / LRU eviction drops the registry entry without ever
+    # confirming a hang, so the registry sweep is what bounds these dicts.
+    del mgr.loaded["gone.gguf"]
+    f._retire_stale_liveness_state(list(mgr.loaded.items()))
+
+    assert (gone.port, gone.generation) not in f._liveness_probe_locks
+    assert (gone.port, gone.generation) not in f._liveness_last_probe
+    assert (gone.port, gone.generation) not in f._liveness_failures
+    # A still-registered engine must never lose its accumulated probe state.
+    assert (kept.port, kept.generation) in f._liveness_probe_locks
 
 
 def test_successful_liveness_probe_resets_failures(monkeypatch):

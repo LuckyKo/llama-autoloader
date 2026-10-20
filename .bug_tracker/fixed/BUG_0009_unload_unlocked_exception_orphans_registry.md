@@ -2,7 +2,8 @@
 
 **Status:** FIXED
 **Filed:** 2026-10-20
-**Fixed:** 2026-10-20 (uncommitted, on top of `03614f1`)
+**Fixed:** 2026-10-20
+**Commit:** `3926ace`
 **Found in:** Follow-up of the `_recover_dead_model_impl` fix (same defect class, second site); the first fix's lesson `.agent_lessons/unload-teardown-exception-orphans-registry.md` recorded this site as unfixed.
 **Severity:** high
 **Component:** `server.py:_unload_unlocked` (docstring + `except BaseException` handler, ~2640-2690)
@@ -36,7 +37,7 @@ failed kill (`killed == False`), which makes a surrounding `except BaseException
 look safe by analogy — but the exception path bypasses `_finalize_unload_locked` entirely.
 None of the 10 call sites restores on exception either.
 
-## Fix
+## Fix (implemented)
 `server.py:_unload_unlocked`, in the `except BaseException as exc:` handler, after the
 flag discard: probe the process, then restore only if it may still be running.
 

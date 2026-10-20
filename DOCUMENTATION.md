@@ -104,6 +104,21 @@ models:
 - **models.root_dir**: Directory to scan for `.gguf` files (recursive)
 - **models.save_state_dir**: Directory where KV cache state files are saved
 
+### Environment Variables
+
+Tunables that have no `config.yaml` key are read from the process environment. All values are optional and fall back to the defaults shown; they are read at startup.
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `AUTOLOADER_INTERNAL_PORT` | 1235 | Internal FastAPI / uvicorn port (see Running Multiple Instances) |
+| `AUTOLOADER_JIT_LOAD_TIMEOUT` | 300 | Seconds to wait for a JIT load before giving up |
+| `AUTOLOADER_MAX_RECOVERY_WAITERS` | 32 | Cap on forwarder threads waiting on one engine's recovery; beyond the cap a retryable 503 is returned instead of consuming the whole connection budget |
+| `AUTOLOADER_LIVENESS_SILENCE` | 10 | Seconds of backend silence before a liveness check is triggered on an in-flight request |
+| `AUTOLOADER_LIVENESS_FAILURES` | 2 | Consecutive failed `/health` probes before an engine is declared dead (a transient stall is not fatal) |
+| `AUTOLOADER_LIVENESS_PROBE_INTERVAL` | 10 | Minimum seconds between `/health` probes per engine, preventing a health-check stampede |
+| `AUTOLOADER_RECOVERY_BACKOFF_BASE` | 5 | Base seconds for exponential recovery backoff (doubled per consecutive failure) |
+| `AUTOLOADER_RECOVERY_BACKOFF_MAX` | 300 | Cap on recovery backoff in seconds |
+
 ### Model Sidecar JSON Format
 
 Each model can have an optional sidecar config file named `model.gguf.json` placed alongside the `.gguf` file.
@@ -256,6 +271,8 @@ This means model-specific args are appended after global defaults, allowing them
 **Base URL:** `http://127.0.0.1:9124`
 
 All endpoints return JSON unless otherwise noted. Models are automatically loaded (JIT) on first inference request if not already loaded.
+
+> The raw-TCP forwarder also accepts `/api/v1` as an alias for `/v1`, so `/api/v1/chat/completions`, `/api/v1/models`, etc. route identically to their `/v1/...` forms.
 
 ### Model Management Endpoints
 
@@ -739,6 +756,8 @@ Select global backend. Request body: `{ "backend": "<folder_name>" }`.
 
 Detailed system status including GPU/RAM info, loaded models, and process states.
 
+The response includes a `recovery_failures` list (sorted by model) with one entry per model currently under a recovery cooldown: `model`, `port`, `generation`, `attempts` (consecutive failed reloads), `reason` (last failure), `failed_at` (monotonic timestamp of the failure), and `retry_after_s` (seconds remaining before the next attempt). It is an empty list when no model is in a failed-recovery state.
+
 #### `GET /v1/settings`
 
 Get current autoloader runtime settings.
@@ -1018,7 +1037,7 @@ When agents need to switch models:
 
 3. **Load ordering**: The autoloader loads models serially to avoid port conflicts, but other requests are queued.
 
-4. **Eviction awareness**: If `max_loaded_models` is reached, the least-recently-used unpinned model will be evicted to make room.
+4. **Eviction awareness**: If `max_loaded_models` is reached, the least-recently-used unpinned model is evicted to make room. Models that are pinned, actively generating, or still loading are excluded from eviction candidates; if no eligible model can be evicted (or the eviction fails), the new load is refused with an error rather than proceeding.
 
 5. **Best practice**: Design agents to use a consistent primary model when possible to reduce switching overhead. Use pinned models for critical paths.
 
