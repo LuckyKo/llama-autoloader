@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -238,6 +240,70 @@ async def test_recover_dead_model_restores_registry_when_teardown_raises(
     # from the unbound kill state instead.
     failure = mgr._recovery_failures.get("dead.gguf")
     assert failure is not None and "teardown exploded" in failure.reason
+
+
+@pytest.mark.asyncio
+async def test_unload_unlocked_restores_registry_when_teardown_raises(
+        isolated_manager, monkeypatch, request):
+    """BUG_0009: an aborted teardown must not orphan a live process from self.loaded."""
+    mgr = isolated_manager
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    request.addfinalizer(lambda: (live.kill(), live.wait()))
+    old = _add_resident(mgr, pid=live.pid)
+    old.process = live
+    finalizes, flag_armed = [], []
+
+    async def _raising_unload_finish(lm, model_id):  # noqa: ARG001
+        # The flag is armed by _begin_unload_locked before the slow phase runs;
+        # recording it here makes the later absence assertion non-vacuous.
+        flag_armed.append(model_id in mgr._unload_in_progress)
+        raise RuntimeError("teardown exploded")
+
+    def _record_finalize(*args):
+        finalizes.append(args)
+        return UnloadResult(model_id=args[1], unloaded=True, reason="not reached")
+
+    monkeypatch.setattr(mgr, "_unload_finish", _raising_unload_finish)
+    monkeypatch.setattr(mgr, "_finalize_unload_locked", _record_finalize)
+    gen_before = mgr._status_gen
+
+    # The wait_for pins the contract: the caller holds self._lock and the restore
+    # must not re-acquire it (a re-acquire would deadlock, not fail).
+    async with mgr._lock:
+        with pytest.raises(RuntimeError, match="teardown exploded"):
+            await asyncio.wait_for(mgr._unload_unlocked("dead.gguf"), timeout=2.0)
+
+    assert mgr.loaded["dead.gguf"] is old
+    assert old.ready is True  # this site never touches ready, unlike recovery
+    assert mgr._status_gen != gen_before  # cached status invalidated
+    assert flag_armed == [True]
+    assert "dead.gguf" not in mgr._unload_in_progress
+    assert finalizes == []
+
+
+@pytest.mark.asyncio
+async def test_unload_unlocked_does_not_resurrect_verified_dead_process(
+        isolated_manager, monkeypatch):
+    """_unload_finish re-raises after a completed kill; a dead process stays untracked."""
+    mgr = isolated_manager
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()  # reaped: the pid is gone, so there is nothing to keep tracked
+    old = _add_resident(mgr, pid=dead.pid)
+    old.process = dead
+
+    async def _cancelled_unload_finish(lm, model_id):  # noqa: ARG001
+        # Mirrors the real re-raise at the end of _unload_finish: queue dropped,
+        # process killed, only the caller's cancellation preserved.
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(mgr, "_unload_finish", _cancelled_unload_finish)
+
+    async with mgr._lock:
+        with pytest.raises(asyncio.CancelledError):
+            await mgr._unload_unlocked("dead.gguf")
+
+    assert "dead.gguf" not in mgr.loaded
+    assert "dead.gguf" not in mgr._unload_in_progress
 
 
 @pytest.mark.asyncio

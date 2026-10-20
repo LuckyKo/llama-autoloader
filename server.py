@@ -2641,9 +2641,11 @@ class ModelManager:
 
         Returns ``None`` when the model was not resident. Otherwise the result's
         ``unloaded`` flag says whether the engine process is verifiably gone. On a
-        failed kill the model is put back into ``self.loaded``: the registry must
-        never claim an engine was released while its process is still running, and
-        callers can retry the unload.
+        failed kill the model is put back into ``self.loaded``, and on an aborted
+        teardown it is restored only while its process may still be running: the
+        registry must never claim an engine was released while its process is still
+        running, and must never resurrect one it has verified dead. Callers can
+        retry the unload.
         """
         begin = self._begin_unload_locked(model_id)
         if begin is None:
@@ -2651,9 +2653,42 @@ class ModelManager:
         lm, deliberate = begin
         try:
             killed, kill_reason = await self._unload_finish(lm, model_id)
-        except BaseException:
+        except BaseException as exc:
             if deliberate:
                 self._unload_in_progress.discard(model_id)
+            # BUG_0009: _begin_unload_locked popped the model. Decide from the
+            # process, not from the exception type: a CancelledError can arrive
+            # either before the kill (process alive, must stay visible to routing
+            # and LRU) or at _unload_finish's own re-raise after a verified
+            # kill (dead, must NOT come back as a routable ready=True entry).
+            # The caller already holds self._lock (contract), so the restore runs
+            # directly — re-acquiring would deadlock. setdefault matches the
+            # sibling restores in _finalize_unload_locked / recovery.
+            try:
+                if lm.process is not None:
+                    still_running = lm.process.poll() is None
+                else:
+                    # Same "no real pid means nothing was ever running" rule as
+                    # _kill_proc uses for fake/legacy entries. Unlike the Popen
+                    # probe (handle-based), this PID probe cannot tell a zombie or
+                    # a recycled PID from a live engine, so it errs toward keeping
+                    # the model tracked. Reachable today only from tests: every
+                    # real LoadedModel carries its Popen.
+                    still_running = bool(lm.pid and lm.pid > 0
+                                         and psutil.pid_exists(lm.pid))
+            except Exception:  # noqa: BLE001 - a failed probe must not mask exc
+                still_running = True  # doubt resolves toward the invariant
+            if still_running:
+                self.loaded.setdefault(model_id, lm)
+                self._invalidate_status()
+                log.error(
+                    f"Unload of {model_id} aborted by {type(exc).__name__}; "
+                    f"process {lm.pid} may still be running, model restored "
+                    f"to registry")
+            else:
+                log.error(
+                    f"Unload of {model_id} aborted by {type(exc).__name__}; "
+                    f"process {lm.pid} is gone, not re-registered")
             raise
         return self._finalize_unload_locked(
             lm, model_id, deliberate, killed, kill_reason)
