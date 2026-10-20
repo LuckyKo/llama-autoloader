@@ -40,7 +40,8 @@ import re
 import select
 import socket
 import threading
-from typing import Dict, Optional, Tuple
+import time
+from typing import Callable, Dict, Optional, Tuple
 
 log = logging.getLogger("autoloader")
 
@@ -91,6 +92,28 @@ _MAX_CONNECTIONS = max(1, int(os.environ.get("AUTOLOADER_MAX_CONNECTIONS", "256"
 # requests get an immediate retryable 503 instead of another blocked worker.
 _MAX_RECOVERY_WAITERS = max(1, int(os.environ.get("AUTOLOADER_MAX_RECOVERY_WAITERS", "32")))
 
+# Established-connection liveness (BUG_0002). A TCP connect succeeding is not proof that
+# the engine can still make progress: a wedged process can accept a connection and then
+# never answer. Silence on the data socket alone is NOT death — a cold prompt evaluation
+# can legitimately emit nothing for minutes — so the pipe asks the engine's /health
+# endpoint once it has been silent for a while. Two consecutive failed probes (with one
+# shared probe per engine instance) are required before the engine is evicted.
+_LIVENESS_PROBE_INTERVAL = max(
+    0.05, float(os.environ.get("AUTOLOADER_LIVENESS_PROBE_INTERVAL", "10")))
+_LIVENESS_PROBE_TIMEOUT = max(
+    0.05, float(os.environ.get("AUTOLOADER_LIVENESS_PROBE_TIMEOUT", "2")))
+_LIVENESS_FAILURE_THRESHOLD = max(
+    1, int(os.environ.get("AUTOLOADER_LIVENESS_FAILURES", "2")))
+_LIVENESS_SILENCE_BEFORE_PROBE = max(
+    0.0, float(os.environ.get("AUTOLOADER_LIVENESS_SILENCE", "10")))
+_LIVENESS_WATCHDOG_INTERVAL = max(
+    0.1, float(os.environ.get("AUTOLOADER_LIVENESS_WATCHDOG_INTERVAL", "10")))
+
+# select() poll interval for the data pipe. Small enough to notice shutdown and to run
+# the liveness check promptly; large enough that an idle connection is nearly free.
+_PIPE_POLL_INTERVAL = max(
+    0.05, float(os.environ.get("AUTOLOADER_PIPE_POLL_INTERVAL", "5")))
+
 # How long an LLM request waits for its model's FIFO ticket before returning 503.
 _QUEUE_WAIT_TIMEOUT = max(0.1, float(os.environ.get("AUTOLOADER_QUEUE_TIMEOUT", "300")))
 
@@ -140,10 +163,12 @@ _RECOVERY_TIMEOUT_EXTRA = 60.0
 
 
 class _BackendUnreachable(Exception):
-    """The LLM backend port actively refused a connection.
+    """The LLM backend could not be connected to and nothing was sent.
 
-    Raised only for the llama-server fast path, and only for refusal-class errors: the
-    request has not been sent anywhere yet, so it is safe to evict/reload and retry it.
+    Raised only for the llama-server fast path. Refusal-class errors qualify directly;
+    timeouts/resets qualify only after ``proc.poll()`` or a short /health probe confirms
+    the engine is dead (BUG_0006). In every case the request has not reached the backend,
+    so it is safe to evict/reload and retry it once.
     """
 
     def __init__(self, target_port: int, cause: BaseException):
@@ -168,6 +193,40 @@ def _is_connection_refused(exc: BaseException) -> bool:
     return False
 
 
+def _is_connect_timeout(exc: BaseException) -> bool:
+    """True for connect-phase timeouts (POSIX ``ETIMEDOUT`` / Windows 10060)."""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "winerror", None) == 10060:
+            return True
+        if getattr(exc, "errno", None) == errno.ETIMEDOUT:
+            return True
+    return False
+
+
+def _is_connection_reset_or_abort(exc: BaseException) -> bool:
+    """True for reset/abort failures that can appear while connecting."""
+    if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "winerror", None) in (10053, 10054):
+            return True
+        if getattr(exc, "errno", None) in (errno.ECONNRESET, errno.ECONNABORTED):
+            return True
+    return False
+
+
+def _is_ambiguous_connect_failure(exc: BaseException) -> bool:
+    """A connect failure that is NOT safe to treat as refusal without verification.
+
+    A timeout can mean a wedged listener, a reset can mean the process died during the
+    handshake, but either can also be a transient scheduling/load condition. BUG_0006:
+    only evict after ``proc.poll()`` and/or a short ``/health`` probe confirms death.
+    """
+    return _is_connect_timeout(exc) or _is_connection_reset_or_abort(exc)
+
+
 class RawTCPForwarder:
     """Transparent TCP forwarder with model-based routing.
 
@@ -188,12 +247,26 @@ class RawTCPForwarder:
         # (target port, engine generation). Ports are reused after reload, so the
         # generation component keeps a cancel from closing a replacement's sockets.
         self._active_conns: Dict[Tuple[int, int], set] = {}
+        # Whether any backend response bytes have been forwarded to each active
+        # client. A watchdog-confirmed hang may only inject a 504 while this is
+        # still False; a started streaming response is simply truncated/closed.
+        self._active_response_started: Dict[Tuple[int, int], Dict[object, bool]] = {}
         self._active_lock = threading.Lock()
         self._conn_sem = threading.BoundedSemaphore(_MAX_CONNECTIONS)
         # Threads currently waiting on a recovery, keyed by (dead port, generation).
         # Bounded so one dead model cannot monopolize the whole connection budget.
         self._recovery_waiters: Dict[Tuple[int, int], int] = {}
         self._recovery_wait_lock = threading.Lock()
+        # Established-connection liveness state (BUG_0002), keyed by (port, generation).
+        # One probe lock per engine prevents a health-check stampede when many requests
+        # are in flight against the same backend.
+        self._liveness_lock = threading.Lock()
+        self._liveness_failures: Dict[Tuple[int, int], int] = {}
+        self._liveness_last_probe: Dict[Tuple[int, int], float] = {}
+        self._liveness_probe_locks: Dict[Tuple[int, int], threading.Lock] = {}
+        self._scheduled_recoveries: set = set()
+        self._stop_event = threading.Event()
+        self._watchdog_thread: Optional[threading.Thread] = None
 
     def _reserve_recovery_waiter(self, port: int, generation: int) -> bool:
         """Reserve one bounded recovery-wait slot, or return False when saturated."""
@@ -230,6 +303,236 @@ class RawTCPForwarder:
         finally:
             self._release_recovery_waiter(port, generation)
 
+    # ------------------------------------------------------------- liveness checks
+    def _find_engine(self, port: int,
+                     generation: int = 0) -> Optional[Tuple[str, object]]:
+        """Snapshot the loaded model matching ``(port, generation)``.
+
+        Runs on forwarder worker/watchdog threads. ``self.loaded`` is only mutated on
+        the main event loop, so iterating a list copy is the safe cross-thread read
+        used elsewhere in this module.
+        """
+        manager = self.model_manager
+        if manager is None:
+            return None
+        try:
+            items = list(manager.loaded.items())
+        except Exception:  # noqa: BLE001 - fake/older managers may lack loaded
+            return None
+        for mid, lm in items:
+            if getattr(lm, "port", None) != port:
+                continue
+            if generation > 0 and int(getattr(lm, "generation", 0) or 0) != generation:
+                continue
+            return mid, lm
+        return None
+
+    def _probe_engine_health(self, port: int) -> bool:
+        """Return True when the engine answers ``GET /health`` with HTTP 200.
+
+        Deliberately a fresh short-lived socket (not the manager's httpx client): this
+        runs on a forwarder thread and must never touch an asyncio-bound client. A
+        connection refusal, timeout, malformed status line, or non-200 all count as a
+        failed probe. A wedged generation loop that still serves /health is not
+        declared dead here; that is the narrow, non-false-positive policy BUG_0002 asks
+        for (a long prompt may legitimately emit no data bytes for minutes).
+        """
+        timeout = _LIVENESS_PROBE_TIMEOUT
+        request = (b"GET /health HTTP/1.1\r\n"
+                   b"Host: 127.0.0.1\r\n"
+                   b"Connection: close\r\n\r\n")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+                s.settimeout(timeout)
+                s.sendall(request)
+                data = b""
+                while len(data) < 8192 and b"\r\n\r\n" not in data:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+        except (OSError, TimeoutError):
+            return False
+        first_line = data.split(b"\r\n", 1)[0]
+        parts = first_line.split()
+        return len(parts) >= 2 and parts[1] == b"200"
+
+    def _backend_confirmed_dead(self, port: int, generation: int = 0) -> bool:
+        """Verify an ambiguous connect failure before evicting the engine.
+
+        BUG_0006: a connect timeout / reset is not proof of death. If the process has
+        already exited, that is sufficient. Otherwise require a failed short /health
+        probe. A live-but-slow backend therefore keeps its normal 502 and is not
+        needlessly reloaded.
+        """
+        found = self._find_engine(port, generation)
+        if found is not None:
+            _mid, lm = found
+            proc = getattr(lm, "process", None)
+            if proc is not None:
+                try:
+                    if proc.poll() is not None:
+                        return True
+                except Exception:  # noqa: BLE001 - a fake process may not implement poll
+                    pass
+        # Even with no matching registry entry, always require a failed health probe
+        # before evicting: the port may already belong to a newer healthy instance, and
+        # an unverifiable timeout is not sufficient evidence of death (BUG_0006).
+        return not self._probe_engine_health(port)
+
+    def _liveness_probe_lock(self, key: Tuple[int, int]) -> threading.Lock:
+        with self._liveness_lock:
+            lock = self._liveness_probe_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._liveness_probe_locks[key] = lock
+            return lock
+
+    def _schedule_recovery(self, model_id: str, port: int,
+                           generation: int = 0) -> None:
+        """Start the shared manager recovery without blocking the calling thread.
+
+        BUG_0002/BUG_0006: the current request already has a bounded error to return;
+        it must not also wait minutes for a full reload. The manager deduplicates the
+        actual unload/reload by ``(port, generation)`` and BUG_0007 adds a per-model
+        cooldown for repeated failures.
+        """
+        key = (port, generation)
+        with self._liveness_lock:
+            if key in self._scheduled_recoveries:
+                return
+            self._scheduled_recoveries.add(key)
+
+        manager = self.model_manager
+        recover = getattr(manager, "recover_dead_model", None)
+        loop = getattr(manager, "_main_loop", None)
+        if recover is None or loop is None or not loop.is_running():
+            log.error(f"Cannot schedule recovery for '{model_id}' on port {port} "
+                      f"(generation {generation}): no running main event loop")
+            with self._liveness_lock:
+                self._scheduled_recoveries.discard(key)
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                recover(model_id, port, generation), loop)
+        except Exception as e:  # noqa: BLE001 - loop closed between check and submit
+            log.error(f"Could not schedule recovery for '{model_id}' on port {port}: {e}")
+            with self._liveness_lock:
+                self._scheduled_recoveries.discard(key)
+            return
+
+        def _done(fut) -> None:
+            try:
+                fut.result()
+            except Exception as e:  # noqa: BLE001 - recovery failures are reported by manager
+                log.error(f"Background recovery for '{model_id}' on port {port} "
+                          f"(generation {generation}) failed: {e}")
+
+        future.add_done_callback(_done)
+
+    def _handle_confirmed_hang(self, port: int, generation: int, reason: str,
+                               cancel_connections: bool = False) -> None:
+        """Mark one engine unready, schedule recovery, optionally abort its pipes."""
+        found = self._find_engine(port, generation)
+        if found is None:
+            return
+        mid, lm = found
+        if getattr(lm, "ready", False):
+            # Plain bool write: this is the same cross-thread contract used by
+            # note_request_start/touch. The recovery path will invalidate the status
+            # cache under the manager lock.
+            lm.ready = False
+        log.error(f"Engine for '{mid}' on port {port} (generation {generation}) "
+                  f"is unresponsive: {reason}; evicting and reloading")
+        self._schedule_recovery(mid, port, generation)
+        if cancel_connections:
+            # Watchdog path: abort the active pipes to bound the client's wait, sending
+            # a 504 to connections that have not started a response yet.
+            self._cancel_unresponsive_active(port, generation)
+
+    def _check_engine_liveness(self, port: int, generation: int = 0,
+                               cancel_connections: bool = False) -> bool:
+        """Check one engine instance, sharing one probe per interval.
+
+        Returns False only when the process has exited or ``_LIVENESS_FAILURE_THRESHOLD``
+        consecutive health probes failed. The first failed probe returns True so a
+        transient scheduling stall is not fatal. A successful probe resets the failure
+        count immediately.
+        """
+        found = self._find_engine(port, generation)
+        if found is None:
+            return True
+        _mid, lm = found
+        if not getattr(lm, "ready", False):
+            # Another recovery (or a deliberate unload) already owns this engine.
+            return True
+
+        proc = getattr(lm, "process", None)
+        if proc is not None:
+            try:
+                if proc.poll() is not None:
+                    self._handle_confirmed_hang(
+                        port, generation, "process exited", cancel_connections)
+                    return False
+            except Exception:  # noqa: BLE001 - fake process
+                pass
+
+        key = (port, generation)
+        probe_lock = self._liveness_probe_lock(key)
+        with probe_lock:
+            now = time.monotonic()
+            with self._liveness_lock:
+                last = self._liveness_last_probe.get(key)
+                if last is not None and now - last < _LIVENESS_PROBE_INTERVAL:
+                    return self._liveness_failures.get(key, 0) < _LIVENESS_FAILURE_THRESHOLD
+
+            healthy = self._probe_engine_health(port)
+            now = time.monotonic()
+            with self._liveness_lock:
+                self._liveness_last_probe[key] = now
+                if healthy:
+                    self._liveness_failures.pop(key, None)
+                    return True
+                failures = self._liveness_failures.get(key, 0) + 1
+                self._liveness_failures[key] = failures
+
+        if failures < _LIVENESS_FAILURE_THRESHOLD:
+            log.warning(f"Liveness probe failed for engine on port {port} "
+                        f"(generation {generation}), failure {failures}/"
+                        f"{_LIVENESS_FAILURE_THRESHOLD}; still allowing it to recover")
+            return True
+
+        self._handle_confirmed_hang(
+            port, generation,
+            f"{failures} consecutive /health probes failed", cancel_connections)
+        return False
+
+    def _liveness_watchdog(self) -> None:
+        """Probe resident engines even when no request is currently being piped."""
+        while self._running and not self._stop_event.wait(_LIVENESS_WATCHDOG_INTERVAL):
+            manager = self.model_manager
+            if manager is None:
+                continue
+            try:
+                items = list(manager.loaded.items())
+            except Exception:  # noqa: BLE001 - manager shutting down / fake
+                continue
+            for mid, lm in items:
+                if not self._running:
+                    break
+                if not getattr(lm, "ready", False):
+                    continue
+                port = int(getattr(lm, "port", 0) or 0)
+                if port <= 0:
+                    continue
+                generation = int(getattr(lm, "generation", 0) or 0)
+                try:
+                    self._check_engine_liveness(
+                        port, generation, cancel_connections=True)
+                except Exception as e:  # noqa: BLE001 - watchdog must never die
+                    log.warning(f"Liveness watchdog error for '{mid}' on port {port}: {e}")
+
     def cancel_active(self, port: int, generation: Optional[int] = None) -> int:
         """Best-effort cancel of in-flight requests bound to one engine instance.
 
@@ -246,6 +549,7 @@ class RawTCPForwarder:
             pairs = []
             for key in keys:
                 pairs.extend(self._active_conns.pop(key, ()))
+                self._active_response_started.pop(key, None)
         for client_sock, target_sock in pairs:
             for s in (target_sock, client_sock):
                 try:
@@ -259,10 +563,21 @@ class RawTCPForwarder:
         return len(pairs)
 
     def _register_active(self, port: int, generation: int,
-                         client_sock: socket.socket, target_sock: socket.socket) -> None:
+                         client_sock: socket.socket, target_sock: socket.socket,
+                         response_started: bool = False) -> None:
         with self._active_lock:
-            self._active_conns.setdefault((port, generation), set()).add(
+            key = (port, generation)
+            self._active_conns.setdefault(key, set()).add(
                 (client_sock, target_sock))
+            self._active_response_started.setdefault(key, {})[client_sock] = bool(
+                response_started)
+
+    def _mark_active_response_started(self, port: int, generation: int,
+                                      client_sock: socket.socket) -> None:
+        with self._active_lock:
+            states = self._active_response_started.get((port, generation))
+            if states is not None and client_sock in states:
+                states[client_sock] = True
 
     def _unregister_active(self, port: int, generation: int,
                            client_sock: socket.socket, target_sock: socket.socket) -> None:
@@ -273,6 +588,39 @@ class RawTCPForwarder:
                 conns.discard((client_sock, target_sock))
                 if not conns:
                     self._active_conns.pop(key, None)
+            states = self._active_response_started.get(key)
+            if states is not None:
+                states.pop(client_sock, None)
+                if not states:
+                    self._active_response_started.pop(key, None)
+
+    def _cancel_unresponsive_active(self, port: int, generation: int) -> int:
+        """Abort one engine's pipes, sending 504 where no response has started.
+
+        The watchdog calls this after a hang is confirmed. Connections that already
+        forwarded backend bytes must only be closed (injecting a second HTTP response
+        into a live stream would corrupt it); connections still waiting for the first
+        byte get the same bounded 504 as the in-pipe liveness path.
+        """
+        with self._active_lock:
+            key = (port, generation)
+            pairs = list(self._active_conns.pop(key, ()))
+            states = self._active_response_started.pop(key, {})
+        for client_sock, target_sock in pairs:
+            if not states.get(client_sock, False):
+                self._send_error_response(
+                    client_sock, 504,
+                    "llama-server stopped responding (health probe failed)")
+            for s in (target_sock, client_sock):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        return len(pairs)
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -290,12 +638,17 @@ class RawTCPForwarder:
         self._running = True
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
+        self._stop_event.clear()
+        self._watchdog_thread = threading.Thread(
+            target=self._liveness_watchdog, daemon=True, name="llm-liveness")
+        self._watchdog_thread.start()
         log.info(f"Raw TCP forwarder listening on 127.0.0.1:{self.listen_port} "
                  f"(internal API -> {self.internal_api_port})")
 
     def stop(self) -> None:
         """Stop the forwarder. In-flight handler threads are daemon and finish on close."""
         self._running = False
+        self._stop_event.set()
         if self._server_sock is not None:
             try:
                 self._server_sock.close()
@@ -398,6 +751,16 @@ class RawTCPForwarder:
                                            target_port, model_id, queue,
                                            expected_generation=target_generation)
                     return
+                # BUG_0007: a model whose dead-backend reload just failed must not
+                # spawn a fresh multi-minute load attempt on every request. The
+                # manager exposes the per-model cooldown as a synchronous read; a
+                # manual load endpoint bypasses it deliberately.
+                retry_after = self._recovery_retry_after(model_id)
+                if retry_after is not None:
+                    self._send_recovery_error(
+                        client_sock, model_id, None, 0,
+                        f"Model '{model_id}' recovery is cooling down after a failed reload")
+                    return
                 # Model not loaded -> JIT load it, wait for readiness, then pipe.
                 log.info(f"Model '{model_id}' not loaded; triggering JIT load...")
                 target = self._jit_load_and_wait_target(model_id)
@@ -410,9 +773,11 @@ class RawTCPForwarder:
                                            target_port, model_id, queue,
                                            expected_generation=target_generation)
                     return
-                # JIT load failed (unknown model / timeout / spawn error).
+                # JIT load failed (unknown model / timeout / spawn error / cooldown).
                 log.error(f"JIT load failed for '{model_id}' on {method} {path}")
-                self._send_error_response(client_sock, 503, f"Failed to load model '{model_id}'")
+                self._send_recovery_error(
+                    client_sock, model_id, None, 0,
+                    f"Failed to load model '{model_id}'")
                 return
             # Non-LLM endpoint -> forward to FastAPI.
             self._pipe_to_backend(client_sock, raw_headers,
@@ -835,6 +1200,43 @@ class RawTCPForwarder:
                   f"(generation {expected_generation}) returned no ready model")
         return None
 
+    def _recovery_retry_after(self, model_id: str, dead_port: Optional[int] = None,
+                              generation: int = 0) -> Optional[float]:
+        """Seconds until a suppressed recovery may be retried, if any.
+
+        The manager owns the per-model failure state (BUG_0007); this is a plain
+        synchronous read from a forwarder worker thread. Fake/older managers simply do
+        not expose the hook, preserving the old 503 body without a Retry-After header.
+        """
+        manager = self.model_manager
+        method = getattr(manager, "recovery_retry_after", None)
+        if method is None:
+            return None
+        try:
+            remaining = method(model_id, dead_port, generation)
+        except Exception:  # noqa: BLE001 - observability must never break the error path
+            return None
+        if remaining is None:
+            return None
+        try:
+            remaining = float(remaining)
+        except (TypeError, ValueError):
+            return None
+        return remaining if remaining > 0 else None
+
+    def _send_recovery_error(self, sock: socket.socket, model_id: str,
+                             dead_port: Optional[int], generation: int,
+                             message: str) -> None:
+        """Send a 503, adding a standard ``Retry-After`` header during a cooldown."""
+        remaining = self._recovery_retry_after(model_id, dead_port, generation)
+        if remaining is None:
+            self._send_error_response(sock, 503, message)
+            return
+        retry_after = max(1, int(remaining + 0.999))
+        self._send_error_response(
+            sock, 503, f"{message} (retry after {retry_after}s)",
+            headers={"Retry-After": str(retry_after)})
+
     def _jit_load_and_wait(self, model_id: str) -> Optional[int]:
         """Backwards-compatible port-only view of :meth:`_jit_load_and_wait_target`."""
         target = self._jit_load_and_wait_target(model_id)
@@ -945,8 +1347,8 @@ class RawTCPForwarder:
                     f"Model '{model_id}' recovery is saturated ({e}); retry shortly")
                 return
             if not recovered:
-                self._send_error_response(
-                    client_sock, 503,
+                self._send_recovery_error(
+                    client_sock, model_id, target_port, expected_generation,
                     f"Model '{model_id}' engine died and could not be restarted")
                 return
             new_port, new_generation = recovered
@@ -1024,10 +1426,19 @@ class RawTCPForwarder:
             target_sock = self._connect_backend(target_port)
         except Exception as e:  # noqa: BLE001
             log.error(f"Failed to connect to {label} on port {target_port}: {e}")
-            if label == _LLAMA_SERVER_LABEL and _is_connection_refused(e):
-                # Nothing has been sent to the backend yet, so the request is safe to
-                # retry after a reload. The caller owns sending the error response.
-                raise _BackendUnreachable(target_port, e) from e
+            if label == _LLAMA_SERVER_LABEL:
+                if _is_connection_refused(e):
+                    # Nothing has been sent yet, so the request is safe to retry after a
+                    # reload. The caller owns sending the error response.
+                    raise _BackendUnreachable(target_port, e) from e
+                if (_is_ambiguous_connect_failure(e)
+                        and self._backend_confirmed_dead(target_port, engine_generation)):
+                    # BUG_0006: a timeout/reset is only declared dead after proc.poll()
+                    # or a short /health probe confirms it. Still no bytes sent, so the
+                    # caller may retry the same request after recovery.
+                    log.warning(f"Connect failure to {label} on port {target_port} "
+                                f"was confirmed dead; scheduling recovery")
+                    raise _BackendUnreachable(target_port, e) from e
             self._send_error_response(client_sock, 502, f"{label} unreachable")
             return
 
@@ -1042,6 +1453,12 @@ class RawTCPForwarder:
         except OSError as e:
             log.error(f"Failed to send request to {label}: {e}")
             target_sock.close()
+            if label == _LLAMA_SERVER_LABEL:
+                # BUG_0006: part of the request may already have reached the engine, so
+                # this request must NOT be retried. Mark/schedule recovery for later
+                # requests and return the bounded 502 immediately.
+                self._handle_confirmed_hang(
+                    target_port, engine_generation, f"send failed: {e}")
             self._send_error_response(client_sock, 502, f"{label} unreachable")
             return
 
@@ -1061,23 +1478,38 @@ class RawTCPForwarder:
         # slow first responses) is acceptable because llama-server's response head arrives in a
         # single segment under normal conditions. Management traffic to FastAPI is left
         # untouched (label != _LLAMA_SERVER_LABEL).
+        response_started = False
         if label == _LLAMA_SERVER_LABEL:
-            self._inject_cors_nonblocking(client_sock, target_sock)
+            response_started = self._inject_cors_nonblocking(client_sock, target_sock)
 
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
         tracking = label == _LLAMA_SERVER_LABEL
         if tracking:
             self._register_active(target_port, engine_generation,
-                                  client_sock, target_sock)
+                                  client_sock, target_sock,
+                                  response_started=response_started)
+        liveness_check = None
+        on_response_started = None
+        if tracking:
+            # BUG_0002: a connected-but-wedged backend is detected independently of data
+            # silence (long prompt eval is healthy). The callback is shared per engine so
+            # a herd of requests causes at most one /health probe per interval.
+            liveness_check = lambda: self._check_engine_liveness(
+                target_port, engine_generation)
+            on_response_started = lambda: self._mark_active_response_started(
+                target_port, engine_generation, client_sock)
         try:
-            self._bidirectional_pipe(client_sock, target_sock)
+            self._bidirectional_pipe(
+                client_sock, target_sock, liveness_check=liveness_check,
+                response_started=response_started,
+                on_response_started=on_response_started)
         finally:
             if tracking:
                 self._unregister_active(target_port, engine_generation,
                                         client_sock, target_sock)
 
     def _inject_cors_nonblocking(self, client_sock: socket.socket,
-                                 target_sock: socket.socket) -> None:
+                                 target_sock: socket.socket) -> bool:
         """Inject CORS headers into the first response head using a zero-wait peek.
 
         Strategy: ZERO-WAIT non-blocking peek. ``select`` is called with a timeout of 0.0, i.e. a
@@ -1103,21 +1535,21 @@ class RawTCPForwarder:
         try:
             ready, _, _ = select.select([target_sock], [], [], 0.0)
         except (OSError, ValueError):
-            return  # socket error or already closed; pipe loop will handle it
+            return False  # socket error or already closed; pipe loop will handle it
 
         if not ready:
             # No data buffered yet — cold prompt eval in progress (full reprocess of a large
             # context). Skip injection entirely; the pipe delivers the first byte the instant
             # it arrives. Zero latency added.
-            return
+            return False
 
         try:
             chunk = target_sock.recv(65536)
         except OSError:
-            return  # socket error; the pipe loop will handle it
+            return False  # socket error; the pipe loop will handle it
 
         if not chunk:
-            return  # backend closed before sending anything; pipe handles EOF
+            return False  # backend closed before sending anything; pipe handles EOF
 
         # We have at least some bytes. Check if the head is complete in THIS chunk.
         if b"\r\n\r\n" in chunk:
@@ -1133,20 +1565,51 @@ class RawTCPForwarder:
             client_sock.sendall(payload)
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass  # client gone; pipe loop will notice and shut down cleanly
+        return True
 
-    def _bidirectional_pipe(self, sock_a: socket.socket, sock_b: socket.socket) -> None:
-        """Pipe bytes between two blocking sockets until both directions are closed."""
+    def _bidirectional_pipe(self, sock_a: socket.socket, sock_b: socket.socket,
+                            liveness_check: Optional[Callable[[], bool]] = None,
+                            response_started: bool = False,
+                            on_response_started: Optional[Callable[[], None]] = None) -> None:
+        """Pipe bytes between two blocking sockets until both directions are closed.
+
+        ``sock_a`` is the client-facing socket and ``sock_b`` the backend. When
+        ``liveness_check`` is supplied (LLM fast path only), it is consulted after the
+        backend has been silent for ``_LIVENESS_SILENCE_BEFORE_PROBE``; a False result
+        means the engine was confirmed wedged. If no response bytes have been forwarded
+        yet, the client gets a bounded 504 before both sockets are closed. Long prompt
+        evaluation is explicitly safe: the health probe passes while no data flows.
+        """
         open_socks = [sock_a, sock_b]
+        last_backend_activity = time.monotonic()
         try:
             while self._running and open_socks:
                 try:
-                    # Poll every 5s (not 60s) so a shutdown request is noticed promptly on an
-                    # idle connection; 5s still far exceeds typical HTTP keepalive idle gaps.
-                    readable, _writable, exceptional = select.select(open_socks, [], open_socks, 5)
+                    # Poll periodically (not 60s) so shutdown is noticed promptly on an
+                    # idle connection; the liveness callback needs a similar cadence.
+                    readable, _writable, exceptional = select.select(
+                        open_socks, [], open_socks, _PIPE_POLL_INTERVAL)
                 except OSError:
                     break
                 if exceptional:
                     break
+                if liveness_check is not None:
+                    # Probe only after BACKEND silence: client upload traffic says
+                    # nothing about whether generation is alive, while a healthy cold
+                    # prompt eval answers /health even though it emits no tokens yet.
+                    now = time.monotonic()
+                    if now - last_backend_activity >= _LIVENESS_SILENCE_BEFORE_PROBE:
+                        try:
+                            alive = liveness_check()
+                        except Exception as e:  # noqa: BLE001 - never kill on a probe error
+                            log.warning(f"Liveness check failed unexpectedly: {e}")
+                            alive = True
+                        if not alive:
+                            if not response_started:
+                                self._send_error_response(
+                                    sock_a, 504,
+                                    "llama-server stopped responding (health probe failed)")
+                            return
                 for sock in readable:
                     other = sock_b if sock is sock_a else sock_a
                     try:
@@ -1174,6 +1637,8 @@ class RawTCPForwarder:
                         except OSError:
                             pass
                     else:
+                        if sock is sock_b:
+                            last_backend_activity = time.monotonic()
                         try:
                             other.sendall(data)
                         except (ConnectionResetError, BrokenPipeError, OSError):
@@ -1182,6 +1647,13 @@ class RawTCPForwarder:
                             except OSError:
                                 pass
                             return
+                        if sock is sock_b and not response_started:
+                            response_started = True
+                            if on_response_started is not None:
+                                try:
+                                    on_response_started()
+                                except Exception as e:  # noqa: BLE001 - bookkeeping only
+                                    log.warning(f"Failed to record response start: {e}")
         finally:
             for sock in open_socks:
                 try:
@@ -1211,15 +1683,22 @@ class RawTCPForwarder:
             pass
 
     @staticmethod
-    def _send_error_response(sock: socket.socket, status_code: int, message: str) -> None:
+    def _send_error_response(sock: socket.socket, status_code: int, message: str,
+                             headers: Optional[Dict[str, str]] = None) -> None:
         """Send a minimal HTTP error response and let the caller close the socket."""
         status_text = {400: "Bad Request", 404: "Not Found", 502: "Bad Gateway",
-                       503: "Service Unavailable"}.get(status_code, "Error")
+                       503: "Service Unavailable", 504: "Gateway Timeout"}.get(
+                           status_code, "Error")
         body = json.dumps({"error": message}).encode("utf-8")
+        extra_headers = ""
+        if headers:
+            extra_headers = "".join(f"{key}: {value}\r\n"
+                                    for key, value in headers.items())
         response = (
             f"HTTP/1.1 {status_code} {status_text}\r\n"
             f"Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n"
+            f"{extra_headers}"
             f"Connection: close\r\n"
             f"\r\n"
         ).encode("latin-1") + body

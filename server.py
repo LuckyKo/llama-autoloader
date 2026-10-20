@@ -663,6 +663,40 @@ class UnloadResult:
         return {"model": self.model_id, "pid": self.pid, "reason": self.reason}
 
 
+# BUG_0007: a failed dead-backend recovery is remembered per model so a client retry
+# loop cannot spawn a full load attempt on every request. The delay grows exponentially
+# from BASE up to MAX; a manual/force load (or a successful load/unload/config edit)
+# clears it. These are env-overridable for tests and operators.
+_RECOVERY_BACKOFF_BASE_S = max(
+    0.1, float(os.environ.get("AUTOLOADER_RECOVERY_BACKOFF_BASE", "5")))
+_RECOVERY_BACKOFF_MAX_S = max(
+    _RECOVERY_BACKOFF_BASE_S,
+    float(os.environ.get("AUTOLOADER_RECOVERY_BACKOFF_MAX", "300")))
+
+
+@dataclass
+class RecoveryFailure:
+    """One model's failed-reload circuit-breaker state (BUG_0007)."""
+    model_id: str
+    dead_port: int
+    generation: int
+    attempts: int
+    reason: str
+    failed_at: float          # wall clock, for status display
+    retry_at: float           # time.monotonic() deadline for the next attempt
+
+
+class RecoveryCooldownError(RuntimeError):
+    """A load/recovery was suppressed by the per-model failed-reload cooldown."""
+
+    def __init__(self, model_id: str, retry_after: float):
+        self.model_id = model_id
+        self.retry_after = max(0.0, float(retry_after))
+        super().__init__(
+            f"Model '{model_id}' recovery is cooling down; retry in "
+            f"{int(self.retry_after + 0.999)}s")
+
+
 @dataclass
 class GPUInfo:
     index: int
@@ -816,6 +850,10 @@ class ModelManager:
         # rest await it. The generation is part of the key so a delayed recovery for
         # an OLD instance can never attach to a healthy replacement on the same port.
         self._recovery_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+        # Failed dead-backend reload state, keyed by resolved model id (BUG_0007).
+        # A cooldown suppresses repeated spawn/readiness attempts after a deterministic
+        # failure (missing binary, bad config, GPU allocation failure, ...).
+        self._recovery_failures: Dict[str, RecoveryFailure] = {}
         # Per-model FIFO ticket queues (keyed by engine port). The TCP forwarder and
         # the state save/restore paths both acquire a ticket here so operations for a
         # model run in strict FIFO order. See model_queue.py.
@@ -1781,6 +1819,9 @@ class ModelManager:
             self.models[mid] = new_cfg
             if mid in self.loaded:
                 self.loaded[mid].config = new_cfg
+            # A configuration edit plausibly fixes a failed reload (bad args, engine
+            # path, GPU settings), so allow the next attempt immediately (BUG_0007).
+            self._clear_recovery_failure(mid)
             # Sync the mmproj pairing computed above so --mmproj is correct at launch.
             if paired is not None:
                 self.mmproj_paths[mid] = paired
@@ -1979,13 +2020,53 @@ class ModelManager:
             self._model_locks[model_id] = lock
         return lock
 
-    async def load_model(self, model_id_input: str, force: bool = False) -> LoadedModel:
-        """Load (JIT) a model with non-blocking concurrency for other requests."""
+    async def load_model(self, model_id_input: str, force: bool = False,
+                         respect_recovery_cooldown: bool = True) -> LoadedModel:
+        """Load (JIT) a model with non-blocking concurrency for other requests.
+
+        BUG_0007: when a dead-backend reload has just failed, ordinary JIT loading is
+        suppressed for the per-model cooldown so a retry loop cannot spawn a doomed
+        engine on every request. A manual "load now" endpoint passes
+        ``respect_recovery_cooldown=False`` (and ``force=True`` also bypasses it).
+        """
         model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise KeyError(f"Unknown model: {model_id_input}")
-        async with self._model_lock(model_id):
-            return await self._load_model_serialized(model_id, force)
+        if not force and respect_recovery_cooldown:
+            remaining = self.recovery_retry_after(model_id)
+            if remaining is not None:
+                log.warning(f"JIT load of '{model_id}' suppressed: recovery cooldown "
+                            f"has {remaining:.1f}s remaining")
+                raise RecoveryCooldownError(model_id, remaining)
+        if force or not respect_recovery_cooldown:
+            self._clear_recovery_failure(model_id)
+        had_failure = model_id in self._recovery_failures
+        try:
+            async with self._model_lock(model_id):
+                # Re-check now that concurrent loads are serialized: the first waiter
+                # may have just failed and armed a fresh cooldown. Without this, a
+                # post-cooldown burst would each attempt its own doomed load.
+                if not force and respect_recovery_cooldown:
+                    remaining = self.recovery_retry_after(model_id)
+                    if remaining is not None:
+                        raise RecoveryCooldownError(model_id, remaining)
+                had_failure = model_id in self._recovery_failures
+                return await self._load_model_serialized(model_id, force)
+        except asyncio.CancelledError:
+            raise
+        except RecoveryCooldownError:
+            # A concurrent waiter armed the cooldown after this call passed its first
+            # check. Suppression is not another failed load attempt.
+            raise
+        except Exception as e:  # noqa: BLE001 - extend an existing dead-recovery backoff
+            if had_failure and respect_recovery_cooldown and not force:
+                current = self.loaded.get(model_id)
+                dead_port = int(getattr(current, "port", 0) or 0) if current else 0
+                self._record_recovery_failure(
+                    model_id, dead_port,
+                    int(getattr(current, "generation", 0) or 0) if current else 0,
+                    f"JIT reload failed: {e}")
+            raise
 
     async def _load_model_serialized(self, model_id: str,
                                      force: bool = False) -> LoadedModel:
@@ -2013,8 +2094,92 @@ class ModelManager:
                 if self._loading_tasks.get(model_id) is task:
                     self._loading_tasks.pop(model_id, None)
 
+    def _clear_recovery_failure(self, model_id: str) -> None:
+        """Forget a model's failed-reload cooldown (success/manual action/config edit)."""
+        if model_id and self._recovery_failures.pop(model_id, None) is not None:
+            log.info(f"Cleared failed-recovery backoff for '{model_id}'")
+
+    def _record_recovery_failure(self, model_id: str, dead_port: int,
+                                 generation: int = 0, reason: str = "") -> RecoveryFailure:
+        """Record one failed recovery and arm exponential backoff (BUG_0007).
+
+        Runs on the main event loop. Existing state is never replaced by a *shorter*
+        cooldown: repeated deterministic failures grow the delay up to the cap.
+        """
+        previous = self._recovery_failures.get(model_id)
+        attempts = (previous.attempts + 1) if previous else 1
+        exponent = min(attempts - 1, 20)
+        delay = min(_RECOVERY_BACKOFF_MAX_S, _RECOVERY_BACKOFF_BASE_S * (2 ** exponent))
+        now_mono = time.monotonic()
+        if generation <= 0:
+            current = self.loaded.get(model_id)
+            generation = int(getattr(current, "generation", 0) or 0) if current else 0
+        failure = RecoveryFailure(
+            model_id=model_id,
+            dead_port=dead_port,
+            generation=generation,
+            attempts=attempts,
+            reason=reason,
+            failed_at=time.time(),
+            retry_at=now_mono + delay,
+        )
+        self._recovery_failures[model_id] = failure
+        log.error(f"Dead-backend recovery for '{model_id}' failed "
+                  f"(attempt {attempts}); suppressing retries for {delay:.1f}s: {reason}")
+        return failure
+
+    def recovery_retry_after(self, model_id_hint: str = "",
+                             dead_port: Optional[int] = None,
+                             expected_generation: int = 0) -> Optional[float]:
+        """Seconds remaining on a model's failed-recovery cooldown, or None.
+
+        Safe to call from forwarder worker threads: it only snapshots dict values and
+        never awaits/takes the asyncio lock. ``dead_port`` matches the exact failed
+        engine; otherwise the model id (including its normal alias forms) is used.
+        """
+        now = time.monotonic()
+        best: Optional[float] = None
+        resolved_hint = None
+        if model_id_hint and model_id_hint not in self._recovery_failures:
+            try:
+                resolved_hint = self._lookup_model_locked(model_id_hint)
+            except Exception:  # noqa: BLE001 - concurrent registry mutation
+                resolved_hint = None
+        for rec in list(self._recovery_failures.values()):
+            if (expected_generation > 0
+                    and rec.generation not in (0, expected_generation)):
+                continue
+            matched = dead_port is not None and rec.dead_port == dead_port
+            if not matched and model_id_hint:
+                matched = (rec.model_id == model_id_hint
+                           or rec.model_id == resolved_hint)
+            if not matched:
+                continue
+            remaining = rec.retry_at - now
+            if remaining > 0 and (best is None or remaining > best):
+                best = remaining
+        return best
+
+    def recovery_failures_snapshot(self) -> List[Dict[str, Any]]:
+        """Serializable failed-recovery state for ``/v1/status`` observability."""
+        now = time.monotonic()
+        out = []
+        for rec in list(self._recovery_failures.values()):
+            out.append({
+                "model": rec.model_id,
+                "port": rec.dead_port,
+                "generation": rec.generation,
+                "attempts": rec.attempts,
+                "reason": rec.reason,
+                "failed_at": round(rec.failed_at, 1),
+                "retry_after_s": round(max(0.0, rec.retry_at - now), 1),
+            })
+        out.sort(key=lambda item: item["model"])
+        return out
+
     async def recover_dead_model(self, model_id_hint: str, dead_port: int,
-                                 expected_generation: int = 0) -> Optional[LoadedModel]:
+                                 expected_generation: int = 0,
+                                 force: bool = False) -> Optional[LoadedModel]:
         """Evict and reload the resident model whose engine refused a connection.
 
         This is the recovery half of the TCP forwarder's dead-backend detection: the
@@ -2033,9 +2198,27 @@ class ModelManager:
         killed-but-unverifiable process is left tracked (ready=False) exactly like any
         other failed unload; we never start a second engine on top of a process that
         may still be running.
+
+        BUG_0007: after a failed reload the model enters an exponential cooldown and
+        subsequent non-forced calls return ``None`` immediately instead of spawning
+        again. ``force=True`` (manual action) bypasses the cooldown.
         """
+        lock_key = model_id_hint
+        if not force:
+            lock_key = await self._recovery_lock_key(model_id_hint, dead_port)
+
         task_key = (dead_port, expected_generation)
         async with self._lock:
+            if not force:
+                remaining = self.recovery_retry_after(
+                    lock_key, dead_port, expected_generation)
+                if remaining is None:
+                    remaining = self.recovery_retry_after(lock_key)
+                if remaining is not None:
+                    log.warning(
+                        f"Recovery for '{lock_key}' on port {dead_port} suppressed: "
+                        f"failed-reload cooldown has {remaining:.1f}s remaining")
+                    return None
             task = self._recovery_tasks.get(task_key)
             if task is None or task.done():
                 task = asyncio.create_task(
@@ -2113,6 +2296,7 @@ class ModelManager:
                     # port. Reuse that instance instead of cycling it a second time.
                     if hinted is not None and hinted.port != dead_port:
                         if hinted.ready:
+                            self._clear_recovery_failure(model_id_hint)
                             return hinted
                         reload_mid = model_id_hint  # join the in-flight load below
 
@@ -2138,6 +2322,8 @@ class ModelManager:
                                 ready_loaded = [cand for cand in self.loaded.values()
                                                 if cand.ready]
                                 if ready_loaded:
+                                    self._clear_recovery_failure(
+                                        getattr(ready_loaded[0], "model_id", ""))
                                     return ready_loaded[0]
                                 log.warning(
                                     f"Dead backend on port {dead_port} is gone and "
@@ -2147,6 +2333,7 @@ class ModelManager:
                             current = self.loaded.get(resolved)
                             if current is not None:
                                 if current.ready:
+                                    self._clear_recovery_failure(reload_mid)
                                     return current
                                 # A load is already in flight; fall through to join it.
                         else:
@@ -2161,6 +2348,7 @@ class ModelManager:
                                     f"port now has engine generation {lm.generation} "
                                     f"(expected {expected_generation})")
                                 if lm.ready:
+                                    self._clear_recovery_failure(reload_mid)
                                     return lm
                                 # The replacement is still loading; join it below.
                             else:
@@ -2193,12 +2381,19 @@ class ModelManager:
                             f"Recovery of {reload_mid} aborted: engine process "
                             f"{result.pid} is still running ({result.reason}); "
                             f"keeping it tracked and refusing to start a duplicate")
+                        self._record_recovery_failure(
+                            reload_mid, dead_port, expected_generation,
+                            f"engine process {result.pid} is still running "
+                            f"({result.reason})")
                         return None
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 - recovery must never escape into a worker thread
                 log.error(f"Dead-backend recovery for '{model_id_hint}' on port {dead_port} "
                           f"failed during eviction: {e}")
+                self._record_recovery_failure(
+                    reload_mid or lock_key, dead_port, expected_generation,
+                    f"eviction failed: {e}")
                 return None
 
             if reload_mid is None:
@@ -2213,7 +2408,11 @@ class ModelManager:
                 raise
             except Exception as e:  # noqa: BLE001 - reported to the forwarder as a 503
                 log.error(f"Dead-backend recovery reload of '{reload_mid}' failed: {e}")
+                self._record_recovery_failure(
+                    reload_mid, dead_port, expected_generation,
+                    f"reload failed: {e}")
                 return None
+            self._clear_recovery_failure(reload_mid)
             return lm
 
     async def _do_load_model(self, model_id: str, force: bool = False) -> LoadedModel:
@@ -2307,6 +2506,9 @@ class ModelManager:
 
             log.info(f"Model {model_id} ready on port {port}")
             lm.touch()
+            # Any successful load (manual, JIT, or recovery reload) clears the
+            # failed-recovery circuit breaker for this model (BUG_0007).
+            self._clear_recovery_failure(model_id)
 
             # Start this model's FIFO queue now that it is ready, so the auto-restore
             # below and any concurrent LLM request are ordered through one queue.
@@ -2578,7 +2780,10 @@ class ModelManager:
             return None
         async with self._model_lock(mid):
             async with self._lock:
-                return await self._unload_unlocked(mid)
+                result = await self._unload_unlocked(mid)
+            if result is None or result.unloaded:
+                self._clear_recovery_failure(mid)
+            return result
 
     async def unload_model_exact(self, model_id: str) -> Optional[UnloadResult]:
         """Unload a specific registry id without name/stem resolution.
@@ -2589,7 +2794,10 @@ class ModelManager:
         """
         async with self._model_lock(model_id):
             async with self._lock:
-                return await self._unload_unlocked(model_id)
+                result = await self._unload_unlocked(model_id)
+            if result is None or result.unloaded:
+                self._clear_recovery_failure(model_id)
+            return result
 
     async def unload_all(self) -> Dict[str, Any]:
         """Unload every resident model and report which ones actually went away.
@@ -2605,6 +2813,10 @@ class ModelManager:
 
         unloaded = [r.model_id for r in results if r is not None and r.unloaded]
         failed = [r.failure() for r in results if r is not None and not r.unloaded]
+        for mid in ids:
+            result = next((r for r in results if r is not None and r.model_id == mid), None)
+            if result is None or result.unloaded:
+                self._clear_recovery_failure(mid)
         return {"unloaded_all": not failed, "unloaded": unloaded, "failed": failed}
 
     # ---------------- GPU info ----------------
@@ -3017,6 +3229,7 @@ class ModelManager:
             asyncio.to_thread(self.per_model_ram_vram, loaded_items=loaded_snap),
         )
         gpus = [asdict(g) for g in gpus_list]
+        recovery_failures = self.recovery_failures_snapshot()
         return {
             "launcher": {
                 "host": self.host,
@@ -3031,6 +3244,7 @@ class ModelManager:
             "models_total": total,
             "idle_timeout": self.idle_timeout,
             "max_loaded_models": self.max_loaded_models,
+            "recovery_failures": recovery_failures,
             "per_model": per,
             "uptime_models": [
                 {
@@ -3970,7 +4184,10 @@ async def rescan():
 @app.post("/v1/models/{model_id}/load")
 async def load_model_ep(model_id: str):
     try:
-        lm = await manager.load_model(model_id, force=False)
+        # A manual "load now" is an explicit operator action: it bypasses the
+        # failed-recovery cooldown, even though JIT loads respect it (BUG_0007).
+        lm = await manager.load_model(
+            model_id, force=False, respect_recovery_cooldown=False)
         return {"id": model_id, "port": lm.port, "pid": lm.pid, "ready": lm.ready}
     except HTTPException:
         raise
