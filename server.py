@@ -2369,9 +2369,23 @@ class ModelManager:
                     try:
                         killed, kill_reason = await self._unload_finish(
                             detached_lm, reload_mid)
-                    except BaseException:
+                    except BaseException as exc:
+                        # BUG_0005: the teardown above runs OUTSIDE self._lock, so the
+                        # pop made by _begin_unload_locked must be undone if it aborts:
+                        # routing, LRU eviction and the next recovery pass all key off
+                        # self.loaded. The entry comes back with ready=False, so idle_reaper
+                        # will not reclaim it (it skips not-ready entries) -- that is
+                        # deliberate; only the next recovery/unload pass can.
+                        # The flag is cleared before re-inserting on purpose: a cancelled
+                        # lock acquire must never leave _unload_in_progress set forever.
                         if deliberate:
                             self._unload_in_progress.discard(reload_mid)
+                        async with self._lock:
+                            self.loaded.setdefault(reload_mid, detached_lm)
+                            self._invalidate_status()
+                        log.error(
+                            f"Recovery teardown for {reload_mid} aborted by "
+                            f"{type(exc).__name__}; model restored to registry")
                         raise
                     async with self._lock:
                         result = self._finalize_unload_locked(

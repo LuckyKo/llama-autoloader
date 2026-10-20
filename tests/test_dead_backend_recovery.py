@@ -200,6 +200,47 @@ async def test_recover_dead_model_refuses_reload_when_kill_unverified(
 
 
 @pytest.mark.asyncio
+async def test_recover_dead_model_restores_registry_when_teardown_raises(
+        isolated_manager, monkeypatch):
+    """An aborted teardown must not orphan a possibly-live process from self.loaded."""
+    mgr = isolated_manager
+    old = _add_resident(mgr, pid=424242)
+    loads, finalizes, flag_armed = [], [], []
+
+    async def _raising_unload_finish(lm, model_id):  # noqa: ARG001
+        # The flag is armed by _begin_unload_locked before the slow phase runs;
+        # recording it here makes the later absence assertion non-vacuous.
+        flag_armed.append(model_id in mgr._unload_in_progress)
+        raise RuntimeError("teardown exploded")
+
+    async def _record_load(model_id):  # pragma: no cover - asserted unreachable
+        loads.append(model_id)
+
+    def _record_finalize(*args):
+        finalizes.append(args)
+        return UnloadResult(model_id=args[1], unloaded=True, reason="not reached")
+
+    monkeypatch.setattr(mgr, "_unload_finish", _raising_unload_finish)
+    monkeypatch.setattr(mgr, "_load_model_serialized", _record_load)
+    monkeypatch.setattr(mgr, "_finalize_unload_locked", _record_finalize)
+
+    result = await mgr.recover_dead_model("dead.gguf", old.port)
+
+    assert result is None
+    assert mgr.loaded["dead.gguf"] is old
+    assert old.ready is False
+    assert flag_armed == [True]
+    assert "dead.gguf" not in mgr._unload_in_progress
+    assert finalizes == []
+    assert loads == []  # no reload may start on an aborted teardown
+    # Pins that the *original* exception propagates: the outer handler records its
+    # text. Without the re-raise the recorded reason becomes an UnboundLocalError
+    # from the unbound kill state instead.
+    failure = mgr._recovery_failures.get("dead.gguf")
+    assert failure is not None and "teardown exploded" in failure.reason
+
+
+@pytest.mark.asyncio
 async def test_recover_dead_model_reuses_replacement_on_new_port(
         isolated_manager, monkeypatch):
     mgr = isolated_manager
