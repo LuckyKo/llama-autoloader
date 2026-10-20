@@ -2900,42 +2900,53 @@ class ModelManager:
                     except Exception as e:  # noqa: BLE001
                         fallback_error = fallback_error or e
 
-            # Verify by observation; "cannot verify" is a failure because callers rely
-            # on a successful unload to mean memory was freed. Re-check the known
-            # targets and, if we never opened the parent, a fresh handle by pid.
+            # Verify the PARENT is gone — that's what holds GPU memory and the port.
+            # Children (e.g. strata workers) are best-effort: they don't hold engine
+            # resources, so lingering children don't block the swap.
             verify_error: Optional[BaseException] = None
-            verify_targets = list(targets)
-            if parent is None:
+            if parent is not None:
                 try:
-                    verify_targets = [psutil.Process(lm.pid)]
+                    parent_alive = parent.is_running() and parent.status() != psutil.STATUS_ZOMBIE
                 except psutil.NoSuchProcess:
-                    return True, ""
+                    parent_alive = False
                 except Exception as e:  # noqa: BLE001
                     verify_error = e
-                    verify_targets = []
-            remaining = []
-            for proc in verify_targets:
+                    parent_alive = True  # cannot verify → treat as alive
+            else:
+                # Never opened the parent; check by pid.
                 try:
-                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                        remaining.append(proc.pid)
+                    parent_alive = psutil.Process(lm.pid).is_running()
                 except psutil.NoSuchProcess:
-                    pass
+                    parent_alive = False
                 except Exception as e:  # noqa: BLE001
-                    verify_error = verify_error or e
+                    verify_error = e
+                    parent_alive = True
 
-            if remaining or verify_error is not None:
+            if parent_alive or verify_error is not None:
                 reason_parts = []
                 if primary_error is not None:
                     reason_parts.append(str(primary_error))
-                if remaining:
-                    reason_parts.append(
-                        f"process(es) {', '.join(str(pid) for pid in remaining)} "
-                        f"still running")
+                if parent_alive:
+                    reason_parts.append(f"parent process {lm.pid} still running")
                 if verify_error is not None:
                     reason_parts.append(f"could not verify termination: {verify_error}")
                 if fallback_error is not None:
                     reason_parts.append(f"fallback error: {fallback_error}")
                 return False, "; ".join(reason_parts) or "process still running"
+
+            # Parent is gone. Note any lingering children for diagnostics.
+            lingering = []
+            for proc in children:
+                try:
+                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                        lingering.append(proc.pid)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            if lingering:
+                log.warning(
+                    f"Child process(es) {', '.join(str(p) for p in lingering)} "
+                    f"still running after unload of {model_id} (parent {lm.pid} gone); "
+                    f"they will be reaped by the OS")
             return True, ""
 
         killed, kill_reason = await asyncio.to_thread(_kill_proc)
