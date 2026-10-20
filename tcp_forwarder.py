@@ -85,6 +85,12 @@ _BODY_READ_TIMEOUT = max(0.1, float(os.environ.get("AUTOLOADER_BODY_TIMEOUT", "3
 # clients (or a local misbehaving tool) could exhaust the process's threads/descriptors.
 _MAX_CONNECTIONS = max(1, int(os.environ.get("AUTOLOADER_MAX_CONNECTIONS", "256")))
 
+# Cap on threads allowed to wait for the SAME dead-engine recovery. Without this, a
+# thundering herd for one dead model can occupy the entire connection budget for the
+# whole drain/kill/reload (minutes for large models), denying unrelated models. Extra
+# requests get an immediate retryable 503 instead of another blocked worker.
+_MAX_RECOVERY_WAITERS = max(1, int(os.environ.get("AUTOLOADER_MAX_RECOVERY_WAITERS", "32")))
+
 # How long an LLM request waits for its model's FIFO ticket before returning 503.
 _QUEUE_WAIT_TIMEOUT = max(0.1, float(os.environ.get("AUTOLOADER_QUEUE_TIMEOUT", "300")))
 
@@ -146,6 +152,10 @@ class _BackendUnreachable(Exception):
         self.cause = cause
 
 
+class _RecoverySaturated(Exception):
+    """Too many worker threads are already waiting for one engine's recovery."""
+
+
 def _is_connection_refused(exc: BaseException) -> bool:
     """True for the ``WinError 10061`` / ``ECONNREFUSED`` family of connect failures."""
     if isinstance(exc, ConnectionRefusedError):
@@ -174,21 +184,68 @@ class RawTCPForwarder:
         self._server_sock: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        # Thread-safe registry of in-flight llama-server upstream pipes, keyed by target port.
-        # Used by cancel_active() to perform a soft (connection-close) interrupt without unloading.
-        self._active_conns: Dict[int, set] = {}
+        # Thread-safe registry of in-flight llama-server upstream pipes, keyed by
+        # (target port, engine generation). Ports are reused after reload, so the
+        # generation component keeps a cancel from closing a replacement's sockets.
+        self._active_conns: Dict[Tuple[int, int], set] = {}
         self._active_lock = threading.Lock()
         self._conn_sem = threading.BoundedSemaphore(_MAX_CONNECTIONS)
+        # Threads currently waiting on a recovery, keyed by (dead port, generation).
+        # Bounded so one dead model cannot monopolize the whole connection budget.
+        self._recovery_waiters: Dict[Tuple[int, int], int] = {}
+        self._recovery_wait_lock = threading.Lock()
 
-    def cancel_active(self, port: int) -> int:
-        """Best-effort cancel of in-flight requests bound to ``port``.
+    def _reserve_recovery_waiter(self, port: int, generation: int) -> bool:
+        """Reserve one bounded recovery-wait slot, or return False when saturated."""
+        key = (port, generation)
+        with self._recovery_wait_lock:
+            waiting = self._recovery_waiters.get(key, 0)
+            if waiting >= _MAX_RECOVERY_WAITERS:
+                return False
+            self._recovery_waiters[key] = waiting + 1
+            return True
+
+    def _release_recovery_waiter(self, port: int, generation: int) -> None:
+        key = (port, generation)
+        with self._recovery_wait_lock:
+            waiting = self._recovery_waiters.get(key, 0) - 1
+            if waiting > 0:
+                self._recovery_waiters[key] = waiting
+            else:
+                self._recovery_waiters.pop(key, None)
+
+    def _wait_for_recovery(self, model_id: str, port: int,
+                           generation: int) -> Optional[Tuple[int, int]]:
+        """Wait on one shared recovery, bounded by the per-engine waiter cap."""
+        if not self._reserve_recovery_waiter(port, generation):
+            log.warning(
+                f"Model '{model_id}': {_MAX_RECOVERY_WAITERS} requests already "
+                f"waiting for recovery of port {port} (generation {generation}); "
+                f"refusing another waiter")
+            raise _RecoverySaturated(
+                f"{_MAX_RECOVERY_WAITERS} requests are already waiting for model "
+                f"'{model_id}' recovery")
+        try:
+            return self._recover_dead_backend(model_id, port, generation)
+        finally:
+            self._release_recovery_waiter(port, generation)
+
+    def cancel_active(self, port: int, generation: Optional[int] = None) -> int:
+        """Best-effort cancel of in-flight requests bound to one engine instance.
 
         Closes the underlying upstream (and client) sockets. For a recent llama-server build this
         causes generation to stop ("srv stop: cancel task"), while leaving the resident model loaded.
-        Returns the number of connections cancelled.
+        Passing ``generation`` targets only that instance; omitting it keeps the legacy
+        port-wide behavior. Returns the number of connections cancelled.
         """
         with self._active_lock:
-            pairs = list(self._active_conns.pop(port, ()))
+            if generation is None:
+                keys = [key for key in self._active_conns if key[0] == port]
+            else:
+                keys = [(port, generation)]
+            pairs = []
+            for key in keys:
+                pairs.extend(self._active_conns.pop(key, ()))
         for client_sock, target_sock in pairs:
             for s in (target_sock, client_sock):
                 try:
@@ -201,17 +258,21 @@ class RawTCPForwarder:
                     pass
         return len(pairs)
 
-    def _register_active(self, port: int, client_sock: socket.socket, target_sock: socket.socket) -> None:
+    def _register_active(self, port: int, generation: int,
+                         client_sock: socket.socket, target_sock: socket.socket) -> None:
         with self._active_lock:
-            self._active_conns.setdefault(port, set()).add((client_sock, target_sock))
+            self._active_conns.setdefault((port, generation), set()).add(
+                (client_sock, target_sock))
 
-    def _unregister_active(self, port: int, client_sock: socket.socket, target_sock: socket.socket) -> None:
+    def _unregister_active(self, port: int, generation: int,
+                           client_sock: socket.socket, target_sock: socket.socket) -> None:
         with self._active_lock:
-            conns = self._active_conns.get(port)
+            key = (port, generation)
+            conns = self._active_conns.get(key)
             if conns:
                 conns.discard((client_sock, target_sock))
                 if not conns:
-                    self._active_conns.pop(port, None)
+                    self._active_conns.pop(key, None)
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -325,25 +386,29 @@ class RawTCPForwarder:
                     self._send_error_response(client_sock, 400,
                                               "Could not determine 'model' from request body for LLM endpoint")
                     return
-                target_port = self._resolve_target_port(model_id)
-                if target_port:
+                target = self._resolve_target(model_id)
+                if target:
+                    target_port, target_generation = target
                     # Model already loaded -> pipe directly, but only after acquiring this
                     # model's FIFO ticket. The ticket is granted in strict submission order,
                     # so a state restore enqueued before this request runs first (fixes the
                     # full-reprocess race). No per-request log: this is the hot path.
                     queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
-                                           target_port, model_id, queue)
+                                           target_port, model_id, queue,
+                                           expected_generation=target_generation)
                     return
                 # Model not loaded -> JIT load it, wait for readiness, then pipe.
                 log.info(f"Model '{model_id}' not loaded; triggering JIT load...")
-                target_port = self._jit_load_and_wait(model_id)
-                if target_port:
+                target = self._jit_load_and_wait_target(model_id)
+                if target:
+                    target_port, target_generation = target
                     # Acquire the ticket only AFTER the model is loaded and ready, so the
                     # load itself is never gated by the queue.
                     queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
-                                           target_port, model_id, queue)
+                                           target_port, model_id, queue,
+                                           expected_generation=target_generation)
                     return
                 # JIT load failed (unknown model / timeout / spawn error).
                 log.error(f"JIT load failed for '{model_id}' on {method} {path}")
@@ -667,12 +732,13 @@ class RawTCPForwarder:
             log.error(f"Model resolution failed for {model_id!r}: {e}")
             return None
 
-    def _resolve_target_port(self, model_id: str) -> Optional[int]:
-        """Look up the llama-server port for a loaded model.
+    def _resolve_target(self, model_id: str) -> Optional[Tuple[int, int]]:
+        """Return ``(port, engine_generation)`` for a loaded, ready model.
 
         Resolves via :meth:`_resolve_request_model` on the MAIN event loop (never a fresh
-        one) and returns the port only if that model is already loaded AND ready. Returns
-        None otherwise so the caller can JIT-load the requested model.
+        one). The generation is the identity token used to keep recovery and active-
+        request accounting bound to THIS engine instance even after its stable port is
+        reused by a reload.
 
         ``resolve_request_model`` (not the strict variant) is deliberate: an inference
         request naming a model we do not recognise must be served by the already-loaded
@@ -695,16 +761,24 @@ class RawTCPForwarder:
         # raw-TCP path. touch() only writes a float (atomic under the GIL), so it is
         # safe to call from this worker thread without the manager's asyncio lock.
         lm.touch()
-        return lm.port
+        return lm.port, int(getattr(lm, "generation", 0) or 0)
 
-    def _recover_dead_backend(self, model_id: str, dead_port: int) -> Optional[int]:
-        """Ask the manager to evict/reload the engine on ``dead_port``; return its new port.
+    def _resolve_target_port(self, model_id: str) -> Optional[int]:
+        """Backwards-compatible port-only view of :meth:`_resolve_target`."""
+        target = self._resolve_target(model_id)
+        return target[0] if target else None
 
-        Runs the async recovery on the MAIN event loop (never a fresh loop) and blocks
-        this handler thread until it finishes. Concurrent requests for the same dead
-        port share one recovery task inside the manager, so this is safe under a
-        thundering herd. Returns None when no running loop/recovery is available or the
-        replacement did not become ready.
+    def _recover_dead_backend(self, model_id: str, dead_port: int,
+                              expected_generation: int = 0) -> Optional[Tuple[int, int]]:
+        """Ask the manager to evict/reload one engine; return its ``(port, generation)``.
+
+        ``expected_generation`` identifies the exact instance that refused the connection
+        so a concurrent replacement on the same stable port is never evicted. Runs the
+        async recovery on the MAIN event loop (never a fresh loop) and blocks this handler
+        thread until it finishes. Concurrent requests for the same dead instance share one
+        recovery task inside the manager, so this is safe under a thundering herd.
+        Returns None when no running loop/recovery is available or the replacement did not
+        become ready.
         """
         manager = self.model_manager
         if manager is None:
@@ -740,7 +814,7 @@ class RawTCPForwarder:
 
         try:
             future = asyncio.run_coroutine_threadsafe(
-                recover(model_id, dead_port), main_loop)
+                recover(model_id, dead_port, expected_generation), main_loop)
         except Exception as e:  # noqa: BLE001 - loop closed between check and submit
             log.error(f"Could not submit dead-backend recovery for '{model_id}' "
                       f"on port {dead_port}: {e}")
@@ -749,19 +823,30 @@ class RawTCPForwarder:
             lm = future.result(timeout=timeout)
         except Exception as e:  # noqa: BLE001 — includes TimeoutError / spawn errors
             log.error(f"Dead-backend recovery for '{model_id}' on port {dead_port} "
-                      f"failed: {e}")
+                      f"(generation {expected_generation}) failed: {e}")
             return None
         if lm is not None and getattr(lm, "ready", False):
+            generation = int(getattr(lm, "generation", 0) or 0)
             log.info(f"Recovered model '{getattr(lm, 'model_id', model_id)}' on "
-                     f"port {lm.port} after backend death on port {dead_port}")
-            return lm.port
+                     f"port {lm.port} (generation {generation}) after backend death "
+                     f"on port {dead_port} (generation {expected_generation})")
+            return lm.port, generation
         log.error(f"Dead-backend recovery for '{model_id}' on port {dead_port} "
-                  f"returned no ready model")
+                  f"(generation {expected_generation}) returned no ready model")
         return None
 
     def _jit_load_and_wait(self, model_id: str) -> Optional[int]:
-        """Trigger a JIT load of ``model_id`` and block until it is ready. Returns the
-        llama-server port on success, or None on failure (unknown model / timeout / error).
+        """Backwards-compatible port-only view of :meth:`_jit_load_and_wait_target`."""
+        target = self._jit_load_and_wait_target(model_id)
+        return target[0] if target else None
+
+    def _jit_load_and_wait_target(self, model_id: str) -> Optional[Tuple[int, int]]:
+        """Trigger a JIT load of ``model_id`` and block until it is ready.
+
+        Returns ``(port, engine_generation)`` on success, or None on failure
+        (unknown model / timeout / error). The generation is captured from the same
+        LoadedModel that returned ready, so it identifies the exact instance even if
+        another load replaces it immediately afterwards.
 
         The request's model is resolved FIRST, so an unknown name that already has a
         resident fallback joins that model's load instead of trying to load a model
@@ -802,8 +887,10 @@ class RawTCPForwarder:
             log.error(f"JIT load failed for {model_id!r}: {e}")
             return None
         if lm and getattr(lm, "ready", False):
-            log.info(f"Model '{model_id}' loaded on port {lm.port}")
-            return lm.port
+            generation = int(getattr(lm, "generation", 0) or 0)
+            log.info(f"Model '{model_id}' loaded on port {lm.port} "
+                     f"(generation {generation})")
+            return lm.port, generation
         log.error(f"Model '{model_id}' load completed but not ready")
         return None
 
@@ -818,7 +905,8 @@ class RawTCPForwarder:
 
     def _pipe_with_ticket(self, client_sock: socket.socket, raw_headers: bytes,
                           body_prefix: bytes, target_port: int, model_id: str,
-                          queue, _recovery_attempts: int = 0) -> None:
+                          queue, expected_generation: int = 0,
+                          _recovery_attempts: int = 0) -> None:
         """Acquire the model's FIFO ticket, then pipe; surface busy timeouts as 503.
 
         A connection-refused failure on the llama-server fast path means the engine died
@@ -826,31 +914,48 @@ class RawTCPForwarder:
         ticket is released (by the context manager), the manager evicts/reloads the model,
         and the SAME request is retried once on the recovered port. This is what turns a
         permanent 502 loop into a one-request recovery.
+
+        ``expected_generation`` is the engine instance that was routed to. It travels
+        with the recovery and retry so a replacement that reused the same port is never
+        mistaken for the dead instance.
         """
         try:
             with queue.ticket(timeout=_QUEUE_WAIT_TIMEOUT):
                 self._pipe_to_backend(client_sock, raw_headers,
-                                      body_prefix, target_port, _LLAMA_SERVER_LABEL)
+                                      body_prefix, target_port, _LLAMA_SERVER_LABEL,
+                                      engine_generation=expected_generation)
         except _BackendUnreachable:
             if _recovery_attempts >= 1:
-                log.error(f"Model '{model_id}' engine on port {target_port} still "
+                log.error(f"Model '{model_id}' engine on port {target_port} "
+                          f"(generation {expected_generation}) still "
                           f"refused after one recovery attempt")
                 self._send_error_response(
                     client_sock, 503,
                     f"Model '{model_id}' engine is unavailable after a reload attempt")
                 return
-            log.warning(f"Model '{model_id}' engine on port {target_port} refused the "
+            log.warning(f"Model '{model_id}' engine on port {target_port} "
+                        f"(generation {expected_generation}) refused the "
                         f"connection; evicting and reloading")
-            new_port = self._recover_dead_backend(model_id, target_port)
-            if not new_port:
+            try:
+                recovered = self._wait_for_recovery(
+                    model_id, target_port, expected_generation)
+            except _RecoverySaturated as e:
+                self._send_error_response(
+                    client_sock, 503,
+                    f"Model '{model_id}' recovery is saturated ({e}); retry shortly")
+                return
+            if not recovered:
                 self._send_error_response(
                     client_sock, 503,
                     f"Model '{model_id}' engine died and could not be restarted")
                 return
-            log.info(f"Retrying request for model '{model_id}' on recovered port {new_port}")
+            new_port, new_generation = recovered
+            log.info(f"Retrying request for model '{model_id}' on recovered port "
+                     f"{new_port} (generation {new_generation})")
             retry_queue = self.model_manager.queue_registry.get_or_create(new_port, model_id)
             self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
                                    new_port, model_id, retry_queue,
+                                   expected_generation=new_generation,
                                    _recovery_attempts=_recovery_attempts + 1)
         except TimeoutError:
             log.warning(f"Queue wait timed out for model '{model_id}' on port {target_port}")
@@ -862,14 +967,26 @@ class RawTCPForwarder:
             # requests still waiting on it. They are not doomed: join the recovery and
             # retry once on the replacement port instead of surfacing a spurious 503.
             active = getattr(self.model_manager, "recovery_in_progress", None)
+            # Generation 0 is the legacy/fake "unknown instance" form: match any
+            # recovery on the port, as before.
+            active_generation = expected_generation if expected_generation > 0 else None
             if (_recovery_attempts < 1 and active is not None
-                    and active(target_port)):
-                new_port = self._recover_dead_backend(model_id, target_port)
-                if new_port:
+                    and active(target_port, active_generation)):
+                try:
+                    recovered = self._wait_for_recovery(
+                        model_id, target_port, expected_generation)
+                except _RecoverySaturated as e:
+                    self._send_error_response(
+                        client_sock, 503,
+                        f"Model '{model_id}' recovery is saturated ({e}); retry shortly")
+                    return
+                if recovered:
+                    new_port, new_generation = recovered
                     retry_queue = self.model_manager.queue_registry.get_or_create(
                         new_port, model_id)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
                                            new_port, model_id, retry_queue,
+                                           expected_generation=new_generation,
                                            _recovery_attempts=_recovery_attempts + 1)
                     return
             log.error(f"Queue unavailable for model '{model_id}': {e}")
@@ -877,24 +994,31 @@ class RawTCPForwarder:
                 client_sock, 503, f"Model '{model_id}' queue is unavailable")
 
     def _pipe_to_backend(self, client_sock: socket.socket, raw_headers: bytes,
-                          body_prefix: bytes, target_port: int, label: str) -> None:
+                          body_prefix: bytes, target_port: int, label: str,
+                          engine_generation: int = 0) -> None:
         """Track the request as active, then run the raw pipe.
 
         The active counter is what stops the idle reaper / LRU eviction from
-        unloading a model in the middle of a long generation.
+        unloading a model in the middle of a long generation. The start() call
+        returns the exact engine instance, and end() releases that same object,
+        so a late completion from a dead generation cannot decrement a replacement.
         """
         tracking = label == _LLAMA_SERVER_LABEL
+        engine = None
         if tracking and self.model_manager is not None:
-            self.model_manager.note_request_start(target_port)
+            engine = self.model_manager.note_request_start(
+                target_port, engine_generation)
         try:
             self._pipe_to_backend_inner(
-                client_sock, raw_headers, body_prefix, target_port, label)
+                client_sock, raw_headers, body_prefix, target_port, label,
+                engine_generation)
         finally:
-            if tracking and self.model_manager is not None:
-                self.model_manager.note_request_end(target_port)
+            if engine is not None and self.model_manager is not None:
+                self.model_manager.note_request_end(engine)
 
     def _pipe_to_backend_inner(self, client_sock: socket.socket, raw_headers: bytes,
-                          body_prefix: bytes, target_port: int, label: str) -> None:
+                          body_prefix: bytes, target_port: int, label: str,
+                          engine_generation: int = 0) -> None:
         """Forward the request (reconstructed verbatim) to a backend and pipe bidirectionally."""
         try:
             target_sock = self._connect_backend(target_port)
@@ -943,12 +1067,14 @@ class RawTCPForwarder:
         # Both sockets stay blocking (Windows select can't mix with settimeout/non-blocking).
         tracking = label == _LLAMA_SERVER_LABEL
         if tracking:
-            self._register_active(target_port, client_sock, target_sock)
+            self._register_active(target_port, engine_generation,
+                                  client_sock, target_sock)
         try:
             self._bidirectional_pipe(client_sock, target_sock)
         finally:
             if tracking:
-                self._unregister_active(target_port, client_sock, target_sock)
+                self._unregister_active(target_port, engine_generation,
+                                        client_sock, target_sock)
 
     def _inject_cors_nonblocking(self, client_sock: socket.socket,
                                  target_sock: socket.socket) -> None:

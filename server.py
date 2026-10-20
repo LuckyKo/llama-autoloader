@@ -635,6 +635,11 @@ class LoadedModel:
     # both the idle reaper and LRU eviction so a long generation is never
     # killed just because another model wants the slot.
     active_requests: int = 0
+    # Monotonic identity of THIS engine instance, assigned by ModelManager at launch.
+    # Ports are stable per model and are reused after unload/reload, so a bare port
+    # cannot distinguish a dead generation from its replacement. Recovery and active-
+    # request accounting compare this token instead.
+    generation: int = 0
 
     def touch(self):
         self.last_used = time.time()
@@ -795,12 +800,22 @@ class ModelManager:
         self.temp_dir = Path(__file__).resolve().parent / "temp"
         self._lock = asyncio.Lock()
         self._loading_tasks: Dict[str, asyncio.Task] = {}
-        # Dead-backend recoveries currently in flight, keyed by the dead engine port.
-        # The TCP forwarder can have many worker threads hit the same refused port at
-        # once; the first one creates the recovery task and the rest await it. Keyed by
-        # port (not model id) because the request's model name may be an alias and the
-        # port uniquely identifies the resident instance that just died.
-        self._recovery_tasks: Dict[int, asyncio.Task] = {}
+        # Per-model serialization for load vs. dead-backend teardown. Recovery must
+        # drain/kill OUTSIDE the global manager lock (BUG_0005), which means a load
+        # could otherwise spawn a replacement on the same stable port while the old
+        # process is still being killed. This lock is per model (never global), so
+        # recoveries for different models still proceed concurrently.
+        self._model_locks: Dict[str, asyncio.Lock] = {}
+        # Monotonic counter for LoadedModel.generation. Never reset at runtime; a
+        # generation token must remain unique across unload/reload cycles so a delayed
+        # event cannot be mistaken for the replacement that reused the same port.
+        self._engine_generation = 0
+        # Dead-backend recoveries currently in flight, keyed by (dead port, expected
+        # engine generation). The TCP forwarder can have many worker threads hit the
+        # same refused port at once; the first one creates the recovery task and the
+        # rest await it. The generation is part of the key so a delayed recovery for
+        # an OLD instance can never attach to a healthy replacement on the same port.
+        self._recovery_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
         # Per-model FIFO ticket queues (keyed by engine port). The TCP forwarder and
         # the state save/restore paths both acquire a ticket here so operations for a
         # model run in strict FIFO order. See model_queue.py.
@@ -1912,35 +1927,68 @@ class ModelManager:
         await self._unload_unlocked(lru_id)
 
     # ---- active-request tracking (called from forwarder worker threads) ----
-    def note_request_start(self, port: int) -> None:
-        """Mark one in-flight request for the resident model on ``port``."""
+    def note_request_start(self, port: int,
+                           generation: int = 0) -> Optional[LoadedModel]:
+        """Mark one in-flight request and return the EXACT engine instance.
+
+        ``generation`` narrows the match to the instance the forwarder routed to.
+        The returned object is the end() token: a late request from a dead engine
+        must decrement its own instance, never a replacement that reused the port.
+
+        ``generation <= 0`` is the backwards-compatible fake/legacy form: match by
+        port only. Real engines always carry a manager-assigned positive generation.
+        """
         # Snapshot: this runs on a forwarder thread while the event loop may
         # unload a model. Iterating the live dict could raise "changed size".
         for lm in list(self.loaded.values()):
-            if lm.port == port:
-                lm.active_requests += 1
-                lm.touch()
-                return
+            if lm.port != port:
+                continue
+            if generation > 0 and lm.generation != generation:
+                continue
+            lm.active_requests += 1
+            lm.touch()
+            return lm
+        return None
 
-    def note_request_end(self, port: int) -> None:
+    def note_request_end(self, engine: Optional[LoadedModel]) -> None:
         """Release an in-flight request and refresh ``last_used`` on completion.
+
+        Takes the LoadedModel token returned by note_request_start and decrements
+        THAT object directly. A late completion from a dead generation can therefore
+        never decrement a replacement that reused the same port.
 
         Touching at the END matters for long generations: otherwise a request
         that started just before the idle timeout could be reaped while it is
         still streaming.
         """
-        for lm in list(self.loaded.values()):
-            if lm.port == port:
-                lm.active_requests = max(0, lm.active_requests - 1)
-                lm.touch()
-                return
+        if engine is None:
+            return
+        engine.active_requests = max(0, engine.active_requests - 1)
+        engine.touch()
+
+    def _model_lock(self, model_id: str) -> asyncio.Lock:
+        """Per-model lock serializing loads against recovery teardown.
+
+        Access is from the main event loop only. Keeping this lock separate from
+        ``self._lock`` is the point of BUG_0005: a slow recovery for model A never
+        blocks routing/status for model B.
+        """
+        lock = self._model_locks.get(model_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._model_locks[model_id] = lock
+        return lock
 
     async def load_model(self, model_id_input: str, force: bool = False) -> LoadedModel:
         """Load (JIT) a model with non-blocking concurrency for other requests."""
         model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise KeyError(f"Unknown model: {model_id_input}")
+        async with self._model_lock(model_id):
+            return await self._load_model_serialized(model_id, force)
 
+    async def _load_model_serialized(self, model_id: str,
+                                     force: bool = False) -> LoadedModel:
         async with self._lock:
             # Double-check under lock
             if model_id in self.loaded and self.loaded[model_id].ready and not force:
@@ -1965,126 +2013,208 @@ class ModelManager:
                 if self._loading_tasks.get(model_id) is task:
                     self._loading_tasks.pop(model_id, None)
 
-    async def recover_dead_model(self, model_id_hint: str,
-                                 dead_port: int) -> Optional[LoadedModel]:
+    async def recover_dead_model(self, model_id_hint: str, dead_port: int,
+                                 expected_generation: int = 0) -> Optional[LoadedModel]:
         """Evict and reload the resident model whose engine refused a connection.
 
         This is the recovery half of the TCP forwarder's dead-backend detection: the
         forwarder has already observed a connection-refused error on ``dead_port``.
-        Recoveries are deduplicated by port, so a burst of concurrent requests against
-        one dead engine performs a single unload/reload cycle and every caller awaits
-        the same result.
+        Recoveries are deduplicated by ``(dead_port, expected_generation)``, so a burst
+        of concurrent requests against one dead engine performs a single unload/reload
+        cycle and every caller awaits the same result — while a delayed recovery for an
+        OLD instance cannot attach to a healthy replacement that reused the port.
+
+        ``expected_generation`` is the LoadedModel.generation captured when the request
+        was routed. If the generation currently on that port is newer, recovery returns
+        the replacement unchanged instead of evicting it. A value of 0 keeps the legacy
+        port-only behavior for fakes/older callers.
 
         Returns the ready replacement, or ``None`` when no recovery was possible. A
         killed-but-unverifiable process is left tracked (ready=False) exactly like any
         other failed unload; we never start a second engine on top of a process that
         may still be running.
         """
+        task_key = (dead_port, expected_generation)
         async with self._lock:
-            task = self._recovery_tasks.get(dead_port)
+            task = self._recovery_tasks.get(task_key)
             if task is None or task.done():
                 task = asyncio.create_task(
-                    self._recover_dead_model_impl(model_id_hint, dead_port))
-                self._recovery_tasks[dead_port] = task
+                    self._recover_dead_model_impl(
+                        model_id_hint, dead_port, expected_generation))
+                self._recovery_tasks[task_key] = task
                 task.add_done_callback(
-                    lambda t, port=dead_port: self._forget_recovery_task(port, t))
+                    lambda t, key=task_key: self._forget_recovery_task(key, t))
         # Shield: one request's cancellation (client disconnect, shutdown of its worker)
         # must not cancel the shared recovery the other requests are waiting on.
         return await asyncio.shield(task)
 
-    def _forget_recovery_task(self, dead_port: int, task: asyncio.Task) -> None:
-        if self._recovery_tasks.get(dead_port) is task:
-            self._recovery_tasks.pop(dead_port, None)
+    def _forget_recovery_task(self, task_key: Tuple[int, int],
+                              task: asyncio.Task) -> None:
+        if self._recovery_tasks.get(task_key) is task:
+            self._recovery_tasks.pop(task_key, None)
 
-    def recovery_in_progress(self, dead_port: int) -> bool:
+    def recovery_in_progress(self, dead_port: int,
+                             expected_generation: Optional[int] = None) -> bool:
         """True while a dead-backend recovery owns ``dead_port``.
 
-        Called by forwarder worker threads: ``dict.get`` and ``Task.done()`` are safe
-        reads from another thread; no manager lock is needed (and cannot be taken here).
+        With ``expected_generation``, only that engine generation counts; without it,
+        any active recovery for the port counts. Called by forwarder worker threads:
+        ``dict.get`` and ``Task.done()`` are safe reads from another thread; no manager
+        lock is needed (and cannot be taken here).
         """
-        task = self._recovery_tasks.get(dead_port)
-        return task is not None and not task.done()
+        if expected_generation is not None:
+            task = self._recovery_tasks.get((dead_port, expected_generation))
+            return task is not None and not task.done()
+        return any(
+            key[0] == dead_port and not task.done()
+            for key, task in list(self._recovery_tasks.items())
+        )
 
-    async def _recover_dead_model_impl(self, model_id_hint: str,
-                                       dead_port: int) -> Optional[LoadedModel]:
-        """Do one dead-backend eviction/reload (``recover_dead_model`` dedups calls)."""
+    async def _recovery_lock_key(self, model_id_hint: str, dead_port: int) -> str:
+        """Resolve the per-model lock key for a recovery.
+
+        Prefer the model currently owning ``dead_port`` (the exact engine being
+        recovered), then the hinted id/alias, then the inference fallback. Taking
+        ``self._lock`` here is intentionally brief; the slow teardown happens later
+        under the per-model lock only.
+        """
+        async with self._lock:
+            for mid, lm in self.loaded.items():
+                if lm.port == dead_port:
+                    return mid
+            resolved = self._lookup_model_locked(model_id_hint)
+            if resolved:
+                return resolved
+            ready_loaded = [mid for mid, lm in self.loaded.items() if lm.ready]
+            if ready_loaded:
+                return ready_loaded[0]
+        return model_id_hint
+
+    async def _recover_dead_model_impl(self, model_id_hint: str, dead_port: int,
+                                       expected_generation: int = 0) -> Optional[LoadedModel]:
+        """Do one dead-backend eviction/reload (``recover_dead_model`` dedups calls).
+
+        BUG_0005: the slow drain/kill runs OUTSIDE ``self._lock``. Only the fast
+        validate-and-detach phase and the final registry update hold the global
+        lock, so routing/status for unrelated models stays responsive. A per-model
+        lock prevents a load from spawning a replacement on the same stable port
+        while the old process is still being torn down.
+        """
+        lock_key = await self._recovery_lock_key(model_id_hint, dead_port)
         reload_mid: Optional[str] = None
-        try:
-            async with self._lock:
-                hinted = self.loaded.get(model_id_hint)
+        async with self._model_lock(lock_key):
+            detached_lm: Optional[LoadedModel] = None
+            deliberate = False
+            try:
+                async with self._lock:
+                    hinted = self.loaded.get(model_id_hint)
 
-                # A concurrent recovery may already have replaced this model on a new
-                # port. Reuse that instance instead of cycling it a second time.
-                if hinted is not None and hinted.port != dead_port:
-                    if hinted.ready:
-                        return hinted
-                    reload_mid = model_id_hint  # join the in-flight load below
+                    # A concurrent recovery may already have replaced this model on a new
+                    # port. Reuse that instance instead of cycling it a second time.
+                    if hinted is not None and hinted.port != dead_port:
+                        if hinted.ready:
+                            return hinted
+                        reload_mid = model_id_hint  # join the in-flight load below
 
-                else:
-                    lm = hinted if (hinted is not None and hinted.port == dead_port) else None
-                    if lm is not None:
-                        reload_mid = model_id_hint
                     else:
-                        for mid, cand in self.loaded.items():
-                            if cand.port == dead_port:
-                                lm, reload_mid = cand, mid
-                                break
+                        lm = hinted if (hinted is not None and hinted.port == dead_port) else None
+                        if lm is not None:
+                            reload_mid = model_id_hint
+                        else:
+                            for mid, cand in self.loaded.items():
+                                if cand.port == dead_port:
+                                    lm, reload_mid = cand, mid
+                                    break
 
-                    if lm is None:
-                        # The dead instance is already gone (possibly recovered and
-                        # then unloaded). Resolve the hint so this request can still be
-                        # served; never invent a model for an unknown name.
-                        resolved = self._lookup_model_locked(model_id_hint)
-                        if not resolved:
-                            # Unknown inference name: match resolve_request_model's
-                            # accepted fallback and reuse a ready resident model if one
-                            # exists. Never invent a JIT load for the unknown name.
-                            ready_loaded = [cand for cand in self.loaded.values()
-                                            if cand.ready]
-                            if ready_loaded:
-                                return ready_loaded[0]
-                            log.warning(
-                                f"Dead backend on port {dead_port} is gone and "
-                                f"'{model_id_hint}' no longer resolves; cannot recover")
-                            return None
-                        reload_mid = resolved
-                        current = self.loaded.get(resolved)
-                        if current is not None:
-                            if current.ready:
-                                return current
-                            # A load is already in flight; fall through to join it.
-                    else:
-                        state = "refused a connection" if lm.ready else "is already marked unready"
-                        log.error(f"Engine for {reload_mid} on port {dead_port} {state}; "
-                                  f"evicting and reloading")
-                        # Auto-save would hang against a dead engine and capture nothing
-                        # useful. Mark unready first so _unload_finish skips it.
-                        lm.ready = False
-                        self._invalidate_status()
-                        result = await self._unload_unlocked(reload_mid)
-                        if result is not None and not result.unloaded:
-                            log.error(
-                                f"Recovery of {reload_mid} aborted: engine process "
-                                f"{result.pid} is still running ({result.reason}); "
-                                f"keeping it tracked and refusing to start a duplicate")
-                            return None
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - recovery must never escape into a worker thread
-            log.error(f"Dead-backend recovery for '{model_id_hint}' on port {dead_port} "
-                      f"failed during eviction: {e}")
-            return None
+                        if lm is None:
+                            # The dead instance is already gone (possibly recovered and
+                            # then unloaded). Resolve the hint so this request can still be
+                            # served; never invent a model for an unknown name.
+                            resolved = self._lookup_model_locked(model_id_hint)
+                            if not resolved:
+                                # Unknown inference name: match resolve_request_model's
+                                # accepted fallback and reuse a ready resident model if one
+                                # exists. Never invent a JIT load for the unknown name.
+                                ready_loaded = [cand for cand in self.loaded.values()
+                                                if cand.ready]
+                                if ready_loaded:
+                                    return ready_loaded[0]
+                                log.warning(
+                                    f"Dead backend on port {dead_port} is gone and "
+                                    f"'{model_id_hint}' no longer resolves; cannot recover")
+                                return None
+                            reload_mid = resolved
+                            current = self.loaded.get(resolved)
+                            if current is not None:
+                                if current.ready:
+                                    return current
+                                # A load is already in flight; fall through to join it.
+                        else:
+                            # Only evict the instance that actually refused the connection.
+                            # A newer generation on the same (stable) port is a healthy
+                            # replacement from a concurrent load/restore; unloading it here
+                            # would kill the fix instead of the failure.
+                            if (expected_generation > 0
+                                    and lm.generation != expected_generation):
+                                log.info(
+                                    f"Recovery for {reload_mid} on port {dead_port} skipped: "
+                                    f"port now has engine generation {lm.generation} "
+                                    f"(expected {expected_generation})")
+                                if lm.ready:
+                                    return lm
+                                # The replacement is still loading; join it below.
+                            else:
+                                state = ("refused a connection" if lm.ready
+                                         else "is already marked unready")
+                                log.error(f"Engine for {reload_mid} on port {dead_port} "
+                                          f"{state}; evicting and reloading")
+                                # Auto-save would hang against a dead engine and capture
+                                # nothing useful. Mark unready first so _unload_finish skips it.
+                                lm.ready = False
+                                self._invalidate_status()
+                                # Detach under the lock, then release it for the slow part.
+                                begin = self._begin_unload_locked(reload_mid)
+                                if begin is not None:
+                                    detached_lm, deliberate = begin
 
-        if reload_mid is None:
-            return None
-        try:
-            lm = await self.load_model(reload_mid)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 - reported to the forwarder as a 503
-            log.error(f"Dead-backend recovery reload of '{reload_mid}' failed: {e}")
-            return None
-        return lm
+                if detached_lm is not None:
+                    try:
+                        killed, kill_reason = await self._unload_finish(
+                            detached_lm, reload_mid)
+                    except BaseException:
+                        if deliberate:
+                            self._unload_in_progress.discard(reload_mid)
+                        raise
+                    async with self._lock:
+                        result = self._finalize_unload_locked(
+                            detached_lm, reload_mid, deliberate, killed, kill_reason)
+                    if result is not None and not result.unloaded:
+                        log.error(
+                            f"Recovery of {reload_mid} aborted: engine process "
+                            f"{result.pid} is still running ({result.reason}); "
+                            f"keeping it tracked and refusing to start a duplicate")
+                        return None
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - recovery must never escape into a worker thread
+                log.error(f"Dead-backend recovery for '{model_id_hint}' on port {dead_port} "
+                          f"failed during eviction: {e}")
+                return None
+
+            if reload_mid is None:
+                return None
+            try:
+                # Hold the per-model lock across the reload too. A racing explicit
+                # load joins this task through _loading_tasks; an explicit unload
+                # waits here instead of observing the detached gap and returning
+                # success before the replacement engine exists.
+                lm = await self._load_model_serialized(reload_mid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - reported to the forwarder as a 503
+                log.error(f"Dead-backend recovery reload of '{reload_mid}' failed: {e}")
+                return None
+            return lm
 
     async def _do_load_model(self, model_id: str, force: bool = False) -> LoadedModel:
         if not model_id or not model_id.strip():
@@ -2149,6 +2279,7 @@ class ModelManager:
                         cwd=cwd,
                     )
 
+                self._engine_generation += 1
                 lm = LoadedModel(
                     model_id=model_id,
                     gguf_path=artifact,
@@ -2157,6 +2288,7 @@ class ModelManager:
                     process=proc,
                     pid=proc.pid,
                     starting_at=time.time(),
+                    generation=self._engine_generation,
                 )
                 self.loaded[model_id] = lm
                 self._start_log_thread(model_id, proc)
@@ -2231,14 +2363,13 @@ class ModelManager:
         async with self._lock:
             await self._unload_unlocked(model_id)
 
-    async def _unload_unlocked(self, model_id: str) -> Optional[UnloadResult]:
-        """Unload a model (caller must hold self._lock).
+    def _begin_unload_locked(self, model_id: str) -> Optional[Tuple[LoadedModel, bool]]:
+        """Detach an engine for teardown (caller must hold ``self._lock``).
 
-        Returns ``None`` when the model was not resident. Otherwise the result's
-        ``unloaded`` flag says whether the engine process is verifiably gone. On a
-        failed kill the model is put back into ``self.loaded``: the registry must
-        never claim an engine was released while its process is still running, and
-        callers can retry the unload.
+        Fast phase of an unload: remove the model from the routing/registry view
+        and arm the in-progress flag. The slow drain/kill happens in
+        ``_unload_finish`` and may run without the global lock (recovery path).
+        Returns ``(lm, deliberate)`` or None when the model was not resident.
         """
         lm = self.loaded.pop(model_id, None)
         if lm is None:
@@ -2248,9 +2379,9 @@ class ModelManager:
         # Mark the release as IN PROGRESS: a state/load landing while this
         # method runs would cold-reload the endpoint the caller just released —
         # a full model load plus a full prompt reprocess. manager._lock spans
-        # this whole teardown, so no caller can observe the flag mid-unload:
-        # this is a race backstop, not the mechanism that closed BUG_0089
-        # (see .agent_lessons/unload-in-progress-flag-replaces-recent-unload-window.md).
+        # this whole teardown on the ordinary path, so no caller can observe the
+        # flag mid-unload: this is a race backstop, not the mechanism that
+        # closed BUG_0089 (see .agent_lessons/unload-in-progress-flag-replaces-recent-unload-window.md).
         # Only DELIBERATE releases set the flag. _unload_unlocked is also
         # reached from a load in flight (force-reload, failed-load and
         # cancelled-load cleanup); a state/load landing during such a load
@@ -2259,8 +2390,13 @@ class ModelManager:
         deliberate = not (loading_now and not loading_now.done())
         if deliberate:
             self._unload_in_progress.add(model_id)
+        return lm, deliberate
+
+    def _finalize_unload_locked(self, lm: LoadedModel, model_id: str,
+                                deliberate: bool, killed: bool,
+                                kill_reason: str) -> UnloadResult:
+        """Finalize registry state after teardown (caller must hold ``_lock``)."""
         try:
-            killed, kill_reason = await self._unload_finish(lm, model_id)
             if not killed:
                 self.loaded.setdefault(model_id, lm)
                 # The queue was dropped before the kill; restore it so the still-
@@ -2283,6 +2419,28 @@ class ModelManager:
             # leave the flag set forever and refuse every later restore.
             if deliberate:
                 self._unload_in_progress.discard(model_id)
+
+    async def _unload_unlocked(self, model_id: str) -> Optional[UnloadResult]:
+        """Unload a model (caller must hold self._lock).
+
+        Returns ``None`` when the model was not resident. Otherwise the result's
+        ``unloaded`` flag says whether the engine process is verifiably gone. On a
+        failed kill the model is put back into ``self.loaded``: the registry must
+        never claim an engine was released while its process is still running, and
+        callers can retry the unload.
+        """
+        begin = self._begin_unload_locked(model_id)
+        if begin is None:
+            return None
+        lm, deliberate = begin
+        try:
+            killed, kill_reason = await self._unload_finish(lm, model_id)
+        except BaseException:
+            if deliberate:
+                self._unload_in_progress.discard(model_id)
+            raise
+        return self._finalize_unload_locked(
+            lm, model_id, deliberate, killed, kill_reason)
 
     async def _unload_finish(self, lm: LoadedModel, model_id: str) -> Tuple[bool, str]:
         """Complete an unload: auto-save, drain, drop the queue, kill, clean up.
@@ -2418,8 +2576,9 @@ class ModelManager:
         mid = await self.resolve_model_id_strict(model_id_input)
         if not mid:
             return None
-        async with self._lock:
-            return await self._unload_unlocked(mid)
+        async with self._model_lock(mid):
+            async with self._lock:
+                return await self._unload_unlocked(mid)
 
     async def unload_model_exact(self, model_id: str) -> Optional[UnloadResult]:
         """Unload a specific registry id without name/stem resolution.
@@ -2428,8 +2587,9 @@ class ModelManager:
         ``self.models``: calling the resolving variant at that point would find
         nothing and silently leave the engine process running.
         """
-        async with self._lock:
-            return await self._unload_unlocked(model_id)
+        async with self._model_lock(model_id):
+            async with self._lock:
+                return await self._unload_unlocked(model_id)
 
     async def unload_all(self) -> Dict[str, Any]:
         """Unload every resident model and report which ones actually went away.
@@ -3599,7 +3759,7 @@ async def interrupt_model(model_id: str, hard: bool = False):
         fw = globals().get("_forwarder")
         if fw is not None:
             try:
-                cancelled = fw.cancel_active(lm.port)
+                cancelled = fw.cancel_active(lm.port, lm.generation)
             except Exception as e:
                 log.warning(f"Soft interrupt failed for {model_id}: {e}")
 
