@@ -12,12 +12,12 @@ import os
 import struct
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 import pytest_asyncio
 
-from server import ModelManager, ModelConfig, LoadedModel, _read_gguf_metadata, _read_gguf_name
+from server import ModelManager, ModelConfig, LoadedModel, UnloadResult, _read_gguf_metadata, _read_gguf_name
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -486,6 +486,97 @@ class TestEvictLRU:
             await manager._evict_lru_if_needed("b.gguf")
 
         assert len(manager.loaded) == 1
+
+    @pytest.mark.asyncio
+    async def test_skips_mid_load_models(self, manager):
+        # The mid-load model is the LRU pick; the filter must make the OTHER
+        # model the victim instead. Asserting "nothing evicted" would also pass
+        # with a filter that wrongly excludes everything, so this shape is
+        # the discriminating one.
+        manager.models.clear()
+        manager.loaded.clear()
+        cfg_x = ModelConfig.default_for(Path("x.gguf"))
+        cfg_y = ModelConfig.default_for(Path("y.gguf"))
+        cfg_z = ModelConfig.default_for(Path("z.gguf"))
+        manager.models.update({"x.gguf": cfg_x, "y.gguf": cfg_y, "z.gguf": cfg_z})
+
+        lm_x = LoadedModel("x.gguf", Path("x.gguf"), cfg_x, 9001, MagicMock(),
+                           last_used=time.time() - 100, ready=True, pid=1)
+        lm_y = LoadedModel("y.gguf", Path("y.gguf"), cfg_y, 9002, MagicMock(),
+                           last_used=time.time() - 50, ready=True, pid=2)
+        manager.loaded.update({"x.gguf": lm_x, "y.gguf": lm_y})
+
+        # x.gguf is mid-load: an incomplete task in _loading_tasks.
+        task = asyncio.create_task(asyncio.sleep(30))
+        manager._loading_tasks["x.gguf"] = task
+        try:
+            async with manager._lock:
+                result = await manager._evict_lru_if_needed("z.gguf")
+        finally:
+            task.cancel()
+            manager._loading_tasks.pop("x.gguf", None)
+
+        assert result is not None
+        assert result.model_id == "y.gguf"
+        assert "x.gguf" in manager.loaded   # mid-load model survives
+        assert "y.gguf" not in manager.loaded
+
+    @pytest.mark.asyncio
+    async def test_no_eviction_when_only_mid_load_candidates(self, manager):
+        manager.models.clear()
+        manager.loaded.clear()
+        cfg_x = ModelConfig.default_for(Path("x.gguf"))
+        cfg_y = ModelConfig.default_for(Path("y.gguf"))
+        cfg_z = ModelConfig.default_for(Path("z.gguf"))
+        manager.models.update({"x.gguf": cfg_x, "y.gguf": cfg_y, "z.gguf": cfg_z})
+
+        lm_x = LoadedModel("x.gguf", Path("x.gguf"), cfg_x, 9001, MagicMock(),
+                           last_used=time.time() - 100, ready=True, pid=1)
+        lm_y = LoadedModel("y.gguf", Path("y.gguf"), cfg_y, 9002, MagicMock(),
+                           last_used=time.time() - 50, ready=True, pid=2)
+        manager.loaded.update({"x.gguf": lm_x, "y.gguf": lm_y})
+
+        task = asyncio.create_task(asyncio.sleep(30))
+        manager._loading_tasks["x.gguf"] = task
+        task2 = asyncio.create_task(asyncio.sleep(30))
+        manager._loading_tasks["y.gguf"] = task2
+        try:
+            async with manager._lock:
+                result = await manager._evict_lru_if_needed("z.gguf")
+        finally:
+            task.cancel()
+            task2.cancel()
+            manager._loading_tasks.clear()
+
+        assert result is None
+        assert len(manager.loaded) == 2
+
+    @pytest.mark.asyncio
+    async def test_load_refused_when_eviction_fails(self, manager):
+        # Call-site guard: a failed eviction verdict (process still running)
+        # must refuse the load and leave the registry unchanged.
+        manager.models.clear()
+        manager.loaded.clear()
+        cfg_x = ModelConfig.default_for(Path("x.gguf"))
+        cfg_y = ModelConfig.default_for(Path("y.gguf"))
+        cfg_z = ModelConfig.default_for(Path("z.gguf"))
+        manager.models.update({"x.gguf": cfg_x, "y.gguf": cfg_y, "z.gguf": cfg_z})
+
+        lm_x = LoadedModel("x.gguf", Path("x.gguf"), cfg_x, 9001, MagicMock(),
+                           last_used=time.time() - 100, ready=True, pid=1)
+        lm_y = LoadedModel("y.gguf", Path("y.gguf"), cfg_y, 9002, MagicMock(),
+                           last_used=time.time() - 50, ready=True, pid=2)
+        manager.loaded.update({"x.gguf": lm_x, "y.gguf": lm_y})
+
+        failed = UnloadResult("x.gguf", False, 1, "kill could not be verified")
+        with patch.object(manager, "_unload_unlocked",
+                         new=AsyncMock(return_value=failed)):
+            with pytest.raises(RuntimeError, match="LRU eviction of x.gguf failed"):
+                await manager._do_load_model("z.gguf")
+
+        assert "x.gguf" in manager.loaded
+        assert "z.gguf" not in manager.loaded
+        assert len(manager.loaded) == 2
 
 
 # ---------------------------------------------------------------------------

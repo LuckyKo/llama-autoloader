@@ -1948,24 +1948,43 @@ class ModelManager:
         log.error(f"Timed out waiting for llama-server on port {port} after {timeout}s")
         return False
 
-    async def _evict_lru_if_needed(self, target_model_id: str):
-        """If loaded models count >= max_loaded_models, unload LRU unpinned model (caller must hold self._lock)."""
+    async def _evict_lru_if_needed(self, target_model_id: str) -> Optional[UnloadResult]:
+        """If loaded models count >= max_loaded_models, unload the LRU evictable model
+        (caller must hold self._lock).
+
+        A model is an eviction candidate only when it is not the target, not pinned,
+        has no active requests, and is not mid-load (an incomplete task in
+        ``_loading_tasks`` — evicting one causes a load/evict ping-pong cascade).
+
+        Returns the ``UnloadResult`` of the eviction, or ``None`` when no eviction
+        was needed or no candidate existed. Callers MUST check the result: a
+        non-``None`` result with ``unloaded`` False means the slot was NOT freed
+        (through this path the process is still running), and the load must be
+        refused. ``_unload_unlocked`` may also return ``None`` (the entry vanished
+        mid-call) or raise (e.g. cancellation); those propagate to the caller's
+        existing error handling.
+        When no candidate exists the load proceeds over the cap by design —
+        refusing or killing a just-started engine is the ping-pong bug this
+        predicate exists to prevent.
+        """
         if len(self.loaded) < self.max_loaded_models:
-            return
+            return None
         candidates = [
             (mid, lm) for mid, lm in self.loaded.items()
             if mid != target_model_id and not lm.config.pinned
             and lm.active_requests == 0
+            and not (self._loading_tasks.get(mid) and not self._loading_tasks[mid].done())
         ]
         if not candidates:
             log.warning(
                 "Max loaded models limit reached, but every other model is pinned, "
-                "busy (active request), or the target itself; loading without evicting")
-            return
+                "busy (active request), mid-load, or the target itself; "
+                "loading without evicting")
+            return None
         candidates.sort(key=lambda item: item[1].last_used)
         lru_id, lru_lm = candidates[0]
         log.info(f"Auto-evicting LRU model {lru_id} (last used {round(time.time() - lru_lm.last_used, 1)}s ago) to free slot")
-        await self._unload_unlocked(lru_id)
+        return await self._unload_unlocked(lru_id)
 
     # ---- active-request tracking (called from forwarder worker threads) ----
     def note_request_start(self, port: int,
@@ -2445,7 +2464,11 @@ class ModelManager:
                         raise RuntimeError(
                             f"Cannot reload {model_id}: previous engine process "
                             f"{result.pid} is still running ({result.reason})")
-                await self._evict_lru_if_needed(model_id)
+                evict_result = await self._evict_lru_if_needed(model_id)
+                if evict_result is not None and not evict_result.unloaded:
+                    raise RuntimeError(
+                        f"Cannot load {model_id}: LRU eviction of {evict_result.model_id} "
+                        f"failed — process {evict_result.pid} is still running ({evict_result.reason})")
                 cfg = self.models[model_id]
                 port = self._allocate_port(model_id)
                 # Engine dispatch: bridge cards build their own argv/cwd/env from the engine
