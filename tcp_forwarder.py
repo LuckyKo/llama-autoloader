@@ -32,6 +32,7 @@ Design notes / constraints (see the implementation plan):
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -125,6 +126,36 @@ try:
     _JIT_LOAD_TIMEOUT = float(os.environ.get("AUTOLOADER_JIT_LOAD_TIMEOUT", "300"))
 except ValueError:
     _JIT_LOAD_TIMEOUT = 300.0
+
+# Extra wait granted to a dead-backend recovery beyond the model's normal load timeout.
+# The recovery first has to drain slot actions and verify the old process is gone, then
+# reload; without this margin a slow-but-successful recovery would be reported as a 503.
+_RECOVERY_TIMEOUT_EXTRA = 60.0
+
+
+class _BackendUnreachable(Exception):
+    """The LLM backend port actively refused a connection.
+
+    Raised only for the llama-server fast path, and only for refusal-class errors: the
+    request has not been sent anywhere yet, so it is safe to evict/reload and retry it.
+    """
+
+    def __init__(self, target_port: int, cause: BaseException):
+        super().__init__(f"backend on port {target_port} refused the connection: {cause}")
+        self.target_port = target_port
+        self.cause = cause
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    """True for the ``WinError 10061`` / ``ECONNREFUSED`` family of connect failures."""
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "winerror", None) == 10061:
+            return True
+        if getattr(exc, "errno", None) == errno.ECONNREFUSED:
+            return True
+    return False
 
 
 class RawTCPForwarder:
@@ -666,6 +697,68 @@ class RawTCPForwarder:
         lm.touch()
         return lm.port
 
+    def _recover_dead_backend(self, model_id: str, dead_port: int) -> Optional[int]:
+        """Ask the manager to evict/reload the engine on ``dead_port``; return its new port.
+
+        Runs the async recovery on the MAIN event loop (never a fresh loop) and blocks
+        this handler thread until it finishes. Concurrent requests for the same dead
+        port share one recovery task inside the manager, so this is safe under a
+        thundering herd. Returns None when no running loop/recovery is available or the
+        replacement did not become ready.
+        """
+        manager = self.model_manager
+        if manager is None:
+            log.error(f"Cannot recover dead backend on port {dead_port}: no model manager")
+            return None
+        recover = getattr(manager, "recover_dead_model", None)
+        if recover is None:
+            log.error(f"Cannot recover dead backend on port {dead_port}: "
+                      f"manager has no recover_dead_model()")
+            return None
+
+        try:
+            main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            main_loop = getattr(manager, "_main_loop", None)
+        if main_loop is None or not main_loop.is_running():
+            log.error(f"Cannot recover dead backend on port {dead_port}: "
+                      f"no running main event loop")
+            return None
+
+        # Bridge cards legitimately need minutes to load; use the manager's per-engine
+        # timeout (same source as the JIT path) plus time for drain/kill/teardown.
+        timeout = _JIT_LOAD_TIMEOUT
+        resolved = self._resolve_request_model(model_id)
+        if resolved:
+            try:
+                mc = manager.models.get(resolved)
+                if mc and getattr(mc, "is_bridge", False):
+                    timeout = manager.ready_timeout_for(resolved)
+            except Exception:  # noqa: BLE001 - timeout refinement is best-effort
+                pass
+        timeout = max(1.0, float(timeout)) + _RECOVERY_TIMEOUT_EXTRA
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                recover(model_id, dead_port), main_loop)
+        except Exception as e:  # noqa: BLE001 - loop closed between check and submit
+            log.error(f"Could not submit dead-backend recovery for '{model_id}' "
+                      f"on port {dead_port}: {e}")
+            return None
+        try:
+            lm = future.result(timeout=timeout)
+        except Exception as e:  # noqa: BLE001 — includes TimeoutError / spawn errors
+            log.error(f"Dead-backend recovery for '{model_id}' on port {dead_port} "
+                      f"failed: {e}")
+            return None
+        if lm is not None and getattr(lm, "ready", False):
+            log.info(f"Recovered model '{getattr(lm, 'model_id', model_id)}' on "
+                     f"port {lm.port} after backend death on port {dead_port}")
+            return lm.port
+        log.error(f"Dead-backend recovery for '{model_id}' on port {dead_port} "
+                  f"returned no ready model")
+        return None
+
     def _jit_load_and_wait(self, model_id: str) -> Optional[int]:
         """Trigger a JIT load of ``model_id`` and block until it is ready. Returns the
         llama-server port on success, or None on failure (unknown model / timeout / error).
@@ -725,18 +818,60 @@ class RawTCPForwarder:
 
     def _pipe_with_ticket(self, client_sock: socket.socket, raw_headers: bytes,
                           body_prefix: bytes, target_port: int, model_id: str,
-                          queue) -> None:
-        """Acquire the model's FIFO ticket, then pipe; surface busy timeouts as 503."""
+                          queue, _recovery_attempts: int = 0) -> None:
+        """Acquire the model's FIFO ticket, then pipe; surface busy timeouts as 503.
+
+        A connection-refused failure on the llama-server fast path means the engine died
+        silently between the registry check and the connect. Nothing was sent, so the
+        ticket is released (by the context manager), the manager evicts/reloads the model,
+        and the SAME request is retried once on the recovered port. This is what turns a
+        permanent 502 loop into a one-request recovery.
+        """
         try:
             with queue.ticket(timeout=_QUEUE_WAIT_TIMEOUT):
                 self._pipe_to_backend(client_sock, raw_headers,
                                       body_prefix, target_port, _LLAMA_SERVER_LABEL)
+        except _BackendUnreachable:
+            if _recovery_attempts >= 1:
+                log.error(f"Model '{model_id}' engine on port {target_port} still "
+                          f"refused after one recovery attempt")
+                self._send_error_response(
+                    client_sock, 503,
+                    f"Model '{model_id}' engine is unavailable after a reload attempt")
+                return
+            log.warning(f"Model '{model_id}' engine on port {target_port} refused the "
+                        f"connection; evicting and reloading")
+            new_port = self._recover_dead_backend(model_id, target_port)
+            if not new_port:
+                self._send_error_response(
+                    client_sock, 503,
+                    f"Model '{model_id}' engine died and could not be restarted")
+                return
+            log.info(f"Retrying request for model '{model_id}' on recovered port {new_port}")
+            retry_queue = self.model_manager.queue_registry.get_or_create(new_port, model_id)
+            self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
+                                   new_port, model_id, retry_queue,
+                                   _recovery_attempts=_recovery_attempts + 1)
         except TimeoutError:
             log.warning(f"Queue wait timed out for model '{model_id}' on port {target_port}")
             self._send_error_response(
                 client_sock, 503,
                 f"Model '{model_id}' is busy (queue wait exceeded {_QUEUE_WAIT_TIMEOUT:.0f}s)")
         except RuntimeError as e:
+            # The recovery path drops the dead port's FIFO queue, which wakes any
+            # requests still waiting on it. They are not doomed: join the recovery and
+            # retry once on the replacement port instead of surfacing a spurious 503.
+            active = getattr(self.model_manager, "recovery_in_progress", None)
+            if (_recovery_attempts < 1 and active is not None
+                    and active(target_port)):
+                new_port = self._recover_dead_backend(model_id, target_port)
+                if new_port:
+                    retry_queue = self.model_manager.queue_registry.get_or_create(
+                        new_port, model_id)
+                    self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
+                                           new_port, model_id, retry_queue,
+                                           _recovery_attempts=_recovery_attempts + 1)
+                    return
             log.error(f"Queue unavailable for model '{model_id}': {e}")
             self._send_error_response(
                 client_sock, 503, f"Model '{model_id}' queue is unavailable")
@@ -765,6 +900,10 @@ class RawTCPForwarder:
             target_sock = self._connect_backend(target_port)
         except Exception as e:  # noqa: BLE001
             log.error(f"Failed to connect to {label} on port {target_port}: {e}")
+            if label == _LLAMA_SERVER_LABEL and _is_connection_refused(e):
+                # Nothing has been sent to the backend yet, so the request is safe to
+                # retry after a reload. The caller owns sending the error response.
+                raise _BackendUnreachable(target_port, e) from e
             self._send_error_response(client_sock, 502, f"{label} unreachable")
             return
 

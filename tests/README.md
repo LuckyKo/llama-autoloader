@@ -26,6 +26,7 @@ suite passes without either. See "Mock / fake backend" below.
 | `tests/test_regression.py` | Regression tests (plan §3). |
 | `tests/test_e2e_startup.py` | E2E startup tests (plan §4). |
 | `tests/test_unload_reporting.py` | Unload failures must report non-200 and keep the surviving engine tracked (BUG_0102). |
+| `tests/test_dead_backend_recovery.py` | A connection-refused llama-server is evicted/reloaded once and the request is retried; failed kills never start a duplicate engine (BUG_0001). |
 | `tests/test_logger_rotation.py` | `console.log` rotation keeps writing to the new file; a locked backup must not drop records or recurse through the stderr tee (BUG_0104 audit). |
 
 A root-level `conftest.py` excludes the pre-existing ad-hoc scripts
@@ -81,6 +82,9 @@ The load path is exercised without a real binary in two ways:
 - Port allocation: sequential allocation, exhaustion → error.
 - `to_launch_args`: full argv construction (model/host/port/ctx/n-gpu-layers/alias/slot-save-path).
 - State save/list/load/delete path logic.
+- Dead-backend recovery: connection-refused on the LLM fast path triggers a single
+  deduplicated evict/reload, then retries the same request; a kill that cannot be
+  verified keeps the model tracked and refuses to spawn a duplicate engine.
 - Console log rotation: a successful rotation leaves a writable, non-empty new file;
   a locked backup is skipped without dropping records or recursing through stderr.
 - E2E startup: health, index HTML, static assets, models populated from GGUF bytes,

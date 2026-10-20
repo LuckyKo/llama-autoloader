@@ -888,6 +888,7 @@ API type: **OpenAI-compatible**. No API key required.
 3. **Proxy** — Forwards the request to the model's `llama-server` process and streams the response back
 4. **Idle Reaper** — A background task checks every 10 seconds and unloads models that have been idle longer than `idle_timeout_seconds`
 5. **LRU Eviction** — If `max_loaded_models` is reached, the least-recently-used unpinned model is unloaded before loading a new one
+6. **Dead-Backend Recovery** — If a resident engine dies silently, the next LLM request detects the refused connection, evicts/reloads that model once (shared by concurrent requests), and retries the request instead of returning a permanent 502
 
 ---
 
