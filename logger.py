@@ -26,30 +26,77 @@ from pathlib import Path
 
 class _WindowsSafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """
-    RotatingFileHandler that uses shutil.move() instead of os.rename() for file rotation.
+    RotatingFileHandler with Windows-safe, failure-tolerant rotation.
 
-    On Windows, os.rename() fails with PermissionError when the target file is open
-    in another process (e.g., editors, file watchers, antivirus). shutil.move() handles
-    this more gracefully by falling back to copy+delete.
+    On Windows, os.rename()/os.remove() fail with PermissionError when the
+    target is open in another process (editors, file watchers, antivirus).
+    The stdlib doRollover() lets those errors escape into emit(), which drops
+    the record and calls handleError(). When stderr is tee'd through the same
+    logger (see _CapturingStream below), that can recurse and stop file logging.
 
-    Also suppresses errors during rotation rather than letting them cascade into
-    infinite logging recursion.
+    This handler therefore:
+    - rotates with os.replace() (atomic, overwrites the destination) and falls
+      back to shutil.move() for cross-device/copy semantics;
+    - treats a locked *backup* as skippable instead of aborting the rollover;
+    - reopens the active log after every rollover attempt, so the record that
+      triggered rotation is still written even when rotation could not complete.
     """
 
+    @staticmethod
+    def _report_rotation_failure(source, dest, exc):
+        # Don't use logger here - we're inside emit() already, calling
+        # logger.warning() would cause recursion/nested emit on the same
+        # handler -> "Logging error" messages. Write directly to the real
+        # stderr for observability without recursion risk.
+        try:
+            sys.__stderr__.write(f"[LOG ROTATION FAILED] {source} -> {dest}: {exc}\n")
+            sys.__stderr__.flush()
+        except Exception:
+            pass  # Rotation will retry next time the size threshold is hit
+
     def rotate(self, source, dest):
+        try:
+            os.replace(source, dest)  # Atomic; overwrites an existing dest.
+            return
+        except OSError:
+            pass
         try:
             if os.path.exists(dest):
                 os.remove(dest)
             shutil.move(source, dest)
         except OSError as e:
-            # Don't use logger here - we're inside emit() already, calling logger.warning()
-            # would cause recursion/nested emit on the same handler -> "Logging error" messages.
-            # Write directly to stderr for observability without recursion risk.
-            try:
-                sys.__stderr__.write(f"[LOG ROTATION FAILED] {source} -> {dest}: {e}\n")
-                sys.__stderr__.flush()
-            except Exception:
-                pass  # Silently ignore - rotation will retry next time file size threshold is hit
+            self._report_rotation_failure(source, dest, e)
+
+    def doRollover(self):
+        """Roll over, skipping locked backups instead of aborting logging."""
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+
+        if self.backupCount > 0:
+            # Shift backups oldest-first. The stdlib lets a PermissionError
+            # from any of these steps escape into emit(), which drops the
+            # record; only the active file's rotation is essential.
+            for i in range(self.backupCount - 1, 0, -1):
+                sfn = self.rotation_filename("%s.%d" % (self.baseFilename, i))
+                dfn = self.rotation_filename("%s.%d" % (self.baseFilename, i + 1))
+                if not os.path.exists(sfn):
+                    continue
+                try:
+                    os.replace(sfn, dfn)
+                except OSError as e:
+                    self._report_rotation_failure(sfn, dfn, e)
+            dfn = self.rotation_filename(self.baseFilename + ".1")
+            self.rotate(self.baseFilename, dfn)
+
+        # Reopen unconditionally. With delay=True the stdlib leaves the stream
+        # closed until the next emit; opening here guarantees the triggering
+        # record is written and makes post-rotation behavior deterministic.
+        try:
+            self.stream = self._open()
+        except Exception as e:
+            self._report_rotation_failure(self.baseFilename, self.baseFilename, e)
+            self.stream = None
 
 
 class _CapturingStream:
