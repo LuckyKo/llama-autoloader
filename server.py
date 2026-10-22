@@ -728,6 +728,15 @@ LEGACY_CARDS_DIRS = ("./strata_cards",)
 # Bounded wait for an in-flight slot action (save/restore) that holds a granted
 # FIFO ticket to finish before an unload drops the queue and kills its engine.
 SLOT_ACTION_DRAIN_TIMEOUT_S = 15.0
+# BUG_0012: bounded wait for the ENTIRE engine process tree to reach zero after the
+# tracked parent is killed. A graceful parent exit can orphan the engine grandchildren
+# (the Strata engine binary + vision encoder) so they are neither in the pre-kill
+# target list nor re-reachable from the dead parent; a lingering grandchild still
+# holds the model's committed memory and the immediate state-restore auto-load then
+# dies on the Windows commit limit. _kill_proc must not report success until the
+# whole tree is gone, so the drain that terminates + waits for those orphans is
+# bounded by this window; exceeding it turns the unload into an explicit failure.
+KILL_TREE_DRAIN_TIMEOUT_S = 15.0
 # A state/load landing WHILE a deliberate unload is in progress is refused (409)
 # instead of silently cold-reloading the just-released model. The guard is the
 # unload itself, not a wall-clock window: the safe-mode contract (save -> unload
@@ -781,6 +790,160 @@ def _normalize_engines(cfg: Dict[str, Any]) -> Dict[str, Any]:
     })
     log.warning("legacy 'strata:' section migrated to 'engines.strata'")
     return {"strata": spec}
+
+
+# --------------------------------------------------------------------------
+# Engine process-tree teardown (BUG_0012)
+# --------------------------------------------------------------------------
+# Helpers for the tree-complete verification in ModelManager._kill_proc. They are
+# module-level (not nested) so a regression test can drive the real psutil scan
+# (test 1) or stub the scan to force a bounded timeout (test 2) without touching
+# production control flow.
+def _describe_proc(proc) -> str:
+    """One-line identifier for a process in the tree-drain diagnostics.
+
+    The old lingering-children note logged pids only, which left every future
+    occurrence unattributable (see the BUG_0012 forensics: the surviving pids could
+    not be traced to their role). name + ppid make the orphan relationship visible
+    so the next incident is diagnosable from the log alone. All lookups are best-
+    effort: a protected process must still be described, not abort the report.
+    """
+    try:
+        name = proc.name()
+    except Exception:  # noqa: BLE001 - best-effort description
+        name = "?"
+    try:
+        ppid = proc.ppid()
+    except Exception:  # noqa: BLE001
+        ppid = "?"
+    return f"{proc.pid} ({name}, ppid={ppid})"
+
+
+def _tree_survivors(tree_pids: set, expected_ctime: Dict[int, float]) -> List["psutil.Process"]:
+    """Return every LIVE, non-zombie process that is (or was) a descendant of a
+    pid in ``tree_pids`` — the pre-kill snapshot (tracked parent + its children).
+
+    ``expected_ctime`` maps each snapshotted pid to its ``create_time()`` at
+    capture time. It is the pid-recycling guard: a fresh ``psutil.Process(pid)``
+    reports ``is_running()`` True for ANY live pid, including one the OS reused
+    for an unrelated process after the original exited. Any candidate whose pid is
+    in ``expected_ctime`` but whose current ``create_time()`` differs is therefore
+    NOT our process and is treated as gone (see ``_resolve_live``). Without this,
+    a pid recycled inside the drain window would make the BFS descend into — and
+    terminate — an unrelated subtree.
+
+    This runs only after the tracked parent is verifiably gone, which is exactly
+    when the BUG_0012 orphans appear. Two passes are required because the parent
+    can no longer be used as a traversal root:
+
+    * BFS down with ``children(recursive=False)`` from any tree member that is
+      still alive — recovers subtrees hanging off a live orphan (e.g. an engine
+      child of a still-running engine grandchild).
+    * one process-table pass matching ``ppid in tree_pids`` — recovers the
+      direct orphans themselves. Once their parent exits, ``Process(parent).children()``
+      raises NoSuchProcess (psutil resolves descendants through a ppid map rooted
+      at the parent), so the process table is the only way to reach them. On
+      Windows the recorded ppid stays sticky after the parent exits, which is what
+      makes this pass effective; on POSIX orphans reparent to init but were already
+      captured by the pre-kill snapshot and terminated above. The orphan pass
+      matches ppid by value, so it carries the same recycling guard: a candidate
+      is accepted only when nothing live occupies its parent pid (a truly dead
+      parent); if a live process sits at a tree pid it is either the original
+      (BFS already enumerated its children) or a recycled unrelated one (the
+      candidate is its child, not our orphan) — skip both.
+
+    KNOWN limitation (acceptable): an orphan whose entire ppid chain passes only
+    through DEAD intermediates that are NOT themselves in ``tree_pids`` is not
+    reachable by either pass — the BFS cannot descend from a dead pid and the
+    orphan pass only matches one ppid level. In the incident the survivors' ppid
+    was the tracked wrapper (a snapshot pid), so the single process-table pass
+    sufficed; deeper chains would need a full ppid-graph walk, which is not worth
+    the cost here.
+
+    Per-process AccessDenied/NoSuchProcess are skipped, matching the best-effort
+    style of the enumeration in _kill_proc: one inaccessible process must not abort
+    the whole scan. Every candidate is re-resolved through ``psutil.Process`` so
+    liveness is checked through the same API the rest of _kill_proc uses (and so a
+    test that patches psutil.Process controls this scan too).
+    """
+    def _resolve_live(pid: int):
+        # Single gate for "is this pid a live, non-zombie process?" — used by
+        # both the BFS and the orphan pass so the two stay consistent.
+        try:
+            proc = psutil.Process(pid)
+            if not (proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE):
+                return None
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
+        except Exception:  # noqa: BLE001 - best-effort, same as the scan
+            return None
+        # Pid-recycling guard: is_running() is True for ANY live pid, so a pid
+        # the OS reused for an unrelated process after ours exited would otherwise
+        # pass and the BFS would descend into (and terminate) an unrelated subtree.
+        # If we snapshotted this pid, confirm it is still the same process by
+        # create_time; a mismatch means it was recycled -> treat as gone. Pids
+        # discovered below (not in expected_ctime) have no fingerprint and are
+        # accepted unconditionally, which is correct — they are genuinely new.
+        exp = expected_ctime.get(pid)
+        if exp is not None:
+            try:
+                actual = proc.create_time()
+            except Exception:  # noqa: BLE001 - cannot re-fingerprint a snapshotted pid
+                return None
+            if isinstance(actual, float) and isinstance(exp, float) and abs(actual - exp) > 0.1:
+                return None
+        return proc
+
+    found: Dict[int, "psutil.Process"] = {}
+    frontier = list(tree_pids)
+    while frontier:
+        pid = frontier.pop()
+        proc = _resolve_live(pid)
+        if proc is None:
+            continue
+        found[pid] = proc
+        try:
+            kids = proc.children(recursive=False)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            kids = []
+        except Exception:  # noqa: BLE001
+            kids = []
+        for kid in kids:
+            if kid.pid not in found:
+                frontier.append(kid.pid)
+    # Direct orphans: their parent (a tree pid) has exited, so the BFS above
+    # cannot reach them from it; recover their pids from the process table, then
+    # resolve each through psutil.Process like every other candidate.
+    try:
+        for proc in psutil.process_iter(["pid", "ppid"]):
+            try:
+                pid = proc.info["pid"]
+                ppid = proc.info["ppid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:  # noqa: BLE001 - best-effort read
+                continue
+            if ppid in tree_pids and pid not in found:
+                # Pid-recycling guard for the value-based ppid match: accept the
+                # candidate only when nothing live occupies the parent pid (a
+                # truly dead parent). A live process at a tree pid is either the
+                # original (its children the BFS already enumerated) or an
+                # unrelated process that reused the pid (the candidate is its
+                # child, not our orphan); reject both.
+                try:
+                    par = psutil.Process(ppid)
+                    if par.is_running() and par.status() != psutil.STATUS_ZOMBIE:
+                        continue
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                except Exception:  # noqa: BLE001 - cannot probe parent -> treat as gone
+                    pass
+                live = _resolve_live(pid)
+                if live is not None:
+                    found[pid] = live
+    except Exception:  # noqa: BLE001 - best-effort scan
+        pass
+    return list(found.values())
 
 
 # --------------------------------------------------------------------------
@@ -2814,7 +2977,13 @@ class ModelManager:
             try:
                 parent = psutil.Process(lm.pid)
             except psutil.NoSuchProcess:
-                return True, ""  # already gone
+                # The tracked pid was already gone before _kill_proc started, so
+                # there is no tree to re-reach from it and nothing to verify. A
+                # wrapper that self-exits just before the call could still leave
+                # live grandchildren (the same harm on a different timing); that
+                # path is out of scope for BUG_0012, which targets a parent that
+                # dies DURING the call and therefore has a snapshot to drain.
+                return True, ""
             except Exception as e:  # noqa: BLE001 - fallback below still gets a chance
                 primary_error = e
 
@@ -2934,19 +3103,84 @@ class ModelManager:
                     reason_parts.append(f"fallback error: {fallback_error}")
                 return False, "; ".join(reason_parts) or "process still running"
 
-            # Parent is gone. Note any lingering children for diagnostics.
-            lingering = []
-            for proc in children:
+            # Parent is gone. BUG_0012: that is NOT the whole contract. The
+            # engine grandchildren (Strata engine binary + vision encoder) are
+            # orphaned when the wrapper parent exits first: they were never in
+            # ``targets`` (the recursive enumeration can fall back to direct
+            # children, and processes started after the snapshot are unreachable),
+            # and once the parent is gone they cannot be re-reached from it. A
+            # lingering grandchild still holds the model's committed memory, so the
+            # immediate state-restore auto-load died on the Windows commit limit
+            # (VirtualAlloc error 1314) while _kill_proc reported success. The
+            # previous code only logged such children ("reaped by the OS") and
+            # returned success — the exact silent-success-with-survivors defect.
+            #
+            # Verification is now tree-complete: re-enumerate the whole tree rooted
+            # at the snapshot pids, terminate any survivors, and bounded-wait until
+            # the ENTIRE tree is gone before reporting success. Success now means
+            # "the engine process tree is verifiably gone", making the existing
+            # _require_engine_gone / UnloadResult.unloaded contract truthful without
+            # new guards, flags, or locks.
+            tree_pids = {p.pid for p in targets}
+            # Fingerprint each snapshotted pid with its create_time so the tree
+            # scan can tell "still our process" from "pid reused by an unrelated
+            # process" within the drain window (the _tree_survivors/_resolve_live
+            # recycling guard). Best-effort: a pid whose create_time cannot be
+            # read is simply not guarded (same as before), never a hard failure.
+            expected_ctime: Dict[int, float] = {}
+            for p in targets:
                 try:
-                    if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                        lingering.append(proc.pid)
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    expected_ctime[p.pid] = p.create_time()
+                except Exception:  # noqa: BLE001 - un-fingerprintable pid
                     pass
-            if lingering:
+            survivors = _tree_survivors(tree_pids, expected_ctime)
+            if survivors:
                 log.warning(
-                    f"Child process(es) {', '.join(str(p) for p in lingering)} "
+                    f"Engine descendants {', '.join(_describe_proc(p) for p in survivors)} "
                     f"still running after unload of {model_id} (parent {lm.pid} gone); "
-                    f"they will be reaped by the OS")
+                    f"terminating and waiting for the whole tree before reporting success")
+                for proc in survivors:
+                    try:
+                        proc.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                    except Exception:  # noqa: BLE001 - the bounded re-scan below is the truth
+                        pass
+                # Poll until the whole tree is gone or the bounded window expires.
+                # Escalate to a force-kill the first time a re-scan still finds
+                # survivors, mirroring the primary path's terminate -> wait ->
+                # kill -> wait sequence: a descendant that ignores SIGTERM must
+                # still be stopped (Windows TerminateProcess and SIGKILL are not
+                # catchable). Without this it would hold the model's committed
+                # memory for the whole window and the auto-load-before-restore
+                # would still fail — the exact harm this fix exists to prevent.
+                # Unlike the primary path's 3s graceful wait, escalation here is
+                # immediate: the whole point of draining the tree is to free the
+                # commit as fast as possible for the queued reload, so a stubborn
+                # descendant is not given a long grace period first.
+                deadline = time.monotonic() + KILL_TREE_DRAIN_TIMEOUT_S
+                force_killed = False
+                while survivors:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.25)
+                    survivors = _tree_survivors(tree_pids, expected_ctime)
+                    if survivors and not force_killed:
+                        for proc in survivors:
+                            try:
+                                proc.kill()
+                            except psutil.NoSuchProcess:
+                                pass
+                            except Exception:  # noqa: BLE001 - verified by the re-scan
+                                pass
+                        force_killed = True
+                if survivors:
+                    log.error(
+                        f"Tree drain timed out for {model_id} (pid {lm.pid}): "
+                        f"{', '.join(_describe_proc(p) for p in survivors)} still running")
+                    return False, ("tree drain timed out: pids "
+                                   + ", ".join(str(p.pid) for p in survivors)
+                                   + " still running")
             return True, ""
 
         killed, kill_reason = await asyncio.to_thread(_kill_proc)
@@ -2963,8 +3197,13 @@ class ModelManager:
                 log.warning(f"Failed to delete derived engine config for {model_id}: {e}")
 
         if cancelled:
-            # The queue is dropped, the process killed and the cleanup done, so the
-            # unload itself succeeded; only the caller's cancellation is preserved.
+            # The queue is dropped and cleanup is done, so the caller's cancellation
+            # is preserved rather than turned into a normal return. Note this does NOT
+            # assert the process was stopped: when the tree drain timed out (killed
+            # is False) the engine may still be resident. The truthful verdict is
+            # carried by the `killed`/`kill_reason` return path below for the
+            # non-cancelled case; here the caller asked us to abort, so we honour
+            # that and let the caller's own re-check observe any survivor.
             raise asyncio.CancelledError
 
         return killed, kill_reason
