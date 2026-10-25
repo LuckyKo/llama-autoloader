@@ -1119,12 +1119,15 @@ function wsLoop() {
 }
 
 // ---------- Settings ----------
+// save_state_max_bytes is persisted in bytes; the UI works in GiB (0 = off).
+const GiB = 1024 ** 3;
 async function loadSettings() {
   try {
     const s = await apiJSON('/v1/settings');
     $('s-idle').value = s.idle_timeout_seconds ?? '';
     $('s-max-loaded').value = s.max_loaded_models ?? '';
     $('s-save-state-max-keep').value = s.save_state_max_keep ?? '';
+    $('s-save-state-max-bytes').value = s.save_state_max_bytes != null ? s.save_state_max_bytes / GiB : '';
     $('s-poll').value = s.poll_interval_seconds ?? '';
     $('s-base-port').value = s.base_port ?? '';
     $('s-default-args').value = s.default_args || '';
@@ -1142,6 +1145,8 @@ async function saveSettings() {
   const idle = Number($('s-idle').value);
   const maxLoaded = Number($('s-max-loaded').value);
   const saveStateMaxKeep = Number($('s-save-state-max-keep').value);
+  const saveStateMaxBytesRaw = $('s-save-state-max-bytes').value;
+  const saveStateMaxBytesGiB = Number(saveStateMaxBytesRaw);
   const poll = Number($('s-poll').value);
   const basePort = Number($('s-base-port').value);
 
@@ -1155,6 +1160,10 @@ async function saveSettings() {
   }
   if (isNaN(saveStateMaxKeep) || saveStateMaxKeep < 1 || !Number.isInteger(saveStateMaxKeep)) {
     showToast('Max state files to keep must be an integer ≥ 1', 'error');
+    return;
+  }
+  if (saveStateMaxBytesRaw !== '' && (isNaN(saveStateMaxBytesGiB) || saveStateMaxBytesGiB < 0)) {
+    showToast('Max state disk must be a number ≥ 0 GiB (0 = off)', 'error');
     return;
   }
   if (isNaN(poll) || poll <= 0) {
@@ -1176,6 +1185,9 @@ async function saveSettings() {
     selected_backend: $('s-selected-backend').value,
     auto_save_state: $('s-auto-save').checked,
   };
+  if (saveStateMaxBytesRaw !== '') {
+    body.save_state_max_bytes = Math.round(saveStateMaxBytesGiB * GiB);
+  }
   try {
     await apiJSON('/v1/settings', {
       method: 'PUT',

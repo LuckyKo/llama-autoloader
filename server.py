@@ -770,6 +770,20 @@ KILL_TREE_DRAIN_TIMEOUT_S = 15.0
 # are swept from states/. Nothing else ever reclaims them.
 STATE_TEMP_MAX_AGE_S = 3600.0
 
+# Default global slot-state disk budget in bytes (models.save_state_max_bytes).
+# 0 disables the budget entirely. This is a cross-model byte cap that complements
+# the per-model count cap (save_state_max_keep); the count cap alone cannot
+# bound total disk usage when many models each sit below their keep-N.
+_DEFAULT_STATE_MAX_BYTES = 8 * 1024**3
+
+# Engine scratch files that can collide with a known-model state prefix
+# (e.g. ``Qwen2.5-…gguf.probe.bin`` reads as a state of ``Qwen2.5-…gguf``).
+# Never counted against the budget nor evicted as state. NOTE: excluding
+# ``*.probe.bin`` reserves the state label ``probe`` — a state saved with that
+# label is treated as scratch (never counted, never evicted by either policy).
+_STATE_SCRATCH_NAMES = ("probe.bin", "viaraw.bin")
+_STATE_SCRATCH_SUFFIXES = (".probe.bin",)
+
 # Exceptions meaning the engine is unreachable AT ALL (connection refused /
 # closed), as opposed to an HTTP error it actually returned. Retrying the other
 # endpoint formats against a dead socket only reproduces the same error.
@@ -982,6 +996,7 @@ class ModelManager:
         self.idle_timeout = cfg["models"].get("idle_timeout_seconds", 300)
         self.max_loaded_models = cfg["models"].get("max_loaded_models", 1)
         self.save_state_max_keep = cfg["models"].get("save_state_max_keep", 5)
+        self.save_state_max_bytes = cfg["models"].get("save_state_max_bytes", _DEFAULT_STATE_MAX_BYTES)
         self.default_auto_save_state = cfg["models"].get("auto_save_state", False)
         self.binary = cfg["llama_server"]["binary"]
         self.backends_dir = Path(cfg["llama_server"].get("backends_dir", "./backends")).resolve()
@@ -1204,6 +1219,13 @@ class ModelManager:
         save_state_max_keep = models.get("save_state_max_keep", 5)
         if not isinstance(save_state_max_keep, int) or save_state_max_keep < 1:
             raise ValueError(f"Config 'models.save_state_max_keep' must be >= 1, got {save_state_max_keep!r}")
+        # NOTE: deliberately the GUARDED form (bool check first), unlike the
+        # save_state_max_keep validator above which omits it. `save_state_max_bytes`
+        # treats 0 as a valid "disabled" value, so a bool (True == 1) must be
+        # rejected rather than silently read as a 1-byte budget.
+        save_state_max_bytes = models.get("save_state_max_bytes", _DEFAULT_STATE_MAX_BYTES)
+        if isinstance(save_state_max_bytes, bool) or not isinstance(save_state_max_bytes, int) or save_state_max_bytes < 0:
+            raise ValueError(f"Config 'models.save_state_max_bytes' must be an int >= 0 (0 = disabled), got {save_state_max_bytes!r}")
 
         # gpu section
         gpu = cfg.get("gpu", {})
@@ -3195,6 +3217,10 @@ class ModelManager:
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 log.info(f"Auto-saving session state for {model_id} to {state_path}...")
                 await self._perform_slot_save(lm.port, state_path, timeout=60.0, model_id=model_id)
+                # This teardown path runs no per-model cleanup, so auto-saved
+                # states could otherwise grow states/ unbounded. Enforce the
+                # global byte budget, keeping the file just written.
+                await self._enforce_state_budget(keep_path=state_path)
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
 
@@ -3759,6 +3785,14 @@ class ModelManager:
         except Exception as e:
             log.debug(f"State cleanup failed (non-critical): {e}")
 
+        # Enforce the global byte budget across ALL models (the per-model count
+        # cap above cannot bound total disk usage). keep_path is the file just
+        # written, so it is never the one evicted.
+        try:
+            await self._enforce_state_budget(keep_path=state_path)
+        except Exception as e:
+            log.debug(f"State budget enforcement failed (non-critical): {e}")
+
         return state_path
 
     async def load_state(self, model_id_input: str, label: str = "default") -> Path:
@@ -3854,6 +3888,170 @@ class ModelManager:
         except Exception as e:
             raise HTTPException(500, f"Failed to delete state file: {e}")
 
+    def _is_state_scratch(self, name: str) -> bool:
+        """True if a ``.bin`` filename is engine scratch, not a real state.
+
+        Single source of truth for what counts as a state file vs scratch, shared
+        by _iter_all_state_files / _iter_state_files / _enforce_state_budget so
+        the three can never drift. Scratch names can collide with a known-model
+        state prefix (e.g. ``Qwen2.5-…gguf.probe.bin``), which is why this filter
+        is applied before any prefix matching.
+        """
+        return name in _STATE_SCRATCH_NAMES or name.endswith(_STATE_SCRATCH_SUFFIXES)
+
+    def _iter_all_state_files(self) -> List[Path]:
+        """List every completed, non-scratch ``.bin`` state file in the dir.
+
+        The GLOBAL view used by _enforce_state_budget: it must see files whose
+        owning model was renamed/removed or whose id CASE drifted (ORPHANS), or
+        else the byte budget under-counts real disk usage and never evicts them.
+        _iter_state_files is the per-model projection of this same set, so the
+        ``.bin`` rule and scratch exclusion live in exactly one place.
+        """
+        out: List[Path] = []
+        try:
+            for p in self.save_state_dir.iterdir():
+                name = p.name
+                if not name.endswith(".bin"):
+                    continue
+                if self._is_state_scratch(name):
+                    continue
+                if not p.is_file():
+                    continue
+                out.append(p)
+        except Exception:
+            # Caller treats this as best-effort; return what we have.
+            return out
+        return out
+
+    def _iter_state_files(self, model_id_clean: str) -> List[Path]:
+        """List completed ``.bin`` state files belonging to a single model.
+
+        Matches on the known-model prefix ``{model_id_clean}.`` (the same forward
+        match _cleanup_old_states has always used) rather than reverse-parsing the
+        name — model ids AND labels both contain dots, so a filename cannot be
+        split reliably. Delegates the ``.bin`` rule and scratch exclusion to
+        _iter_all_state_files so there is a single source of truth.
+        """
+        if not model_id_clean:
+            return []
+        prefix = f"{model_id_clean}."
+        return [p for p in self._iter_all_state_files() if p.name.startswith(prefix)]
+
+    async def _enforce_state_budget(self, keep_path: Optional[Path] = None) -> None:
+        """Enforce the global slot-state disk budget (models.save_state_max_bytes).
+
+        Unlike _cleanup_old_states (per-model COUNT cap), this is a cross-model
+        BYTE budget: it sums EVERY state file in the dir — files owned by a
+        registered model AND ORPHANS (files whose model was renamed/removed or
+        whose id CASE drifted, so no registered owner matches them) — and, only
+        when the total exceeds the cap, deletes oldest-first (by mtime) until
+        back under budget. Counting orphans is essential: without them the
+        counted total can sit UNDER the budget while real disk usage is far over
+        it, and nothing is ever evicted. Floor = 1 newest file per KNOWN model,
+        so a plausible restore target always survives per model; ORPHANS have
+        NO floor (always evictable, oldest-first) so a renamed model's stale
+        files get reclaimed. ``keep_path`` (the file just written) is never
+        evicted. Lazy: does nothing when already at/under budget. A
+        ``save_state_max_bytes`` of 0 disables the feature entirely.
+
+        Accepted tradeoff (documented in the plan): under sustained disk pressure
+        a non-newest labeled state CAN be evicted, so a later explicit
+        load_state() of that label returns HTTP 500 — the same category as the
+        pre-existing keep-N recency policy, which already evicts by mtime. The
+        auto-restore path is safe (its exists-guard degrades to a fresh start).
+        The user controls the cap; raise it to avoid evictions.
+        """
+        budget = self.save_state_max_bytes
+        if budget is None or budget <= 0:
+            return
+
+        # Gather every known model's state files via the shared helper (single
+        # source of truth for prefix matching + scratch exclusion). Snapshot the
+        # registry keys so a concurrent scan cannot mutate it mid-iteration.
+        #
+        # Ownership is assigned to the model with the LONGEST matching prefix.
+        # Two model ids can share a dotted prefix (e.g. ``foo.gguf`` and
+        # ``foo.gguf.lora.gguf``): a state of the latter matches BOTH prefixes.
+        # Counting it once, under its true (most specific) owner, prevents both a
+        # double-counted total (premature eviction) and flooring it under the
+        # wrong model. NOTE: longest-prefix is the best available disambiguation
+        # under forward prefix matching; it only misattributes a genuine state of
+        # the shorter model whose *label* happens to spell a registered longer
+        # model's prefix — a contrived co-registration case inherent to the design.
+        owner_of: Dict[str, str] = {}  # path-str -> owning mid_clean
+        for mid in list(self.models.keys()):
+            mid_clean = self._sanitize_model_id(mid)
+            if not mid_clean:
+                continue
+            for p in self._iter_state_files(mid_clean):
+                key = str(p)
+                prev = owner_of.get(key)
+                if prev is None or len(mid_clean) > len(prev):
+                    owner_of[key] = mid_clean
+
+        # Enumerate EVERY non-scratch .bin file via the shared global view, not
+        # just files matched by a registered model. A file absent from owner_of
+        # has no registered owner — it is an ORPHAN (its model was renamed/removed
+        # or the id CASE drifted): assign it owner None so it still counts against
+        # the budget and is reclaimable. This is the exact bug — an owner-only
+        # scan under-counts real disk usage and never evicts those files.
+        sized: List[Tuple[Path, Optional[str], int, float]] = []  # (path, owner, size, mtime)
+        total = 0
+        for p in self._iter_all_state_files():
+            mid_clean = owner_of.get(str(p))  # None => orphan (no registered owner)
+            try:
+                st = p.stat()
+            except OSError:
+                continue  # vanished mid-scan; best-effort
+            sized.append((p, mid_clean, st.st_size, st.st_mtime))
+            total += st.st_size
+
+        if total <= budget:
+            return
+
+        # Floor: the newest file per KNOWN model is never evictable. ORPHANS
+        # (owner None) get NO floor — they are always evictable, oldest-first,
+        # which reclaims a renamed/removed model's stale files.
+        newest_by_model: Dict[str, Tuple[float, Path]] = {}
+        for p, mid_clean, _size, mtime in sized:
+            if mid_clean is None:
+                continue  # orphans have no floor
+            cur = newest_by_model.get(mid_clean)
+            if cur is None or mtime > cur[0]:
+                newest_by_model[mid_clean] = (mtime, p)
+
+        keep_name = keep_path.name if keep_path else None
+        reclaimed = 0
+        orphan_reclaimed = 0
+        remaining = total
+        for p, mid_clean, size, mtime in sorted(sized, key=lambda t: t[3]):
+            if remaining <= budget:
+                break
+            if keep_name is not None and p.name == keep_name:
+                continue  # the file just written by the caller
+            if mid_clean is not None and newest_by_model.get(mid_clean, (None, None))[1] == p:
+                continue  # floor: newest for this KNOWN model must survive
+            try:
+                p.unlink()
+            except Exception as e:
+                log.warning(f"Failed to evict state file {p.name} during budget enforcement: {e}")
+                continue
+            remaining -= size
+            reclaimed += size
+            if mid_clean is None:
+                orphan_reclaimed += size
+            log.info(
+                f"State budget: evicted {p.name} ({size / (1024 * 1024):.1f} MB) "
+                f"to stay within {budget / (1024**3):.2f} GiB"
+            )
+        if reclaimed:
+            log.info(
+                f"State budget enforcement reclaimed {reclaimed / (1024**3):.2f} GiB "
+                f"({orphan_reclaimed / (1024**3):.2f} GiB orphaned) "
+                f"(budget {budget / (1024**3):.2f} GiB, now {remaining / (1024**3):.2f} GiB)"
+            )
+
     async def _cleanup_old_states(self, model_id_input: str) -> None:
         """Delete old state files for a model, keeping only the latest N files.
 
@@ -3869,14 +4067,11 @@ class ModelManager:
             return
 
         try:
-            # Find all state files for this model using prefix/suffix matching
-            # instead of glob to avoid pattern injection issues with special chars
-            state_files = [
-                p for p in self.save_state_dir.iterdir()
-                if (p.is_file() and 
-                    p.name.startswith(f"{mid_clean}.") and 
-                    p.name.endswith(".bin"))
-            ]
+            # Shared helper: known-model prefix match + scratch exclusion. This
+            # also fixes a latent collision here — a scratch file such as
+            # ``Qwen2.5-…gguf.probe.bin`` used to be counted as a state of
+            # ``Qwen2.5-…gguf`` and could be deleted by the keep-N policy.
+            state_files = self._iter_state_files(mid_clean)
 
             if len(state_files) <= max_states:
                 return
@@ -4021,6 +4216,15 @@ class ModelManager:
     async def start(self) -> None:
         async with self._lock:
             await asyncio.to_thread(self.scan)
+        # Reclaim pre-existing slot-state disk usage on boot. The save-path
+        # wiring only covers steady state, so a states/ dir already over the
+        # global byte budget from a previous run is never touched otherwise.
+        # Runs after scan() so the model registry is populated (the budget
+        # groups files by known model id). Best-effort: never blocks startup.
+        try:
+            await self._enforce_state_budget()
+        except Exception as e:
+            log.debug(f"Startup state budget sweep failed (non-critical): {e}")
         self._bg_task = asyncio.create_task(self.idle_reaper())
         self._status_task: Optional[asyncio.Task] = asyncio.create_task(self._status_cache_updater())
 
@@ -4338,6 +4542,7 @@ async def get_settings():
         "idle_timeout_seconds": manager.idle_timeout,
         "max_loaded_models": manager.max_loaded_models,
         "save_state_max_keep": manager.save_state_max_keep,
+        "save_state_max_bytes": manager.save_state_max_bytes,
         "auto_save_state": manager.default_auto_save_state,
         "poll_interval_seconds": manager._poll_interval,
         "base_port": manager.base_port,
@@ -4364,6 +4569,10 @@ async def update_settings(request: Request):
         v = body["save_state_max_keep"]
         if isinstance(v, bool) or not isinstance(v, int) or v < 1:
             errors.append("'save_state_max_keep' must be >= 1")
+    if "save_state_max_bytes" in body:
+        v = body["save_state_max_bytes"]
+        if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+            errors.append("'save_state_max_bytes' must be >= 0 (0 = disabled)")
     if "poll_interval_seconds" in body:
         v = body["poll_interval_seconds"]
         if isinstance(v, bool) or not isinstance(v, (int, float)) or (isinstance(v, float) and math.isnan(v)) or v <= 0:
@@ -4410,6 +4619,9 @@ async def update_settings(request: Request):
     if "save_state_max_keep" in body:
         manager.save_state_max_keep = body["save_state_max_keep"]
         changed.append("save_state_max_keep")
+    if "save_state_max_bytes" in body:
+        manager.save_state_max_bytes = body["save_state_max_bytes"]
+        changed.append("save_state_max_bytes")
     if "auto_save_state" in body:
         manager.default_auto_save_state = body["auto_save_state"]
         changed.append("auto_save_state")
@@ -4439,6 +4651,8 @@ async def update_settings(request: Request):
             cfg["models"]["max_loaded_models"] = body["max_loaded_models"]
         if "save_state_max_keep" in body:
             cfg["models"]["save_state_max_keep"] = body["save_state_max_keep"]
+        if "save_state_max_bytes" in body:
+            cfg["models"]["save_state_max_bytes"] = body["save_state_max_bytes"]
         if "auto_save_state" in body:
             cfg["models"]["auto_save_state"] = body["auto_save_state"]
         if "poll_interval_seconds" in body:

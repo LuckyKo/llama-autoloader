@@ -17,6 +17,10 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 import pytest_asyncio
 
+import server
+import yaml
+from fastapi import HTTPException
+
 from server import ModelManager, ModelConfig, LoadedModel, UnloadResult, _read_gguf_metadata, _read_gguf_name
 
 # ---------------------------------------------------------------------------
@@ -420,6 +424,263 @@ class TestCleanupOldStates:
 
 
 # ---------------------------------------------------------------------------
+# _enforce_state_budget()
+# ---------------------------------------------------------------------------
+
+class TestStateBudget:
+    def _isolate_states(self, manager, tmp_path):
+        """Point the manager at a fresh EMPTY state dir.
+
+        The `manager` fixture pre-seeds model-a/model-b state files; the budget
+        groups by the KNOWN MODEL REGISTRY (self.models), not by what happens to
+        already be on disk, so an empty dir keeps the byte math deterministic.
+        """
+        d = tmp_path / "budget_states"
+        d.mkdir()
+        manager.save_state_dir = d
+        return d
+
+    def _make_state_files(self, state_dir, model_id, count, base_mtime, size=1000):
+        """Create `count` state files for a model with distinct mtimes (oldest→newest)."""
+        paths = []
+        for i in range(count):
+            p = state_dir / f"{model_id}.state{i}.bin"
+            p.write_bytes(b"x" * size)
+            t = base_mtime + i * 100
+            os.utime(p, (t, t))
+            paths.append(p)
+        return paths
+
+    def _write_state(self, state_dir, name, size, mtime=None):
+        p = state_dir / name
+        p.write_bytes(b"x" * size)
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
+        return p
+
+    def _remaining_bins(self, state_dir):
+        return sorted(p.name for p in state_dir.iterdir() if p.name.endswith(".bin"))
+
+    @pytest.mark.asyncio
+    async def test_disabled_zero_evicts_nothing(self, manager, tmp_path):
+        d = self._isolate_states(manager, tmp_path)
+        manager.save_state_max_bytes = 0
+        self._make_state_files(d, "model-c.gguf", 3, 1_000_000, size=5000)
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == [
+            "model-c.gguf.state0.bin", "model-c.gguf.state1.bin", "model-c.gguf.state2.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_under_budget_evicts_nothing(self, manager, tmp_path):
+        d = self._isolate_states(manager, tmp_path)
+        manager.save_state_max_bytes = 10_000
+        self._make_state_files(d, "model-c.gguf", 3, 1_000_000, size=100)
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == [
+            "model-c.gguf.state0.bin", "model-c.gguf.state1.bin", "model-c.gguf.state2.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_evicts_oldest_first_until_under_budget(self, manager, tmp_path):
+        # 3 × 1000 = 3000 > budget 2000 → evict only the single oldest, stop at 2000.
+        d = self._isolate_states(manager, tmp_path)
+        self._make_state_files(d, "model-c.gguf", 3, 1_000_000, size=1000)
+        manager.save_state_max_bytes = 2000
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == [
+            "model-c.gguf.state1.bin", "model-c.gguf.state2.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_floor_one_newest_per_model_preserved(self, manager, tmp_path):
+        # Budget smaller than any single file → evict all but the newest per model.
+        d = self._isolate_states(manager, tmp_path)
+        self._make_state_files(d, "model-c.gguf", 3, 1_000_000, size=1000)
+        manager.save_state_max_bytes = 1
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == ["model-c.gguf.state2.bin"]
+
+    @pytest.mark.asyncio
+    async def test_keep_path_never_evicted(self, manager, tmp_path):
+        # keep_path is the OLDEST file; one eviction is required → must skip the
+        # protected keep_path and evict the next-oldest instead.
+        d = self._isolate_states(manager, tmp_path)
+        paths = self._make_state_files(d, "model-c.gguf", 3, 1_000_000, size=1000)
+        manager.save_state_max_bytes = 2000
+        await manager._enforce_state_budget(keep_path=paths[0])
+        assert paths[0].exists()
+        assert self._remaining_bins(d) == [
+            "model-c.gguf.state0.bin", "model-c.gguf.state2.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_scratch_files_never_counted_or_evicted(self, manager, tmp_path):
+        # A large model-prefixed scratch file must NOT be counted against the budget
+        # nor evicted. The single real state file (100 B) is under budget on its own.
+        d = self._isolate_states(manager, tmp_path)
+        self._write_state(d, "model-c.gguf.probe.bin", 100_000)
+        self._write_state(d, "probe.bin", 100_000)
+        self._write_state(d, "viaraw.bin", 100_000)
+        self._write_state(d, "model-c.gguf.state0.bin", 100)
+        manager.save_state_max_bytes = 1000
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == [
+            "model-c.gguf.probe.bin", "model-c.gguf.state0.bin", "probe.bin", "viaraw.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_cross_model_eviction_is_global_oldest_first(self, manager, tmp_path):
+        # Two models, each with 2 files. Eviction order is GLOBAL by mtime (not
+        # per-model), while the floor is per-model. Total 4000 > budget 2000.
+        # model-c files are globally oldest → its non-floor file is evicted first,
+        # then model-a's non-floor file; both floors survive.
+        d = self._isolate_states(manager, tmp_path)
+        self._make_state_files(d, "model-c.gguf", 2, 1_000_000, size=1000)
+        self._make_state_files(d, "model-a.gguf", 2, 2_000_000, size=1000)
+        manager.save_state_max_bytes = 2000
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == [
+            "model-a.gguf.state1.bin", "model-c.gguf.state1.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_nested_model_prefix_counted_once(self, manager, tmp_path):
+        # A model id that is a dotted prefix of another (``foo.gguf`` and
+        # ``foo.gguf.lora.gguf``): the lora state matches BOTH prefixes. With
+        # correct single-ownership (longest prefix wins) total is 4000 and only
+        # the globally-oldest non-floor (foo.gguf.a) is evicted; a naive double
+        # count would inflate the total and evict the lora state.
+        from server import ModelConfig
+        d = self._isolate_states(manager, tmp_path)
+        manager.models.clear()
+        manager.models.update({
+            "foo.gguf": ModelConfig.default_for(Path("foo.gguf")),
+            "foo.gguf.lora.gguf": ModelConfig.default_for(Path("foo.gguf.lora.gguf")),
+        })
+        self._write_state(d, "foo.gguf.a.bin", 1000, 1_000_000)          # evictable (not foo floor)
+        self._write_state(d, "foo.gguf.lora.gguf.x.bin", 1000, 1_000_100)  # owned by lora, must survive
+        self._write_state(d, "foo.gguf.b.bin", 1000, 1_000_200)          # floor for foo.gguf
+        self._write_state(d, "foo.gguf.lora.gguf.y.bin", 1000, 2_000_000)  # floor for lora
+        manager.save_state_max_bytes = 3000
+        await manager._enforce_state_budget()
+        assert not (d / "foo.gguf.a.bin").exists()
+        assert self._remaining_bins(d) == [
+            "foo.gguf.b.bin", "foo.gguf.lora.gguf.x.bin", "foo.gguf.lora.gguf.y.bin",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_start_sweep_reclaims_over_budget_dir(self, manager, tmp_path):
+        # A states/ dir already over budget from a previous run must be reclaimed
+        # by the async startup sweep in ModelManager.start(). start() re-scans
+        # models but never touches save_state_dir, so the isolated dir survives.
+        d = self._isolate_states(manager, tmp_path)
+        self._make_state_files(d, "model-c.gguf", 3, 1_000_000, size=1000)
+        manager.save_state_max_bytes = 2000
+        await manager.start()
+        try:
+            assert self._remaining_bins(d) == [
+                "model-c.gguf.state1.bin", "model-c.gguf.state2.bin",
+            ]
+        finally:
+            await manager.stop()
+
+    # ---- Orphan handling: files with no registered owner (renamed/removed
+    # model, or id CASE drift) are counted against the budget and reclaimed.
+    # An id like "orphan-gone.gguf" / "strata-coder-iq1_m" is NOT in the
+    # registry, so no model prefix matches it -> owner None.
+
+    @pytest.mark.asyncio
+    async def test_orphan_files_no_floor_all_reclaimed(self, manager, tmp_path):
+        # ORPHANS have NO floor, so with a budget smaller than everything,
+        # ALL orphan files are evicted.
+        d = self._isolate_states(manager, tmp_path)
+        self._write_state(d, "orphan-gone.gguf.state0.bin", 1000, 1_000_000)
+        self._write_state(d, "orphan-gone.gguf.state1.bin", 1000, 1_000_100)
+        manager.save_state_max_bytes = 1
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == []
+
+    @pytest.mark.asyncio
+    async def test_renamed_model_old_id_treated_as_orphan(self, manager, tmp_path):
+        # A model was RENAMED: the NEW id is registered, the OLD id's state
+        # files remain on disk. Old-id files match NO registered prefix -> orphans
+        # -> reclaimed oldest-first. Reclaiming the two orphans alone does NOT get
+        # under budget (remaining stays 2000 > 1500), so the loop reaches the new-id
+        # file and the newest-per-KNOWN-model floor is what protects it. This test
+        # therefore covers both orphan reclaim and the floor.
+        from server import ModelConfig
+        d = self._isolate_states(manager, tmp_path)
+        manager.models.clear()
+        manager.models["qwen3.8-flash-next-coder-iq1_m"] = ModelConfig.default_for(
+            Path("qwen3.8-flash-next-coder-iq1_m")
+        )
+        self._write_state(d, "strata-coder-iq1_m.state0.bin", 1000, 1_000_000)
+        self._write_state(d, "strata-coder-iq1_m.state1.bin", 1000, 1_000_100)
+        self._write_state(d, "qwen3.8-flash-next-coder-iq1_m.default.bin", 1000, 2_000_000)
+        manager.save_state_max_bytes = 1500
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == ["qwen3.8-flash-next-coder-iq1_m.default.bin"]
+
+    @pytest.mark.asyncio
+    async def test_known_model_floor_survives_when_only_orphans_insufficient(self, manager, tmp_path):
+        # Eviction demand exceeds what the orphans alone can free: both orphans
+        # are reclaimed (no floor), but the KNOWN model's newest file is protected
+        # by the floor even though the budget can no longer be met.
+        d = self._isolate_states(manager, tmp_path)
+        self._write_state(d, "model-c.gguf.new.bin", 1000, 3_000_000)  # known model, floor
+        self._write_state(d, "orphan-gone.gguf.a.bin", 1000, 500_000)
+        self._write_state(d, "orphan-gone.gguf.b.bin", 1000, 600_000)
+        manager.save_state_max_bytes = 500
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == ["model-c.gguf.new.bin"]
+
+    @pytest.mark.asyncio
+    async def test_orphan_only_over_budget_still_fires(self, manager, tmp_path):
+        # Regression guard for the exact bug: the ONLY over-budget content is
+        # orphan (renamed/removed) files. The old owner-only scan saw total=0
+        # ("under budget") and evicted nothing; now orphans are counted and the
+        # oldest is reclaimed.
+        d = self._isolate_states(manager, tmp_path)
+        self._write_state(d, "qwen3.8-27b-gsq-rco-iq3_s.old.bin", 1000, 1_000_000)
+        self._write_state(d, "qwen3.8-27b-gsq-rco-iq3_s.new.bin", 1000, 1_000_100)
+        manager.save_state_max_bytes = 1500
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == ["qwen3.8-27b-gsq-rco-iq3_s.new.bin"]
+
+    @pytest.mark.asyncio
+    async def test_case_drift_old_lowercase_is_orphan_new_cased_floored(self, manager, tmp_path):
+        # The NInfer-card bug: an id's CASE drifted between save time and the
+        # current registry. Prefix matching is case-sensitive, so the OLD lowercase
+        # file matches NO registered prefix -> orphan (reclaimed); the current-cased
+        # file IS owned and is floored. Confirms no crash and correct ownership.
+        from server import ModelConfig
+        d = self._isolate_states(manager, tmp_path)
+        manager.models.clear()
+        manager.models["Qwen3.8-27B-GSQ-RCO-IQ3_S"] = ModelConfig.default_for(
+            Path("Qwen3.8-27B-GSQ-RCO-IQ3_S")
+        )
+        self._write_state(d, "qwen3.8-27b-gsq-rco-iq3_s.auto.bin", 1000, 1_000_000)  # old case -> orphan
+        self._write_state(d, "Qwen3.8-27B-GSQ-RCO-IQ3_S.maine.bin", 1000, 1_000_100)  # current case -> floored
+        manager.save_state_max_bytes = 1500
+        await manager._enforce_state_budget()
+        assert self._remaining_bins(d) == ["Qwen3.8-27B-GSQ-RCO-IQ3_S.maine.bin"]
+
+    @pytest.mark.asyncio
+    async def test_orphan_keep_path_never_evicted(self, manager, tmp_path):
+        # keep_path is an ORPHAN and the oldest file: it must still be protected
+        # (keep_path overrides the no-floor rule), so the next-oldest orphan is
+        # evicted instead.
+        d = self._isolate_states(manager, tmp_path)
+        keep = self._write_state(d, "orphan-gone.gguf.a.bin", 1000, 1_000_000)
+        self._write_state(d, "orphan-gone.gguf.b.bin", 1000, 1_000_100)
+        manager.save_state_max_bytes = 1000
+        await manager._enforce_state_budget(keep_path=keep)
+        assert keep.exists()
+        assert self._remaining_bins(d) == ["orphan-gone.gguf.a.bin"]
+
+
+# ---------------------------------------------------------------------------
 # _evict_lru_if_needed()
 # ---------------------------------------------------------------------------
 
@@ -706,6 +967,86 @@ class TestConfigValidation:
         cfg["models"]["save_state_max_keep"] = "5"
         with pytest.raises(ValueError, match="save_state_max_keep"):
             ModelManager.validate_config(cfg)
+
+    def test_save_state_max_bytes_valid(self):
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_bytes"] = 1000
+        assert ModelManager.validate_config(cfg) is None
+
+    def test_save_state_max_bytes_zero_allowed(self):
+        # 0 is a valid "disabled" value, not an error.
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_bytes"] = 0
+        assert ModelManager.validate_config(cfg) is None
+
+    def test_save_state_max_bytes_negative_rejected(self):
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_bytes"] = -1
+        with pytest.raises(ValueError, match="save_state_max_bytes"):
+            ModelManager.validate_config(cfg)
+
+    def test_save_state_max_bytes_bool_rejected(self):
+        # The guarded validator must reject a bool (True == 1 would otherwise
+        # read as a 1-byte budget). Mirrors the PATCH validator, not the
+        # bool-guard-less save_state_max_keep validator above.
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_bytes"] = True
+        with pytest.raises(ValueError, match="save_state_max_bytes"):
+            ModelManager.validate_config(cfg)
+
+    def test_save_state_max_bytes_not_int_rejected(self):
+        cfg = _make_cfg()
+        cfg["models"]["save_state_max_bytes"] = "1000"
+        with pytest.raises(ValueError, match="save_state_max_bytes"):
+            ModelManager.validate_config(cfg)
+
+
+# ---------------------------------------------------------------------------
+# PUT /v1/settings — save_state_max_bytes config seam (apply + persist)
+# ---------------------------------------------------------------------------
+
+class TestSettingsPersist:
+    class _FakeRequest:
+        """Minimal stand-in for fastapi.Request: update_settings only calls .json()."""
+        def __init__(self, body):
+            self._body = body
+
+        async def json(self):
+            return self._body
+
+    @pytest.mark.asyncio
+    async def test_patch_applies_and_persists_max_bytes(self, manager, tmp_path, monkeypatch):
+        # Drive the real handler: the new key must be applied to the live manager
+        # AND written to config.yaml. Without the persist seam a PATCH is silently
+        # lost on restart — this is the regression the test guards.
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text(yaml.safe_dump(manager.cfg))
+        monkeypatch.setattr(server, "manager", manager)
+        monkeypatch.setattr(server, "CONFIG_PATH", str(cfg_path))
+        await server.update_settings(self._FakeRequest({"save_state_max_bytes": 12345}))
+        written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        assert written["models"]["save_state_max_bytes"] == 12345
+        assert manager.save_state_max_bytes == 12345
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_negative_max_bytes(self, manager, monkeypatch):
+        monkeypatch.setattr(server, "manager", manager)
+        with pytest.raises(HTTPException):
+            await server.update_settings(self._FakeRequest({"save_state_max_bytes": -1}))
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_bool_max_bytes(self, manager, monkeypatch):
+        monkeypatch.setattr(server, "manager", manager)
+        with pytest.raises(HTTPException):
+            await server.update_settings(self._FakeRequest({"save_state_max_bytes": True}))
+
+    @pytest.mark.asyncio
+    async def test_get_settings_exposes_max_bytes(self, manager, monkeypatch):
+        # The GET seam: the new key must be returned and reflect the live value.
+        monkeypatch.setattr(server, "manager", manager)
+        manager.save_state_max_bytes = 98765
+        body = await server.get_settings()
+        assert body["save_state_max_bytes"] == 98765
 
 
 # ---------------------------------------------------------------------------
