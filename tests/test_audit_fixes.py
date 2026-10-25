@@ -55,19 +55,14 @@ async def test_request_resolution_falls_back_to_loaded_model(seeded_manager):
 
 
 def test_update_model_config_duplicate_name_does_not_mutate_live(client, seeded_manager):
-    """A rejected rename must leave the live registry untouched (no sidecar, no 500 damage)."""
+    """A rejected rename returns a clean 400 and leaves the live registry untouched
+    (no sidecar, no mutation)."""
     mgr = seeded_manager
     before_a = mgr.models["model-a.gguf"].name
     before_b = mgr.models["model-b.gguf"].name
 
-    try:
-        response = client.put("/v1/models/model-a.gguf/config", json={"name": before_b})
-    except ValueError:
-        # TestClient re-raises server exceptions by default; the behavior under
-        # test is the absence of mutation, not the HTTP status.
-        pass
-    else:
-        assert response.status_code == 500
+    response = client.put("/v1/models/model-a.gguf/config", json={"name": before_b})
+    assert response.status_code == 400
 
     assert mgr.models["model-a.gguf"].name == before_a
     assert mgr.models["model-b.gguf"].name == before_b

@@ -942,7 +942,7 @@ class TestState:
     async def test_save_state_writes_file(self, mgr):
         # The real _perform_slot_save writes the state file over HTTP; emulate
         # that side effect so save_state's post-conditions hold.
-        async def fake_save(port, path, timeout=None):
+        async def fake_save(port, path, timeout=None, model_id=None):
             Path(path).write_bytes(b"state-data")
 
         with patch.object(mgr, "_perform_slot_save", new=AsyncMock(side_effect=fake_save)) as mock_save:

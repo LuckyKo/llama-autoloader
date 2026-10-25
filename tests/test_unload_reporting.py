@@ -4,9 +4,16 @@ Every caller of unload treats a successful response as "the engine is gone and i
 memory is free" (AC safe-mode, media_gen's VRAM seam, LRU eviction). Swallowing a
 termination failure broke that contract: the endpoint returned 200 while the process
 was still running. These tests pin the failure reporting and the residency truth.
+
+BUG_0014 tests (appended below): a *deliberate* unload whose kill could not be verified
+must NOT be resurrected by dead-backend recovery. The model stays tracked (its process
+may still be running) but a ``_release_requested`` marker records that the caller asked
+for the release, so recovery leaves it tracked-and-not-ready instead of reloading it. An
+explicit/JIT load clears the marker and is the legitimate way to bring it back.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -263,3 +270,155 @@ def test_single_unload_endpoint_returns_500_on_failed_kill(client, seeded_manage
     assert retry.status_code == 200, retry.text
     assert retry.json()["unloaded"] is True
     assert "immortal.gguf" not in seeded_manager.loaded
+
+
+# ---------------------------------------------------------------------------
+# BUG_0014: a deliberate unload whose kill failed must not be resurrected.
+# ---------------------------------------------------------------------------
+class _FakeLaunchProc:
+    """Popen stand-in for a successful launch: alive, never exits on its own."""
+
+    def __init__(self, pid=314159):
+        self.pid = pid
+
+    def poll(self):
+        return None
+
+    def kill(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):  # noqa: ARG002 - Popen API
+        return 0
+
+
+@pytest.mark.asyncio
+async def test_failed_deliberate_unload_is_not_resurrected_by_recovery(
+        isolated_manager, monkeypatch, caplog):
+    """A deliberate release that could not be verified must survive recovery un-reloaded."""
+    mgr = isolated_manager
+    mid = "immortal.gguf"
+    lm = _add_resident(mgr, model_id=mid)
+
+    with monkeypatch.context() as m:
+        m.setattr(server.platform, "system", lambda: "Linux")
+        _make_kill_fail(m)
+        result = await mgr.unload_model(mid)
+
+    assert result.unloaded is False
+    assert mid in mgr.loaded
+    assert mid in mgr._release_requested, "BUG_0014 release marker must be set"
+
+    # Now the engine is genuinely dead (a crash after the failed kill).
+    lm.ready = False
+
+    popen = MagicMock()
+    caplog.set_level(logging.INFO)
+    with monkeypatch.context() as m:
+        m.setattr(server.subprocess, "Popen", popen)
+        recovered = await mgr.recover_dead_model(mid, lm.port, lm.generation)
+
+    # Recovery must NOT reload: it returns None, leaves the model tracked, and
+    # books no cooldown (this is a deliberate release, not a failed reload).
+    assert recovered is None
+    assert mid in mgr.loaded, "model stays tracked, not evicted"
+    assert mgr.recovery_retry_after(mid) is None, "must not arm the recovery cooldown"
+    assert not popen.called, "recovery must not launch a replacement engine"
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not [msg for msg in messages if "Launching" in msg], messages
+    assert [msg for msg in messages
+            if msg.startswith("Not reloading") and mid in msg], \
+            "expected the 'Not reloading' release-intent warning"
+
+
+@pytest.mark.asyncio
+async def test_explicit_load_after_failed_release_clears_marker_and_loads(
+        isolated_manager, monkeypatch):
+    """An explicit load supersedes a failed release: it clears the marker and reloads."""
+    mgr = isolated_manager
+    mid = "immortal.gguf"
+    lm = _add_resident(mgr, model_id=mid)
+
+    # Reproduce the failed deliberate release so the marker is set.
+    with monkeypatch.context() as m:
+        m.setattr(server.platform, "system", lambda: "Linux")
+        _make_kill_fail(m)
+        result = await mgr.unload_model(mid)
+    assert result.unloaded is False
+    assert mid in mgr._release_requested
+
+    # The engine then dies; the tracked entry is now not-ready. A dead entry with no
+    # live pid is verified-gone by _kill_proc, so the load's eviction step succeeds
+    # and the real launch path runs.
+    lm.ready = False
+    lm.process = None
+    lm.pid = None
+    mgr.gguf_paths[mid] = Path(mid)  # the llama launch reads this
+
+    async def _always_ready(self, *args, **kwargs):  # noqa: ARG002 - method parity
+        return True
+
+    with monkeypatch.context() as m:
+        m.setattr(server.subprocess, "Popen",
+                  lambda *a, **k: _FakeLaunchProc())
+        m.setattr(server.ModelManager, "_wait_until_ready", _always_ready)
+        lm2 = await mgr.load_model(mid)
+
+    assert lm2 is not None and lm2.ready is True, "explicit load must reach ready"
+    assert mid not in mgr._release_requested, "the explicit load must clear the marker"
+    assert mid in mgr.loaded and mgr.loaded[mid].ready is True
+
+    # Clean teardown: with real psutil restored the (fake-pid) engine is gone, so
+    # unloading removes it and leaves the fixture empty.
+    assert (await mgr.unload_model(mid)).unloaded is True
+    assert mid not in mgr.loaded
+
+
+@pytest.mark.asyncio
+async def test_recovery_teardown_kill_failure_does_not_set_release_marker(
+        isolated_manager, monkeypatch, caplog):
+    """A genuine crash whose recovery teardown cannot verify the kill must stay
+    recoverable. It must NOT be marked as a client release (which would suppress
+    recovery forever) but book the bounded BUG_0007 backoff instead.
+
+    This is the inverse of the not-resurrected test above: there the marker is
+    correct because a CLIENT asked for the release. Here NO client unload happened
+    -- recovery's OWN teardown (server.py:2777 -> _unload_finish -> _finalize_unload_locked
+    2806) is internal, so the marker must stay clear.
+    """
+    mgr = isolated_manager
+    mid = "immortal.gguf"
+    lm = _add_resident(mgr, model_id=mid)
+
+    # No client unload happened. The engine is genuinely crashed: tracked, not ready.
+    lm.ready = False
+
+    caplog.set_level(logging.INFO)
+    with monkeypatch.context() as m:
+        m.setattr(server.platform, "system", lambda: "Linux")
+        # Recovery's own teardown kill cannot be verified (the process survives).
+        _make_kill_fail(m)
+        recovered = await mgr.recover_dead_model(mid, lm.port, lm.generation)
+
+    messages = [r.getMessage() for r in caplog.records]
+
+    # The release marker is the BUG_0014 over-application: it makes the recovery
+    # guard (server.py:2756) return None forever, permanently suppressing a
+    # genuinely-crashed engine. It must NOT be set for an internal recovery.
+    assert mid not in mgr._release_requested, (
+        "an internal recovery teardown must not set the client-release marker")
+    assert not [msg for msg in messages
+                if msg.startswith("Release of") and "was requested" in msg], messages
+
+    # The two assertions above are the FAIL->PASS discriminator (they fail at the
+    # old `deliberate` gate). The checks below are invariant guards that also hold
+    # pre-fix (the "Not reloading" branch never fires within a single recovery call,
+    # and the backoff is armed regardless of the marker) -- they document that a
+    # genuine crash is NOT permanently suppressed, but are not the discriminator.
+    assert not [msg for msg in messages if msg.startswith("Not reloading")], messages
+    assert mgr.recovery_retry_after(mid) is not None, (
+        "a genuine crash must arm the bounded recovery backoff, not suppress forever")
+    assert mid in mgr.loaded, "model stays tracked while its process may survive"

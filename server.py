@@ -31,7 +31,7 @@ import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import httpx
 import psutil
@@ -505,6 +505,7 @@ class ModelConfig:
     # --- Bridge-card fields (defaulted; llama cards ignore them) ---
     engine: str = "llama"           # "llama" (default) or a key of the config's engines: section
     engine_config: str = ""         # absolute path to the engine config JSON (bridge cards only)
+    artifact: str = ""              # per-card engine artifact path (e.g. NInfer .ninfer) carried to argv[1]
     min_free_vram_mib: int = 0      # 0 = off; >0 → the engine's min_free_vram_flag (VRAM safety net)
     extra_args: List[str] = field(default_factory=list)  # appended verbatim to the serve argv
 
@@ -539,6 +540,7 @@ class ModelConfig:
             type_override="",
             engine="llama",
             engine_config="",
+            artifact="",
             min_free_vram_mib=0,
             extra_args=[],
         )
@@ -696,6 +698,27 @@ class RecoveryCooldownError(RuntimeError):
         super().__init__(
             f"Model '{model_id}' recovery is cooling down; retry in "
             f"{int(self.retry_after + 0.999)}s")
+
+
+class LoadAbortedByUnload(RuntimeError):
+    """An in-flight load was killed by an explicit unload of the same model (BUG_0013).
+
+    Distinct from a load failure: the engine process disappeared because a caller asked
+    for the model to be released, not because it crashed or could not start. Callers
+    (dead-backend recovery in particular) must not book it as a failed reload or arm the
+    BUG_0007 cooldown. Deliberately NOT an ``asyncio.CancelledError``: recovery is a
+    shared, ``asyncio.shield``-ed task, and a cancellation here would look like the
+    requesting client disconnecting instead of an intentional release.
+    """
+
+
+class ModelNameConflict(ValueError):
+    """A model name edit collides with another model's name.
+
+    Subclasses ValueError so any existing broad ``except ValueError`` still catches it.
+    The update endpoint catches this specific type to return a 400, while genuine
+    internal ValueErrors (e.g. a GGUF parse failure) propagate as 500s.
+    """
 
 
 @dataclass
@@ -998,6 +1021,13 @@ class ModelManager:
         self.temp_dir = Path(__file__).resolve().parent / "temp"
         self._lock = asyncio.Lock()
         self._loading_tasks: Dict[str, asyncio.Task] = {}
+        # model_ids whose in-flight load was killed by an EXPLICIT unload (BUG_0013).
+        # Armed by the unload path immediately before it tears the engine down — never by
+        # a load task cleaning up after itself — and consumed in _do_load_model so the
+        # load ends as *aborted* instead of "process exited prematurely" / "failed to
+        # become ready". That distinction matters to dead-backend recovery: a failed start
+        # arms the BUG_0007 cooldown, a release the caller asked for must not.
+        self._load_aborts: Set[str] = set()
         # Per-model serialization for load vs. dead-backend teardown. Recovery must
         # drain/kill OUTSIDE the global manager lock (BUG_0005), which means a load
         # could otherwise spawn a replacement on the same stable port while the old
@@ -1039,6 +1069,14 @@ class ModelManager:
         # landing after the unload finished is the legitimate safe-mode one and
         # is allowed through.
         self._unload_in_progress: Set[str] = set()
+        # model_ids whose DELIBERATE unload failed (the engine process could not be
+        # verified dead, BUG_0014). The model stays tracked with ready=False and a dead
+        # engine port — exactly the shape dead-backend recovery treats as "relaunch it",
+        # which would undo the release the caller asked for (2026-10-25: unload_all
+        # answered 500 at 08:20:56, recovery reloaded the model onto the client's GPUs at
+        # 08:21:04). Recovery refuses while a model is in this set; an explicit or JIT
+        # load clears it, because the caller then wants the model back.
+        self._release_requested: Set[str] = set()
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
@@ -1075,15 +1113,22 @@ class ModelManager:
         """
         for name, spec in self.engines.items():
             errors: List[str] = []
-            if not spec.get("interpreter"):
-                errors.append(f"engines.{name}.interpreter is not set")
-            if not spec.get("serve_script"):
-                errors.append(f"engines.{name}.serve_script is not set")
-            for key in ("interpreter", "serve_script"):
-                val = spec.get(key)
-                if val and not Path(val).exists():
-                    errors.append(f"engines.{name}.{key} path does not exist: {val}")
             argv = spec.get("argv")
+            # interpreter/serve_script are required ONLY when a VALID argv template
+            # references those tokens. A native-exe engine (e.g. ninfer-serve.exe) references
+            # neither, so a missing interpreter is not a misconfiguration for it. When argv is
+            # itself missing/invalid we cannot prove the tokens are unused, so fall back to
+            # the strict requirement. The brace-delimited substring test is exact: "{interpreter}"
+            # matches the token but not "{interpreter_x}".
+            argv_strs = [str(tok) for tok in argv] if isinstance(argv, list) and argv else None
+            for key in ("interpreter", "serve_script"):
+                if argv_strs is not None and not any(f"{{{key}}}" in s for s in argv_strs):
+                    continue
+                val = spec.get(key)
+                if not val:
+                    errors.append(f"engines.{name}.{key} is not set")
+                elif not Path(val).exists():
+                    errors.append(f"engines.{name}.{key} path does not exist: {val}")
             if not argv:
                 errors.append(f"engines.{name}.argv is required (a launch template; there is no default)")
             elif not isinstance(argv, list):
@@ -1097,7 +1142,8 @@ class ModelManager:
                             "engine": name, "model_id": "model", "port": 0,
                             "host": self.host, "derived_config": "derived.json",
                             "interpreter": spec.get("interpreter", ""),
-                            "serve_script": spec.get("serve_script", "")})
+                            "serve_script": spec.get("serve_script", ""),
+                            "artifact": ""})
                     except ValueError as e:
                         errors.append(f"engines.{name}.argv: {e}")
             cfg_dir = spec.get("configs_dir")
@@ -1490,8 +1536,8 @@ class ModelManager:
         except Exception as e:
             log.warning(f"Skipping {engine_name} config {cfg_path}: {e}")
             return None
-        if not isinstance(data, dict) or config_key not in data:
-            log.warning(f"Skipping {engine_name} config {cfg_path}: missing '{config_key}' key (not a valid {engine_name} engine config)")
+        if not isinstance(data, dict) or config_key not in data or not str(data[config_key]).strip():
+            log.warning(f"Skipping {engine_name} config {cfg_path}: missing/empty '{config_key}' key (not a valid {engine_name} engine config)")
             return None                                   # not an engine config
         base = ModelConfig.default_for(cfg_path)
         if card_path is not None and card_path.exists():
@@ -1504,7 +1550,18 @@ class ModelManager:
         # Force AFTER the overlay: a card file must not be able to re-engine the card.
         base.engine = engine_name
         base.engine_config = str(cfg_path)
-        base.auto_save_state = False                       # slot save/restore is llama-only
+        # A card file must not be able to flip auto_save_state either; the global
+        # default_auto_save_state still governs at the use sites (cfg.auto_save_state
+        # or self.default_auto_save_state), so per-card opt-in is intentionally not
+        # supported.
+        base.auto_save_state = False
+        # The per-card artifact path is the engine config's config_key value (e.g. a NInfer
+        # .ninfer at argv[1]); it is data, not a card override, so it is forced here too.
+        # config_key presence is guaranteed by the guard above, so this index cannot KeyError.
+        base.artifact = str(data[config_key])
+        # Slot save/restore support is engine-gated at runtime (llama/ninfer) and controlled
+        # by the global default_auto_save_state, not by the card: per-card auto_save_state
+        # is forced off above, so a card file cannot opt in.
         base.name = data.get("model_name") or base.name or cfg_path.stem
         # A bridge card has no GGUF to classify, so default it to text generation: every
         # engine configured today (llama, Strata) serves text tokens. The card overlay
@@ -1534,10 +1591,28 @@ class ModelManager:
                     for p in sorted(cfg_dir.glob("*.json")):
                         if p.name.endswith(".shared-settings.json"):
                             continue
+                        # Overlay read key: cards_dir/<config-stem>.json. This is the source of the
+                        # key that _bridge_card_overlay_stem reproduces for the write/delete paths.
                         cfg = self._make_engine_config(p, name, cards_dir / f"{p.stem}.json")
-                        if cfg and p.stem not in self.models:
-                            self.models[p.stem] = cfg
-                            log.info(f"Discovered {name} bridge card: {p.stem} -> {p}")
+                        if cfg:
+                            # Model id is the card's editable name (model_name), falling back to
+                            # the config-file stem when unset. Everything downstream (engine
+                            # --model-id, GET /v1/models id, routing) keys off this registry id.
+                            mid = self._bridge_card_model_id(cfg, p.stem)
+                            if mid in self.models:
+                                log.warning(
+                                    f"Skipping {name} bridge card {p}: derived id '{mid}' "
+                                    f"collides with an already-registered model")
+                            else:
+                                if cfg.name:
+                                    for _oc in self.models.values():
+                                        if _oc.name and _oc.name.lower() == cfg.name.lower():
+                                            log.warning(
+                                                f"Bridge card {p} display name '{cfg.name}' is ambiguous "
+                                                f"(matches existing model name '{_oc.name}'); registering anyway")
+                                            break
+                                self.models[mid] = cfg
+                                log.info(f"Discovered {name} bridge card: {mid} -> {p}")
                 else:
                     log.warning(f"engines.{name}.configs_dir {cfg_dir} is not a directory; {name} cards disabled")
             # Loop 2 — user-added card files (persist across rescans). The legacy
@@ -1584,11 +1659,23 @@ class ModelManager:
             log.warning(f"Bridge card {card} has no engine_config; skipping")
             return None
         cfg = self._make_engine_config(Path(ec), engine, card)
-        mid = self._sanitize_model_id(Path(ec).stem)
-        if cfg and mid not in self.models:
-            self.models[mid] = cfg
-            return mid
-        return None
+        if not cfg:
+            return None
+        # Model id is the card's editable name (model_name), falling back to the config-file
+        # stem when unset — consistent with the discovered-card scan above.
+        mid = self._bridge_card_model_id(cfg, Path(ec).stem)
+        if mid in self.models:
+            log.warning(f"Skipping bridge card {card}: derived id '{mid}' collides with "
+                        f"an already-registered model")
+            return None
+        if cfg.name:
+            for _oc in self.models.values():
+                if _oc.name and _oc.name.lower() == cfg.name.lower():
+                    log.warning(f"Bridge card {card} display name '{cfg.name}' is ambiguous "
+                                f"(matches existing model name '{_oc.name}'); registering anyway")
+                    break
+        self.models[mid] = cfg
+        return mid
 
     def _is_mmproj(self, path: Path, info: Dict[str, Any]) -> bool:
         """True when a .gguf is a vision projector rather than a servable model.
@@ -1941,19 +2028,41 @@ class ModelManager:
                     if other_mid == mid:
                         continue
                     if other_cfg.name and other_cfg.name.lower() == target_name:
-                        raise ValueError(
+                        raise ModelNameConflict(
                             f"Model name '{new_cfg.name}' is already used by "
                             f"'{other_cfg.name}' (model ID '{other_mid}'); names must be unique (they are the retrieval key)."
                         )
+            # Bridge rename: derive the new id from the new name and guard ONLY the real
+            # conflicts — the new id already taken by another model, or the model currently
+            # loaded (a running process's model id cannot change in place). Name-uniqueness
+            # is handled above. new_mid == mid means no rename and the flow is unchanged.
+            new_mid = mid
+            config_stem = None
+            if is_bridge:
+                config_stem = self._bridge_card_overlay_stem(cfg, mid)
+                new_mid = self._bridge_card_model_id(new_cfg, config_stem)
+                if new_mid != mid:
+                    if new_mid in self.models:
+                        raise HTTPException(400, f"cannot rename to '{new_mid}': that model id already exists")
+                    if mid in self.loaded:
+                        raise HTTPException(400, "unload the model before renaming — a running process's model id cannot change in place")
 
         paired = None
         if is_bridge:
             # Bridge cards have no gguf path / mmproj pairing; persist only the editable
             # card-overlay fields (plus engine/engine_config) to the engine's cards_dir.
-            save_path = self._cards_dir_for(cfg.engine) / f"{self._sanitize_model_id(mid)}.json"
+            # Keyed by the CONFIG-FILE STEM (or the sanitized id when there is no config) —
+            # the SAME key _scan_bridge_cards reads. Single source of truth: _bridge_card_overlay_stem.
+            save_path = self._cards_dir_for(cfg.engine) / f"{config_stem}.json"
             save_path.parent.mkdir(parents=True, exist_ok=True)
             new_cfg.model_type = new_cfg.type_override or MODEL_TYPE_TEXT
             await asyncio.to_thread(new_cfg.save_engine_card, save_path)
+            # A rename must survive a rescan/restart, and the id is re-derived from the config
+            # file's model_name on scan — so write the new name back to that SOURCE file. Only
+            # when the name actually changed and the card is config-backed; non-config-backed
+            # cards carry the name in the overlay written above.
+            if cfg.engine_config and new_cfg.name and new_cfg.name != cfg.name:
+                await asyncio.to_thread(self._write_bridge_name_to_config, cfg.engine_config, new_cfg.name)
         else:
             # Re-derive the effective type first: _pair_mmproj uses model_type to
             # refuse auxiliary components (draft/MTP/audio), exactly like scan().
@@ -1980,12 +2089,16 @@ class ModelManager:
             await asyncio.to_thread(new_cfg.save, path)
 
         async with self._lock:
-            self.models[mid] = new_cfg
+            self.models[new_mid] = new_cfg
+            if new_mid != mid:
+                self.models.pop(mid, None)
             if mid in self.loaded:
                 self.loaded[mid].config = new_cfg
             # A configuration edit plausibly fixes a failed reload (bad args, engine
             # path, GPU settings), so allow the next attempt immediately (BUG_0007).
-            self._clear_recovery_failure(mid)
+            self._clear_recovery_failure(new_mid)
+            if new_mid != mid:
+                self._recovery_failures.pop(mid, None)
             # Sync the mmproj pairing computed above so --mmproj is correct at launch.
             if paired is not None:
                 self.mmproj_paths[mid] = paired
@@ -2021,6 +2134,42 @@ class ModelManager:
     @staticmethod
     def _sanitize_model_id(model_id: str) -> str:
         return ModelManager.sanitize_safe_string(model_id)
+
+    def _bridge_card_model_id(self, cfg, fallback_stem: str) -> str:
+        """Derive a bridge card's model id from its editable name (model_name).
+
+        Spaces are replaced with '-' so the id stays a single monolithic token (safe in
+        URLs/path params); the display name (cfg.name) keeps its spaces. Falls back to the
+        config-file stem when the name is unset. Single source of truth for BOTH the
+        discovered-card scan and user-added card registration so the two can never drift.
+        """
+        return self._sanitize_model_id((cfg.name or fallback_stem).replace(" ", "-"))
+
+    def _bridge_card_overlay_stem(self, cfg, mid: str) -> str:
+        """On-disk overlay card stem for a bridge card: the config-file stem when the card is
+        config-backed (cfg.engine_config set) — the SAME key _scan_bridge_cards reads
+        (cards_dir/<config-stem>.json) — else the sanitized registry id (legacy/no-config cards).
+        Single source of truth so the write/delete paths cannot drift from the read path.
+        """
+        return Path(cfg.engine_config).stem if cfg.engine_config else self._sanitize_model_id(mid)
+
+    def _write_bridge_name_to_config(self, engine_config_path: str, name: str) -> None:
+        """Persist a renamed bridge card's display name into its SOURCE engine config file
+        (the model_name key) so a rescan/restart re-derives the same id. Preserves every
+        other key (artifact, exe, ...); only model_name is replaced. Best-effort: a missing
+        or unparseable file is a no-op (the overlay still carries the name for this session).
+        """
+        path = Path(engine_config_path)
+        if not path.is_file():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        data["model_name"] = name
+        _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
 
     @staticmethod
     def _sanitize_label(label: str) -> str:
@@ -2091,13 +2240,26 @@ class ModelManager:
             port += 1
         raise RuntimeError("No available ports found for llama-server")
 
-    async def _wait_until_ready(self, port: int, proc: Optional[subprocess.Popen] = None, timeout: float = 120.0) -> bool:
+    async def _wait_until_ready(self, port: int, proc: Optional[subprocess.Popen] = None,
+                                timeout: float = 120.0,
+                                abort_probe: Optional[Callable[[], bool]] = None) -> bool:
+        """Poll /health until the engine answers or the process dies.
+
+        ``abort_probe`` (BUG_0013) reports whether this model's load was already marked as
+        aborted by an explicit unload. When it is true, a dead process is the requested
+        outcome and is logged at INFO; reporting it at ERROR ("exited prematurely") is what
+        made a deliberate release look like a crashed engine upstream.
+        """
         url = f"http://127.0.0.1:{port}/health"
         log.info(f"Waiting for llama-server on port {port} at {url}...")
         start = time.time()
         while time.time() - start < timeout:
             if proc and proc.poll() is not None:
-                log.error(f"llama-server process exited prematurely with code {proc.poll()}")
+                exit_code = proc.poll()
+                if abort_probe is not None and abort_probe():
+                    log.info(f"llama-server on port {port} exited after a requested unload")
+                else:
+                    log.error(f"llama-server process exited prematurely with code {exit_code}")
                 return False
             try:
                 r = await self.client.get(url, timeout=2.0)
@@ -2222,6 +2384,28 @@ class ModelManager:
         task = self._loading_tasks.get(model_id)
         return task is not None and not task.done()
 
+    def _mark_load_aborted_locked(self, model_id: str) -> bool:
+        """Mark an in-flight load of ``model_id`` as aborted by an explicit unload.
+
+        Caller must hold ``self._lock`` and must be about to tear this model's engine
+        down. Returns True when a load was marked.
+
+        BUG_0013: an unload racing a load kills the engine under the loader's feet. The
+        load task's only way to notice is ``proc.poll()``, which reports "exited
+        prematurely" + "failed to become ready", and the recovery wrapper that launched
+        it books a failed reload and arms the 5 s cooldown — for a load the caller asked
+        to abort. This marker (armed *before* the kill) lets the load end as aborted.
+
+        Never marks the teardown a load task runs on itself (force-reload, failed-load
+        and cancelled-load cleanup all route through ``_unload_unlocked``): that is the
+        load terminating itself, not an outside release.
+        """
+        task = self._loading_tasks.get(model_id)
+        if task is None or task.done() or task is asyncio.current_task():
+            return False
+        self._load_aborts.add(model_id)
+        return True
+
     async def load_model(self, model_id_input: str, force: bool = False,
                          respect_recovery_cooldown: bool = True) -> LoadedModel:
         """Load (JIT) a model with non-blocking concurrency for other requests.
@@ -2234,6 +2418,10 @@ class ModelManager:
         model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise KeyError(f"Unknown model: {model_id_input}")
+        # BUG_0014: wanting the model back supersedes a failed release request. Recovery
+        # suppression only exists to avoid undoing a release nobody has revoked; an
+        # explicit (endpoint) or JIT (routing) load IS that revocation.
+        self._release_requested.discard(model_id)
         if not force and respect_recovery_cooldown:
             remaining = self.recovery_retry_after(model_id)
             if remaining is not None:
@@ -2259,6 +2447,9 @@ class ModelManager:
         except RecoveryCooldownError:
             # A concurrent waiter armed the cooldown after this call passed its first
             # check. Suppression is not another failed load attempt.
+            raise
+        except LoadAbortedByUnload:
+            # BUG_0013: a requested release, not a failed load. Never arm a cooldown for it.
             raise
         except Exception as e:  # noqa: BLE001 - extend an existing dead-recovery backoff
             if had_failure and respect_recovery_cooldown and not force:
@@ -2286,6 +2477,11 @@ class ModelManager:
             if self._is_loading(model_id):
                 task = self._loading_tasks[model_id]
             else:
+                # A fresh load owns this model again: an abort marker left by a previous
+                # unload race is stale (BUG_0013). The release marker is NOT cleared here —
+                # recovery calls this method directly and must keep honouring it (BUG_0014);
+                # load_model clears it because that is a caller wanting the model back.
+                self._load_aborts.discard(model_id)
                 task = asyncio.create_task(self._do_load_model(model_id, force=force))
                 self._loading_tasks[model_id] = task
 
@@ -2295,6 +2491,8 @@ class ModelManager:
             async with self._lock:
                 if self._loading_tasks.get(model_id) is task:
                     self._loading_tasks.pop(model_id, None)
+                if task.done():
+                    self._load_aborts.discard(model_id)
 
     def _clear_recovery_failure(self, model_id: str) -> None:
         """Forget a model's failed-reload cooldown (success/manual action/config edit)."""
@@ -2560,6 +2758,18 @@ class ModelManager:
                                     return lm
                                 # The replacement is still loading; join it below.
                             else:
+                                if reload_mid in self._release_requested:
+                                    # BUG_0014: tracked-but-not-ready because a client's
+                                    # unload could not be verified. Reloading here would undo
+                                    # that release and take the cards back from the caller
+                                    # (2026-10-25: reload 8 s after the 500, straight into a
+                                    # running GPU job). Leave it for the client to retry; an
+                                    # explicit or JIT load clears the marker.
+                                    log.warning(
+                                        f"Not reloading '{reload_mid}' on port {dead_port}: "
+                                        f"a client requested its release and the unload did "
+                                        f"not complete; leaving it tracked and not ready")
+                                    return None
                                 state = ("refused a connection" if lm.ready
                                          else "is already marked unready")
                                 log.error(f"Engine for {reload_mid} on port {dead_port} "
@@ -2630,6 +2840,13 @@ class ModelManager:
                 lm = await self._load_model_serialized(reload_mid)
             except asyncio.CancelledError:
                 raise
+            except LoadAbortedByUnload as e:
+                # BUG_0013: the replacement was killed by an explicit unload of the same
+                # model. That is the caller's decision, not a failed reload - no cooldown,
+                # no ERROR: the next request loads normally.
+                log.info(f"Dead-backend recovery for '{reload_mid}' was aborted by an unload "
+                         f"of the same model ({e})")
+                return None
             except Exception as e:  # noqa: BLE001 - reported to the forwarder as a 503
                 log.error(f"Dead-backend recovery reload of '{reload_mid}' failed: {e}")
                 self._record_recovery_failure(
@@ -2736,10 +2953,21 @@ class ModelManager:
 
             # Wait until ready OUTSIDE the lock! Bridge first loads can be slow (multi-GPU),
             # so the timeout comes from the engine entry; llama keeps the original 120s.
-            ready = await self._wait_until_ready(port, proc=proc,
-                                                 timeout=self.ready_timeout_for(model_id))
+            ready = await self._wait_until_ready(
+                port, proc=proc,
+                timeout=self.ready_timeout_for(model_id),
+                abort_probe=lambda: model_id in self._load_aborts)
             lm.ready = ready
             if not ready:
+                if model_id in self._load_aborts:
+                    # BUG_0013: an explicit unload killed this engine on purpose and owns
+                    # the teardown. Do not log a failed start, do not unload again (the
+                    # entry is already detached), and do not let the caller book this as a
+                    # failed reload / arming the recovery cooldown.
+                    self._load_aborts.discard(model_id)
+                    log.info(f"Load of {model_id} aborted by an unload of the same model")
+                    raise LoadAbortedByUnload(
+                        f"Load of '{model_id}' was aborted by an unload of the same model")
                 log.error(f"Model {model_id} failed to become ready")
                 async with self._lock:
                     await self._unload_unlocked(model_id)
@@ -2747,6 +2975,7 @@ class ModelManager:
 
             log.info(f"Model {model_id} ready on port {port}")
             lm.touch()
+            self._release_requested.discard(model_id)
             # Any successful load (manual, JIT, or recovery reload) clears the
             # failed-recovery circuit breaker for this model (BUG_0007).
             self._clear_recovery_failure(model_id)
@@ -2756,9 +2985,9 @@ class ModelManager:
             queue = self.queue_registry.get_or_create(port, model_id)
 
             # Auto-restore session state if enabled and cached auto state exists.
-            # Slot save/restore is llama-only: a bridge card must never trigger it, even
-            # if the global default_auto_save_state is True.
-            if (cfg.auto_save_state or self.default_auto_save_state) and cfg.is_llama:
+            # Slot save/restore is supported by llama-server and NInfer; other bridge
+            # engines (e.g. Strata) handle it internally via config.
+            if (cfg.auto_save_state or self.default_auto_save_state) and (cfg.is_llama or cfg.engine == "ninfer"):
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 if state_path.exists():
@@ -2768,7 +2997,7 @@ class ModelManager:
                         # Hold the FIFO ticket so the restore runs before any LLM request.
                         ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=60.0)
                         try:
-                            await self._perform_slot_restore(port, state_path, timeout=30.0)
+                            await self._perform_slot_restore(port, state_path, timeout=30.0, model_id=model_id)
                             lm.state_path = state_path
                         finally:
                             queue.release_ticket(ticket)
@@ -2836,7 +3065,8 @@ class ModelManager:
 
     def _finalize_unload_locked(self, lm: LoadedModel, model_id: str,
                                 deliberate: bool, killed: bool,
-                                kill_reason: str) -> UnloadResult:
+                                kill_reason: str,
+                                client_requested: bool = False) -> UnloadResult:
         """Finalize registry state after teardown (caller must hold ``_lock``)."""
         try:
             if not killed:
@@ -2850,7 +3080,25 @@ class ModelManager:
                 self._invalidate_status()
                 log.error(f"Unload of {model_id} failed: process {lm.pid} is still "
                           f"running ({kill_reason}); keeping the model tracked")
+                if client_requested:
+                    # BUG_0014: a CLIENT-initiated release whose kill could not be verified
+                    # must keep the release intent across the failure. The engine is gone
+                    # (or hanging) but the model is still tracked, which is exactly the
+                    # shape dead-backend recovery treats as "relaunch it" - undoing the
+                    # release the caller asked for. Cleared by an explicit/JIT load or a
+                    # successful unload.
+                    # NOT gated on `deliberate`: that flag is also True for an internal
+                    # deliberate unload (a genuine dead-backend recovery whose teardown
+                    # kill fails, or a failed LRU eviction). Marking those would suppress
+                    # recovery forever, so a genuinely-crashed engine could never reload.
+                    # Only the client entry points (unload_model / _exact / _all / the
+                    # hard-interrupt endpoint) pass client_requested=True.
+                    self._release_requested.add(model_id)
+                    log.info(f"Release of {model_id} was requested but did not complete; "
+                             f"dead-backend recovery will not reload it until a load is "
+                             f"requested")
                 return UnloadResult(model_id, False, lm.pid, kill_reason)
+            self._release_requested.discard(model_id)
             return UnloadResult(model_id, True, lm.pid)
         finally:
             # Clear the flag only once _unload_finish has run to completion —
@@ -2862,7 +3110,8 @@ class ModelManager:
             if deliberate:
                 self._unload_in_progress.discard(model_id)
 
-    async def _unload_unlocked(self, model_id: str) -> Optional[UnloadResult]:
+    async def _unload_unlocked(self, model_id: str,
+                               client_requested: bool = False) -> Optional[UnloadResult]:
         """Unload a model (caller must hold self._lock).
 
         Returns ``None`` when the model was not resident. Otherwise the result's
@@ -2877,6 +3126,11 @@ class ModelManager:
         if begin is None:
             return None
         lm, deliberate = begin
+        # BUG_0013: tell an in-flight load that this teardown is deliberate, BEFORE the
+        # kill. Otherwise the load task discovers the death through proc.poll() and reports
+        # a crashed engine + failed start, and the recovery that launched it books a failed
+        # reload (5 s cooldown) for a load the caller asked to abort.
+        self._mark_load_aborted_locked(model_id)
         try:
             killed, kill_reason = await self._unload_finish(lm, model_id)
         except BaseException as exc:
@@ -2919,7 +3173,8 @@ class ModelManager:
                     f"process {lm.pid} is gone, not re-registered")
             raise
         return self._finalize_unload_locked(
-            lm, model_id, deliberate, killed, kill_reason)
+            lm, model_id, deliberate, killed, kill_reason,
+            client_requested=client_requested)
 
     async def _unload_finish(self, lm: LoadedModel, model_id: str) -> Tuple[bool, str]:
         """Complete an unload: auto-save, drain, drop the queue, kill, clean up.
@@ -2928,18 +3183,18 @@ class ModelManager:
         could not be verified dead; every other cleanup step is best-effort and
         never changes that verdict.
         """
-        # Auto-save session state if enabled. Slot save/restore is llama-only: a strata
-        # card must never trigger it (even if the global default_auto_save_state is True).
+        # Auto-save session state if enabled. Slot save/restore is supported by
+        # llama-server and NInfer; Strata handles it internally via config.
         # NOTE: intentionally NOT routed through the FIFO ticket queue. This is a teardown
         # path — no later LLM request depends on this save — and the engine's own FIFO
         # already serializes it against any in-flight generation. Ticketing it here would
         # hold the asyncio lock across a potentially long ticket wait for no ordering gain.
-        if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state) and lm.config.is_llama:
+        if lm.ready and (lm.config.auto_save_state or self.default_auto_save_state) and (lm.config.is_llama or lm.config.engine == "ninfer"):
             try:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 log.info(f"Auto-saving session state for {model_id} to {state_path}...")
-                await self._perform_slot_save(lm.port, state_path, timeout=60.0)
+                await self._perform_slot_save(lm.port, state_path, timeout=60.0, model_id=model_id)
             except Exception as e:
                 log.warning(f"Auto-save failed for {model_id}: {e}")
 
@@ -3214,7 +3469,7 @@ class ModelManager:
             return None
         async with self._model_lock(mid):
             async with self._lock:
-                result = await self._unload_unlocked(mid)
+                result = await self._unload_unlocked(mid, client_requested=True)
             if result is None or result.unloaded:
                 self._clear_recovery_failure(mid)
             return result
@@ -3228,7 +3483,7 @@ class ModelManager:
         """
         async with self._model_lock(model_id):
             async with self._lock:
-                result = await self._unload_unlocked(model_id)
+                result = await self._unload_unlocked(model_id, client_requested=True)
             if result is None or result.unloaded:
                 self._clear_recovery_failure(model_id)
             return result
@@ -3243,7 +3498,7 @@ class ModelManager:
         """
         async with self._lock:
             ids = list(self.loaded.keys())
-            results = [await self._unload_unlocked(mid) for mid in ids]
+            results = [await self._unload_unlocked(mid, client_requested=True) for mid in ids]
 
         unloaded = [r.model_id for r in results if r is not None and r.unloaded]
         failed = [r.failure() for r in results if r is not None and not r.unloaded]
@@ -3407,9 +3662,12 @@ class ModelManager:
             log.debug(f"State temp cleanup failed: {e}")
         return removed
 
-    async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+    async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
         """Attempt a slot action (save/restore) trying supported endpoint formats."""
         base = f"http://127.0.0.1:{port}"
+        # Bridge engines (NInfer) require ?model= to identify the target model.
+        # llama-server ignores unknown query params, so this is safe for all engines.
+        model_param = f"&model={model_id}" if model_id else ""
         attempts = [
             ("/slots/0", {"filename": state_path.name}, f"URL param: ?action={action}"),
             ("/slots", {"id_slot": 0, "filename": state_path.name}, f"URL param: ?action={action}"),
@@ -3419,7 +3677,7 @@ class ModelManager:
         last_err = None
         for path, payload, desc in attempts:
             try:
-                url = f"{base}{path}?action={action}"
+                url = f"{base}{path}?action={action}{model_param}"
                 r = await self.client.post(url, json=payload, timeout=timeout)
                 if r.status_code == 200:
                     log.debug(f"Slot {action} succeeded via {desc}")
@@ -3449,21 +3707,21 @@ class ModelManager:
 
         raise RuntimeError(f"{action} failed across all slot endpoints. Last error: {last_err}")
 
-    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
         """Attempt to save slot state trying supported endpoint formats."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
         # A save killed mid-write leaves a multi-GB scratch file behind; reclaim
         # the stale ones right before writing another one (never touches .bin).
         self._cleanup_state_temps()
         log.info(f"Saving slot 0 state to file: {state_path}")
-        return await self._perform_slot_action("save", port, state_path, timeout)
+        return await self._perform_slot_action("save", port, state_path, timeout, model_id=model_id)
 
-    async def _perform_slot_restore(self, port: int, state_path: Path, timeout: float = 120.0) -> bool:
+    async def _perform_slot_restore(self, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
         """Attempt to restore slot state trying supported endpoint formats."""
         if not state_path.exists():
             raise FileNotFoundError(f"State file not found: {state_path}")
         log.info(f"Restoring slot 0 state from file: {state_path}")
-        return await self._perform_slot_action("restore", port, state_path, timeout)
+        return await self._perform_slot_action("restore", port, state_path, timeout, model_id=model_id)
 
     async def save_state(self, model_id_input: str, label: str = "default") -> Path:
         model_id = await self.resolve_model_id_strict(model_id_input)
@@ -3483,7 +3741,7 @@ class ModelManager:
                 queue = self.queue_registry.get_or_create(lm.port, model_id)
                 ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
                 try:
-                    await self._perform_slot_save(lm.port, state_path, timeout=120.0)
+                    await self._perform_slot_save(lm.port, state_path, timeout=120.0, model_id=model_id)
                 finally:
                     queue.release_ticket(ticket)
             finally:
@@ -3555,7 +3813,7 @@ class ModelManager:
                 queue = self.queue_registry.get_or_create(lm.port, model_id)
                 ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
                 try:
-                    await self._perform_slot_restore(lm.port, state_path, timeout=120.0)
+                    await self._perform_slot_restore(lm.port, state_path, timeout=120.0, model_id=model_id)
                 finally:
                     queue.release_ticket(ticket)
             finally:
@@ -4413,7 +4671,7 @@ async def interrupt_model(model_id: str, hard: bool = False):
 
         if hard:
             try:
-                result = await manager._unload_unlocked(mid)
+                result = await manager._unload_unlocked(mid, client_requested=True)
                 if result is not None and not result.unloaded:
                     raise HTTPException(
                         500, f"Interrupt failed for {model_id}: "
@@ -4463,7 +4721,12 @@ async def update_model_config(model_id: str, body: ModelConfigUpdate):
     if cfg.max_ctx_size and cfg.ctx_size and cfg.ctx_size > cfg.max_ctx_size:
         log.info(f"Capping ctx_size ({cfg.ctx_size}) to max_ctx_size ({cfg.max_ctx_size}) for model {mid}")
         cfg.ctx_size = cfg.max_ctx_size
-    saved = await manager.update_config(mid, cfg)
+    try:
+        saved = await manager.update_config(mid, cfg)
+    except ModelNameConflict as e:
+        # Name/id conflicts (the retrieval-key uniqueness guard) surface as a clean 400.
+        # Genuine internal ValueErrors propagate as 500s.
+        raise HTTPException(400, str(e))
     return asdict(saved)
 
 @app.post("/v1/models/{model_id}/vision/toggle")
@@ -4486,8 +4749,10 @@ async def add_engine_card_ep(body: EngineCardCreate):
 
     Resolves the engine (400 unknown/misconfigured), validates the engine config
     (is_file + parses to dict + has the engine's ``config_key``), writes
-    ``engine_cards/<mid>.json`` (self-describing via ``engine`` + ``engine_config``)
-    and registers the card. 400 on invalid config, 409 on id collision.
+    ``engine_cards/<config-stem>.json`` (self-describing via ``engine`` + ``engine_config``;
+    keyed by the config file, NOT the derived id) and registers the card under an id
+    derived from its name (model_name, spaces→dashes, falling back to the config stem).
+    400 on invalid config, 409 on id collision.
 
     NOTE: assumes a single-instance server. The lock is deliberately split (card-file
     write outside the lock, registration inside) to avoid holding it during disk I/O; a
@@ -4505,7 +4770,15 @@ async def add_engine_card_ep(body: EngineCardCreate):
     cfg = await asyncio.to_thread(manager._make_engine_config, cfg_path, body.engine, None)
     if cfg is None:
         raise HTTPException(400, f"not a valid {body.engine} engine config: {body.engine_config}")
-    mid = manager._sanitize_model_id(cfg_path.stem)
+    config_stem = cfg_path.stem  # overlay card key = config stem (same key the read/write/delete paths use)
+    if not config_stem:
+        raise HTTPException(400, "engine_config must have a non-empty file stem (card key)")
+    if body.name:
+        cfg.name = body.name
+    # Registry id is derived from the card's name (model_name, spaces→dashes), falling
+    # back to the config stem — the same rule as the scan/register paths. The on-disk card
+    # file stays keyed by the CONFIG STEM (the overlay read path), independent of the id.
+    mid = manager._bridge_card_model_id(cfg, config_stem)
     if not mid or mid == "_":
         raise HTTPException(400, "engine_config must have a non-empty file stem (model id)")
     if body.name:
@@ -4517,11 +4790,9 @@ async def add_engine_card_ep(body: EngineCardCreate):
     async with manager._lock:
         if mid in manager.models:
             raise HTTPException(409, f"Model id '{mid}' already exists")
-    if body.name:
-        cfg.name = body.name
     cards_dir = manager._cards_dir_for(body.engine)
     cards_dir.mkdir(parents=True, exist_ok=True)
-    await asyncio.to_thread(cfg.save_engine_card, cards_dir / f"{mid}.json")
+    await asyncio.to_thread(cfg.save_engine_card, cards_dir / f"{config_stem}.json")
     async with manager._lock:
         manager.models[mid] = cfg
     log.info(f"Added {body.engine} bridge card: {mid} -> {cfg_path}")
@@ -4678,10 +4949,13 @@ async def delete_model_ep(model_id: str):
         log.warning(f"Unload before delete failed for {mid}: {e}")
 
     # Remove the card file (and any legacy copy) so a rescan won't re-add it.
+    # Keyed by the SAME overlay stem the add/update paths write (single source of truth:
+    # _bridge_card_overlay_stem). The derived-temp cleanup below stays keyed by the registry id.
     cards_dir = manager._cards_dir_for(engine)
+    card_stem = manager._bridge_card_overlay_stem(cfg, mid)
     for d in [cards_dir] + [Path(p) for p in LEGACY_CARDS_DIRS]:
         try:
-            (d / f"{mid}.json").unlink(missing_ok=True)
+            (d / f"{card_stem}.json").unlink(missing_ok=True)
         except OSError as e:
             log.warning(f"Failed to remove card file for {mid} in {d}: {e}")
     try:

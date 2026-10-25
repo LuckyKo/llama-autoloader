@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -120,8 +121,7 @@ def test_launch_bridge_golden_argv(tmp_path):
     models_dir = tmp_path / "models"; models_dir.mkdir()
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    _write_engine_config(engine_dir, "strata-coder-iq1_m",
-                         {"exe": "strata.exe", "model_name": "Coder IQ1_M"})
+    _write_engine_config(engine_dir, "strata-coder-iq1_m", {"exe": "strata.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.temp_dir = tmp_path / "temp"          # isolate derived-config writes
     mgr.scan()
@@ -300,15 +300,17 @@ def test_scan_engine_cards_idempotent(tmp_path):
                          {"exe": "s.exe", "model_name": "C"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
-    mid = "strata-coder-iq1_m"
+    # id is derived from model_name (spaces→dashes); engine_config stays the config-file path.
+    mid = "C"
+    cfg_path = str(engine_dir / "strata-coder-iq1_m.json")
     assert mid in mgr.models
     assert mgr.models[mid].engine == "strata"
-    assert mgr.models[mid].engine_config == str(engine_dir / f"{mid}.json")
+    assert mgr.models[mid].engine_config == cfg_path
     assert mgr.models[mid].name == "C"
     # Idempotent rescan: strata id stable, config unchanged, no duplication.
     mgr.scan()
     assert mid in mgr.models
-    assert mgr.models[mid].engine_config == str(engine_dir / f"{mid}.json")
+    assert mgr.models[mid].engine_config == cfg_path
     assert mgr.models[mid].engine == "strata"
 
 
@@ -337,7 +339,7 @@ def test_scan_strata_card_collision_gguf_wins(tmp_path):
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
     # gguf id "clash.gguf" == strata config stem "clash.gguf" (file clash.gguf.json).
     (models_dir / "clash.gguf").write_bytes(b"GGUF_HEADER")
-    _write_engine_config(engine_dir, "clash.gguf", {"exe": "s.exe", "model_name": "Clash"})
+    _write_engine_config(engine_dir, "clash.gguf", {"exe": "s.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
     assert "clash.gguf" in mgr.models
@@ -365,21 +367,19 @@ async def test_update_config_strata_writes_card(tmp_path):
     models_dir = tmp_path / "models"; models_dir.mkdir()
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    src = _write_engine_config(engine_dir, "card", {"exe": "s.exe", "model_name": "C"})
+    src = _write_engine_config(engine_dir, "card", {"exe": "s.exe"})
     src_hash = _sha256(src)
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
     mid = "card"
     cfg = mgr.models[mid]
     cfg.pinned = True
-    cfg.name = "C updated"
     await mgr.update_config(mid, cfg)
     # card overlay written to cards_dir
     card_path = cards_dir / f"{mid}.json"
     assert card_path.exists()
     data = json.loads(card_path.read_text())
     assert data["pinned"] is True
-    assert data["name"] == "C updated"
     assert data["engine_config"] == str(src)   # self-describing card
     # DELIBERATE REVERSAL: cards now record the engine too. Previously "engine" was
     # derived at scan time and never written, so a card could not say which engine it
@@ -465,18 +465,18 @@ async def test_add_strata_card_registers_and_persists_across_scan(tmp_path, monk
     _use_manager(monkeypatch, mgr)
 
     res = await server.add_strata_card_ep(server.StrataCardCreate(strata_config=str(src)))
-    assert res == {"id": "added"}
-    card = json.loads((cards_dir / "added.json").read_text(encoding="utf-8"))
+    assert res == {"id": "Added-Model"}   # id derived from model_name, not the config stem
+    card = json.loads((cards_dir / "added.json").read_text(encoding="utf-8"))  # file keyed by config stem
     assert card["engine_config"] == str(src)
     assert card["name"] == "Added Model"        # defaults to the engine's model_name
 
     mgr.scan()
-    cfg = mgr.models["added"]
+    cfg = mgr.models["Added-Model"]
     assert cfg.engine == "strata"
     assert cfg.engine_config == str(src)
     assert cfg.name == "Added Model"
 
-    payload = {p["id"]: p for p in await mgr.list_models()}["added"]
+    payload = {p["id"]: p for p in await mgr.list_models()}["Added-Model"]
     assert payload["engine"] == "strata"
     assert payload["engine_config"] == str(src)
     assert payload["min_free_vram_mib"] == 0
@@ -495,9 +495,9 @@ async def test_add_strata_card_name_override(tmp_path, monkeypatch):
 
     res = await server.add_strata_card_ep(
         server.StrataCardCreate(strata_config=str(src), name="User Chosen"))
-    assert res == {"id": "custom"}
-    assert mgr.models["custom"].name == "User Chosen"
-    card = json.loads((cards_dir / "custom.json").read_text(encoding="utf-8"))
+    assert res == {"id": "User-Chosen"}   # id derived from the overridden name, not the config stem
+    assert mgr.models["User-Chosen"].name == "User Chosen"
+    card = json.loads((cards_dir / "custom.json").read_text(encoding="utf-8"))  # file keyed by config stem
     assert card["name"] == "User Chosen"
 
 
@@ -522,7 +522,7 @@ def test_card_overlay_cannot_flip_engine(tmp_path):
     models_dir = tmp_path / "models"; models_dir.mkdir()
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    src = _write_engine_config(engine_dir, "flip", {"exe": "s.exe", "model_name": "F"})
+    src = _write_engine_config(engine_dir, "flip", {"exe": "s.exe"})
     (cards_dir / "flip.json").write_text(json.dumps({
         "engine": "llama",
         "engine_config": "D:\\bogus\\flip.json",
@@ -719,7 +719,7 @@ async def test_bridge_load_missing_interpreter_returns_400(tmp_path):
     models_dir = tmp_path / "models"; models_dir.mkdir()
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    src = _write_engine_config(engine_dir, "card", {"exe": "s.exe", "model_name": "C"})
+    src = _write_engine_config(engine_dir, "card", {"exe": "s.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
 
@@ -742,7 +742,7 @@ async def test_bridge_load_unknown_engine_name_returns_400(tmp_path):
     models_dir = tmp_path / "models"; models_dir.mkdir()
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    _write_engine_config(engine_dir, "card", {"exe": "s.exe", "model_name": "C"})
+    _write_engine_config(engine_dir, "card", {"exe": "s.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
 
@@ -763,7 +763,7 @@ def test_unknown_engine_in_card_file_is_skipped_with_warning(tmp_path, caplog):
     (engine_dir / ".venv" / "python.exe").write_bytes(b"")
     (engine_dir / "serve").mkdir(parents=True, exist_ok=True)
     (engine_dir / "serve" / "server.py").write_text("", encoding="utf-8")
-    _write_engine_config(engine_dir, "real", {"exe": "s.exe", "model_name": "R"})
+    _write_engine_config(engine_dir, "real", {"exe": "s.exe"})
     (cards_dir / "ghost.json").write_text(json.dumps({
         "engine": "ghost", "engine_config": str(engine_dir / "real.json")}),
         encoding="utf-8")
@@ -809,6 +809,60 @@ def test_launch_bridge_second_engine_config_only(tmp_path):
     assert env is not None and "FOO_KEY" not in env
 
 
+# ---------------------------------------------------------------------------
+# native-exe engine: validation relaxation + {artifact} token
+# ---------------------------------------------------------------------------
+
+def test_validate_engines_native_exe_skips_interpreter(tmp_path):
+    """An engine whose argv references neither {interpreter} nor {serve_script} is NOT
+    flagged misconfigured (a native .exe needs no interpreter). An engine that DOES
+    reference {interpreter} is still required to set it — the relaxation must not
+    weaken checking for engines that use those tokens."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    mgr = _manager_with_engines({
+        "native": {
+            "enabled": True, "label": "Native", "config_key": "artifact",
+            "derive_config": False,
+            "argv": ["native.exe", "{artifact}", "--port", "{port}"],
+        },
+    }, models_dir)
+    # construction already ran _validate_engines; a native-exe template references neither token
+    assert not mgr.engines["native"].get("_errors")
+
+    # an engine that DOES reference {interpreter} is still required to provide it
+    mgr.engines["py"] = {
+        "enabled": True, "label": "Py", "config_key": "exe", "derive_config": False,
+        "argv": ["{interpreter}", "serve.py", "--port", "{port}"],
+    }
+    mgr._validate_engines()
+    assert "interpreter is not set" in mgr.engines["py"]["_errors"]
+
+
+def test_launch_bridge_artifact_token(tmp_path):
+    """A native-exe engine places the per-card artifact path at argv[1] via the {artifact}
+    token, sourced from the stub config's config_key value (NInfer's .ninfer)."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "ninfer"; engine_dir.mkdir()
+    art = str(engine_dir / "model-a.ninfer")
+    _write_engine_config(engine_dir, "model-a", {"artifact": art})
+    mgr = _manager_with_engines({
+        "ninfer": {
+            "enabled": True, "label": "NInfer", "config_key": "artifact",
+            "derive_config": False,
+            "argv": ["ninfer-serve.exe", "{artifact}", "--port", "{port}",
+                     "--model-id", "{model_id}"],
+            "configs_dir": str(engine_dir),
+        },
+    }, models_dir)
+    mgr.scan()
+    card = mgr.models["model-a"]
+    assert card.artifact == art
+
+    argv, cwd, env = _launch_bridge(mgr, card, "ninfer", "model-a", 9300)
+    assert argv == ["ninfer-serve.exe", art, "--port", "9300", "--model-id", "model-a"]
+    assert env is None   # no env_scrub → the child inherits the parent env
+
+
 def test_ready_timeout_for_bridge_card(tmp_path):
     """D4: one helper, both copies agree — engine value for bridge, 120s for llama."""
     from tcp_forwarder import _JIT_LOAD_TIMEOUT
@@ -816,7 +870,7 @@ def test_ready_timeout_for_bridge_card(tmp_path):
     (models_dir / "model-a.gguf").write_bytes(b"GGUF_HEADER")
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    _write_engine_config(engine_dir, "card", {"exe": "s.exe", "model_name": "C"})
+    _write_engine_config(engine_dir, "card", {"exe": "s.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
 
@@ -837,13 +891,15 @@ async def test_update_config_can_change_engine_config_path(tmp_path, monkeypatch
     models_dir = tmp_path / "models"; models_dir.mkdir()
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
-    _write_engine_config(engine_dir, "card", {"exe": "s.exe", "model_name": "C"})
-    moved = _write_engine_config(engine_dir, "card-moved", {"exe": "s2.exe", "model_name": "C2"})
+    _write_engine_config(engine_dir, "card", {"exe": "s.exe"})
+    moved = _write_engine_config(engine_dir, "card-moved", {"exe": "s2.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
     _use_manager(monkeypatch, mgr)
 
-    # valid new path applies, in memory and on disk
+    # valid new path applies, in memory and on disk. The overlay stays keyed by the
+    # config the card was registered from (update_config reads the live entry's
+    # engine_config); repointing records the new engine_config inside that file.
     await server.update_model_config("card", server.ModelConfigUpdate(engine_config=str(moved)))
     assert mgr.models["card"].engine_config == str(moved)
     saved = json.loads((cards_dir / "card.json").read_text(encoding="utf-8"))
@@ -876,7 +932,8 @@ async def test_legacy_card_file_with_strata_config_key_loads(tmp_path):
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
 
-    mid = "strata-coder-iq1_m"
+    # id is derived from the card's name (spaces→dashes); config/card files stay at the stem.
+    mid = "Coder-IQ1_M"
     assert mid in mgr.models
     card = mgr.models[mid]
     assert card.engine == "strata"
@@ -884,12 +941,13 @@ async def test_legacy_card_file_with_strata_config_key_loads(tmp_path):
     assert card.pinned is True
     assert card.is_bridge
 
-    # re-saving rewrites it in the new shape (legacy key gone, engine recorded)
+    # re-saving rewrites it in the new shape (legacy key gone, engine recorded),
+    # keyed by the CONFIG STEM — the same file the scan read it from.
     card.pinned = False
     await mgr.update_config(mid, ModelConfig(**{k: getattr(card, k) for k in (
         "name", "description", "tags", "default", "pinned", "auto_save_state",
         "min_free_vram_mib", "extra_args", "engine", "engine_config")}))
-    data = json.loads((cards_dir / f"{mid}.json").read_text(encoding="utf-8"))
+    data = json.loads((cards_dir / "strata-coder-iq1_m.json").read_text(encoding="utf-8"))
     assert data["engine"] == "strata"
     assert data["engine_config"] == str(engine_dir / "strata-coder-iq1_m.json")
     assert "strata_config" not in data
@@ -901,7 +959,7 @@ async def test_add_engine_card_generic_endpoint_and_alias(tmp_path, monkeypatch)
     engine_dir = tmp_path / "strata"; engine_dir.mkdir()
     cards_dir = tmp_path / "cards"; cards_dir.mkdir()
     elsewhere = tmp_path / "elsewhere"; elsewhere.mkdir()
-    src = _write_engine_config(elsewhere, "newcard", {"exe": "s.exe", "model_name": "N"})
+    src = _write_engine_config(elsewhere, "newcard", {"exe": "s.exe"})
     mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
     mgr.scan()
     _use_manager(monkeypatch, mgr)
@@ -912,7 +970,7 @@ async def test_add_engine_card_generic_endpoint_and_alias(tmp_path, monkeypatch)
     assert (cards_dir / "newcard.json").exists()
 
     # deprecated alias reaches the same generic implementation
-    other = _write_engine_config(elsewhere, "aliascard", {"exe": "s.exe", "model_name": "A"})
+    other = _write_engine_config(elsewhere, "aliascard", {"exe": "s.exe"})
     res2 = await server.add_strata_card_ep(server.StrataCardCreate(strata_config=str(other)))
     assert res2 == {"id": "aliascard"}
 
@@ -957,3 +1015,192 @@ async def test_list_engines_reports_errors(tmp_path, monkeypatch):
     off = (await server.list_engines())[0]
     assert off["ready"] is False
     assert "disabled" in off["error"]
+
+
+# ---------------------------------------------------------------------------
+# Bridge-card model id: derived from model_name (spaces→dashes); display name keeps spaces.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_bridge_card_model_id_from_name_and_stem(tmp_path):
+    """A card's callable id is its model_name with spaces→dashes; with no model_name the
+    id is the config-file stem (backward-compat). The display name (GET /v1/models "name")
+    keeps its spaces, and the on-disk overlay stays keyed by the config stem — independent
+    of the id."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    # Card WITH a spaced model_name → id is the dashed name, NOT the config stem.
+    _write_engine_config(engine_dir, "foo-card", {"exe": "s.exe", "model_name": "Foo Bar Baz"})
+    # Card WITHOUT a model_name → id is the config stem.
+    _write_engine_config(engine_dir, "stem-only", {"exe": "s.exe"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    mgr.scan()
+
+    assert "Foo-Bar-Baz" in mgr.models          # id = model_name with dashes
+    assert "stem-only" in mgr.models            # id = file stem when name unset
+    assert "foo-card" not in mgr.models         # the config stem is NOT the id
+    assert mgr.models["Foo-Bar-Baz"].name == "Foo Bar Baz"   # display keeps spaces
+
+    payload = {p["id"]: p for p in await mgr.list_models()}
+    assert "Foo-Bar-Baz" in payload and "stem-only" in payload
+    assert payload["Foo-Bar-Baz"]["id"] == "Foo-Bar-Baz"
+    assert payload["Foo-Bar-Baz"]["name"] == "Foo Bar Baz"
+
+
+@pytest.mark.asyncio
+async def test_discovered_card_edit_survives_rescan(tmp_path):
+    """Guard the overlay read/write key alignment: editing a DISCOVERED card whose id
+    differs from its config stem must persist to the CONFIG-STEM card file and survive a
+    rescan. Breaks if the write keys by the registry id while the read keys by the stem
+    (or vice versa) — the edit would silently vanish."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    # model_name makes the id ("Keep-Me") differ from the config stem ("keepme").
+    src = _write_engine_config(engine_dir, "keepme", {"exe": "s.exe", "model_name": "Keep Me"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    mgr.scan()
+    mid = "Keep-Me"
+    assert mid in mgr.models
+
+    # Edit through the update path (extra_args), exactly as the WebUI does.
+    cfg = mgr.models[mid]
+    cfg.extra_args = ["--edited", "yes"]
+    await mgr.update_config(mid, cfg)
+
+    # The overlay must be written at the CONFIG STEM, never at the id.
+    assert (cards_dir / "keepme.json").exists()
+    assert not (cards_dir / "Keep-Me.json").exists()
+
+    # A rescan re-reads the overlay from the same config-stem key → the edit survives.
+    mgr.scan()
+    assert mid in mgr.models
+    assert mgr.models[mid].extra_args == ["--edited", "yes"]
+
+
+# ---------------------------------------------------------------------------
+# Hardening: name edits are rejected on config-backed cards; id collisions are observable.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_rename_config_backed_card_rekeys_and_persists(tmp_path, monkeypatch):
+    """PUT config with a new name on a config-backed card → 200: the registry re-keys to the
+    new dashed id (old id gone), the new display name is served, and the SOURCE config file's
+    model_name is updated (other keys intact). A subsequent scan() keeps the new id (no revert)."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    src = _write_engine_config(engine_dir, "keepme",
+                              {"exe": "s.exe", "model_name": "Keep Me", "artifact": "keep.gguf"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    mgr.scan()
+    assert "Keep-Me" in mgr.models
+    _use_manager(monkeypatch, mgr)
+
+    saved = await server.update_model_config("Keep-Me", server.ModelConfigUpdate(name="Renamed Card"))
+    assert saved["name"] == "Renamed Card"
+    assert "Keep-Me" not in mgr.models
+    assert "Renamed-Card" in mgr.models
+    assert mgr.models["Renamed-Card"].name == "Renamed Card"
+
+    # SOURCE config file updated, every other key intact
+    data = json.loads(src.read_text(encoding="utf-8"))
+    assert data["model_name"] == "Renamed Card"
+    assert data["artifact"] == "keep.gguf"
+    assert data["exe"] == "s.exe"
+
+    # a rescan keeps the new id (no revert to the old name)
+    mgr.scan()
+    assert "Renamed-Card" in mgr.models and "Keep-Me" not in mgr.models
+
+
+@pytest.mark.asyncio
+async def test_rename_conflict_returns_400(tmp_path, monkeypatch):
+    """Renaming to a name already used by another model returns 400 and leaves the registry
+    and the source config file UNCHANGED."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    src_a = _write_engine_config(engine_dir, "a", {"exe": "s.exe", "model_name": "A One"})
+    _write_engine_config(engine_dir, "b", {"exe": "s.exe", "model_name": "B Two"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    mgr.scan()
+    assert "A-One" in mgr.models and "B-Two" in mgr.models
+    _use_manager(monkeypatch, mgr)
+
+    with pytest.raises(HTTPException) as ei:
+        await server.update_model_config("A-One", server.ModelConfigUpdate(name="B Two"))
+    assert ei.value.status_code == 400
+    # registry unchanged
+    assert "A-One" in mgr.models and "B-Two" in mgr.models
+    assert mgr.models["A-One"].name == "A One"
+    # source config unchanged
+    assert json.loads(src_a.read_text(encoding="utf-8"))["model_name"] == "A One"
+
+
+@pytest.mark.asyncio
+async def test_rename_while_loaded_returns_400(tmp_path, monkeypatch):
+    """Renaming a card that is currently loaded returns 400 (unload first); the model stays
+    under the old id and nothing is persisted."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    src = _write_engine_config(engine_dir, "keepme", {"exe": "s.exe", "model_name": "Keep Me"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    mgr.scan()
+    mid = "Keep-Me"
+    assert mid in mgr.models
+    mgr.loaded[mid] = object()   # simulate a running process (no subprocess in these tests)
+    _use_manager(monkeypatch, mgr)
+
+    with pytest.raises(HTTPException) as ei:
+        await server.update_model_config(mid, server.ModelConfigUpdate(name="Renamed"))
+    assert ei.value.status_code == 400
+    assert "unload" in ei.value.detail.lower()
+    # model stays under the old id, config unchanged
+    assert mid in mgr.models and "Renamed" not in mgr.models
+    assert mgr.models[mid].name == "Keep Me"
+    assert json.loads(src.read_text(encoding="utf-8"))["model_name"] == "Keep Me"
+
+
+@pytest.mark.asyncio
+async def test_scan_skips_id_collision_with_warning(tmp_path, caplog):
+    """Two configs whose model_name derives to the SAME id: the first registers, the second
+    is skipped and a warning naming the config path and the colliding id is logged. The
+    first id wins and only one entry exists under it."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    # Two distinct config files, identical model_name → identical derived id "Dup-Id".
+    _write_engine_config(engine_dir, "aaa", {"exe": "s.exe", "model_name": "Dup Id"})
+    _write_engine_config(engine_dir, "bbb", {"exe": "s.exe", "model_name": "Dup Id"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    with caplog.at_level(logging.WARNING):
+        mgr.scan()
+
+    mid = "Dup-Id"
+    assert mid in mgr.models
+    assert mgr.models[mid].engine_config == str(engine_dir / "aaa.json")   # first (sorted) wins
+    assert any("collides" in r.message and "Dup-Id" in r.message for r in caplog.records)
+    assert sum(1 for m in mgr.models if m == mid) == 1   # second absent
+
+
+@pytest.mark.asyncio
+async def test_scan_warns_on_ambiguous_display_name_but_keeps_both(tmp_path, caplog):
+    """Two configs whose model_names are case-insensitively equal but derive to DISTINCT ids
+    (case is preserved in ids): the ambiguity warning fires, and BOTH cards still register
+    (the name collision is made observable, not a reason to drop a card)."""
+    models_dir = tmp_path / "models"; models_dir.mkdir()
+    engine_dir = tmp_path / "strata"; engine_dir.mkdir()
+    cards_dir = tmp_path / "cards"; cards_dir.mkdir()
+    # Distinct ids ("Dup-Name" vs "DUP-NAME") but the same case-insensitive display name.
+    _write_engine_config(engine_dir, "aaa", {"exe": "s.exe", "model_name": "Dup Name"})
+    _write_engine_config(engine_dir, "bbb", {"exe": "s.exe", "model_name": "DUP NAME"})
+    mgr = _bridge_manager(tmp_path, models_dir, engine_dir, cards_dir)
+    with caplog.at_level(logging.WARNING):
+        mgr.scan()
+
+    assert "Dup-Name" in mgr.models and "DUP-NAME" in mgr.models   # both kept
+    assert any("ambiguous" in r.message for r in caplog.records)   # observable
+    assert not any("collides" in r.message for r in caplog.records)  # no id collision here

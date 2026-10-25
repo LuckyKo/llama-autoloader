@@ -121,7 +121,8 @@ def _launch_bridge(mgr, cfg, engine_name: str, model_id: str, port: int):
     tokens = {"engine": engine_name, "model_id": model_id, "port": port,
               "host": mgr.host, "derived_config": cfg_arg,
               "interpreter": spec.get("interpreter", ""),
-              "serve_script": spec.get("serve_script", "")}
+              "serve_script": spec.get("serve_script", ""),
+              "artifact": cfg.artifact}
     argv_template = spec.get("argv")
     if not argv_template:
         raise ValueError(f"engines.{engine_name}.argv is required (no default; each engine supplies its own launch template)")

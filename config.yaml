@@ -32,6 +32,25 @@ engines:
     min_free_vram_flag: --min-free-vram-mib
     ready_timeout_seconds: 600
     serve_script: N:/work/WD/Strata/serve/server.py
+  ninfer:
+    argv:
+    - 'N:/work/WD/ninfer-all/build-win-120a/apps/ninfer-serve.exe'
+    - '{artifact}'
+    - --port
+    - '{port}'
+    - --host
+    - 127.0.0.1
+    - --model-id
+    - '{model_id}'
+    - --wddm-evictable-budget
+    - --slot-save-path
+    - N:/work/stuff/Beta/llama-autoloader/states
+    configs_dir: N:/work/WD/ninfer-all/ninfer-cards
+    config_key: artifact
+    derive_config: false
+    enabled: true
+    label: NInfer
+    ready_timeout_seconds: 600
 gpu:
   poll_interval_seconds: 5
 launcher:

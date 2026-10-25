@@ -115,7 +115,7 @@ def slow_slot_save(order: list[str], save_secs: float):
     Records ``slot-action-finished`` when it returns, so a test can see whether an
     unload waited for it before dropping the queue.
     """
-    async def _save(port, path, timeout=None):
+    async def _save(port, path, timeout=None, model_id=None):
         await asyncio.sleep(save_secs)
         order.append("slot-action-finished")
     return AsyncMock(side_effect=_save)
@@ -156,7 +156,7 @@ class TestUnloadDrain:
         """Past the bounded cap the kill still happens; memory safety wins."""
         order: list[str] = []
 
-        async def very_slow_save(port, path, timeout=None):
+        async def very_slow_save(port, path, timeout=None, model_id=None):
             await asyncio.sleep(1.0)
             order.append("slot-action-finished")
 
@@ -183,7 +183,7 @@ class TestUnloadDrain:
         order: list[str] = []
         call_no = iter(range(1, 100))
 
-        async def save(port, path, timeout=None):
+        async def save(port, path, timeout=None, model_id=None):
             i = next(call_no)
             order.append(f"save{i}-start")
             await asyncio.sleep(0.1)
