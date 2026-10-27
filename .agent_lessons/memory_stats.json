@@ -6,7 +6,7 @@
   "strata-bridge-lifecycle-facts.md": 8,
   "subagent-edit-xml-fragment-corruption.md": 1,
   "bridge-generic-plan-dig.md": 5,
-  "llama-autoloader-pytest-canonical-invocation.md": 10,
+  "llama-autoloader-pytest-canonical-invocation.md": 11,
   "save-state-max-keep-setting.md": 1,
   "forwarder-model-extraction-fallthrough-fix.md": 1,
   "strata-bridge-config-discovery-and-expert-profile.md": 3,
@@ -31,10 +31,12 @@
   "kill-proc-tree-complete-drain.md": 2,
   "native-exe-engine-blockers.md": 1,
   "stt-integrates-as-bridge-engine.md": 1,
-  "autoloader-registry-is-gguf-shaped.md": 1,
+  "autoloader-registry-is-gguf-shaped.md": 2,
   "ninfer-bridge-engine-facts.md": 4,
   "ninfer-bridge-implementation.md": 3,
   "bridge-card-model-id-vs-overlay-key-invariant.md": 3,
   "bug-0014-release-marker-invariant.md": 2,
-  "perform-slot-save-model-id-wip-signature-drift.md": 1
+  "perform-slot-save-model-id-wip-signature-drift.md": 1,
+  "state-file-save-restore-lifecycle-and-retention.md": 1,
+  "slot-action-probe-loop-hides-engine-error.md": 2
 }

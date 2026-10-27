@@ -797,6 +797,49 @@ _STATE_SCRATCH_SUFFIXES = (".probe.bin",)
 _UNREACHABLE_ERRORS = (httpx.NetworkError, httpx.ConnectTimeout, httpx.RemoteProtocolError)
 
 
+class EngineSlotError(RuntimeError):
+    """The engine understood a slot save/restore request and REFUSED it.
+
+    Raised by _perform_slot_action when the response carries a structured engine
+    error (see _parse_engine_error). Carries the engine's code+message and the
+    engine's OWN 4xx status (guaranteed <500 by the caller's gate) so callers
+    forward it verbatim instead of returning a generic 500 that discards the real
+    reason. Subclasses RuntimeError so any pre-existing ``except Exception`` still
+    catches it; callers wanting the engine's real status catch this FIRST.
+    """
+
+    def __init__(self, code: str, message: str, status_code: int):
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+        super().__init__(f"{code}: {message}" if code else message)
+
+
+def _parse_engine_error(text: str) -> Optional[Tuple[str, str]]:
+    """Extract (code, message) from a structured engine error body, else None.
+
+    Single source of truth for "did the engine understand and refuse this request?".
+    A JSON body carrying an ``error`` object with a ``code`` and/or ``message`` means
+    the engine understood this endpoint shape and refused the operation — terminal.
+    A non-JSON or bare-404 body returns None (this endpoint shape is simply
+    unsupported; keep probing the next one).
+    """
+    try:
+        body = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error")
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    message = err.get("message")
+    if not (code or message):
+        return None
+    return (str(code or ""), str(message or ""))
+
+
 def _normalize_engines(cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Return the ``engines:`` registry, migrating a legacy ``strata:`` section.
 
@@ -3700,7 +3743,7 @@ class ModelManager:
             ("/slots", {"action": action, "id_slot": 0, "filename": state_path.name}, "JSON body params"),
         ]
 
-        last_err = None
+        first_err = None
         for path, payload, desc in attempts:
             try:
                 url = f"{base}{path}?action={action}{model_param}"
@@ -3708,19 +3751,45 @@ class ModelManager:
                 if r.status_code == 200:
                     log.debug(f"Slot {action} succeeded via {desc}")
                     return True
+                # A structured engine error (JSON body with error.code/message) = the
+                # engine understood THIS request shape and REFUSED the operation.
+                # Terminal: the other shapes perform the same operation and would be
+                # refused identically, so stop probing and surface the engine's own
+                # code/message. A bare 404 (no structured body) only means "this
+                # endpoint shape is unsupported" and legitimately falls through to
+                # the next shape. 5xx keeps the existing break below (a genuine
+                # server-side failure stays a 500, not a client 4xx).
+                if r.status_code < 500:
+                    engine_err = _parse_engine_error(r.text)
+                    if engine_err:
+                        code, message = engine_err
+                        log.warning(
+                            f"Slot {action} refused by engine [{desc}]: HTTP {r.status_code} "
+                            f"{code}: {message}"
+                        )
+                        # Forward the engine's own 4xx verbatim (guaranteed <500 by
+                        # this gate) — it chose that status deliberately.
+                        raise EngineSlotError(code, message, r.status_code)
                 log.warning(f"Slot {action} attempt failed [{desc}]: HTTP {r.status_code} — {r.text[:500]}")
-                last_err = f"[{desc}] HTTP {r.status_code}: {r.text}"
+                # Keep the FIRST real error, not the last probe: a bare 404 on a
+                # later shape must not mask a more meaningful earlier failure.
+                if first_err is None:
+                    first_err = f"[{desc}] HTTP {r.status_code}: {r.text}"
                 # 5xx = server is reachable but can't do the operation (e.g. OOM).
                 # Retrying with a different URL format will hit the same server and
                 # either get the same 5xx or a misleading 404 (endpoint doesn't exist).
                 if r.status_code >= 500:
                     break
+            except EngineSlotError:
+                # A genuine engine refusal: propagate, do not retry other formats.
+                raise
             except Exception as e:
                 # str() of some httpx exceptions (e.g. ConnectError('')) is empty; repr()
                 # always carries the class and its args, so the log/exception stay legible.
                 detail = str(e) or repr(e)
                 log.warning(f"Slot {action} attempt failed [{desc}]: {detail}")
-                last_err = f"[{desc}] {detail}"
+                if first_err is None:
+                    first_err = f"[{desc}] {detail}"
                 if isinstance(e, _UNREACHABLE_ERRORS):
                     # The engine is unreachable at all (refused/closed) — not an
                     # HTTP error it returned. The remaining endpoint formats hit
@@ -3731,7 +3800,7 @@ class ModelManager:
                     )
                     break
 
-        raise RuntimeError(f"{action} failed across all slot endpoints. Last error: {last_err}")
+        raise RuntimeError(f"{action} failed across all slot endpoints. First error: {first_err}")
 
     async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
         """Attempt to save slot state trying supported endpoint formats."""
@@ -3774,6 +3843,10 @@ class ModelManager:
                 # Runs on every path (including a failed acquire), so the counter
                 # can never leak and leave later unloads paying the full drain cap.
                 self._end_slot_action(lm.port)
+        except EngineSlotError as e:
+            # The engine understood the save request and refused it — surface a
+            # faithful 4xx with the engine's own message, not a generic 500.
+            raise HTTPException(e.status_code, e.message)
         except Exception as e:
             raise HTTPException(500, f"save failed: {e}")
 
@@ -3852,6 +3925,10 @@ class ModelManager:
                     queue.release_ticket(ticket)
             finally:
                 self._end_slot_action(lm.port)
+        except EngineSlotError as e:
+            # The engine understood the restore request and refused it — surface a
+            # faithful 4xx with the engine's own message, not a generic 500.
+            raise HTTPException(e.status_code, e.message)
         except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
 

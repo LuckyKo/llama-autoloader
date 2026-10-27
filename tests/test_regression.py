@@ -925,6 +925,35 @@ class TestToLaunchArgs:
 # State save / list / load / delete (path logic; network mocked)
 # ===========================================================================
 
+class _FakeSlotResponse:
+    """Minimal stand-in for an httpx.Response (only the attrs the probe loop
+    reads: .status_code and .text)."""
+
+    def __init__(self, status_code: int, text: str):
+        self.status_code = status_code
+        self.text = text
+
+
+class _FakeSlotClient:
+    """Stand-in for the httpx.AsyncClient set at server.py:1096.
+
+    Parity with the real interface used by _perform_slot_action and teardown:
+    .post(url, json=, timeout=) -> response, and .aclose() (called by mgr.stop()).
+    Records each .post URL so tests can assert the exact probe sequence.
+    """
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def post(self, url, json=None, timeout=None):
+        self.calls.append(url)
+        return self._responses.pop(0)
+
+    async def aclose(self):
+        pass
+
+
 class TestState:
     @pytest.fixture()
     def mgr(self, isolated_manager):
@@ -984,6 +1013,116 @@ class TestState:
         with pytest.raises(HTTPException) as exc:
             await mgr.delete_state("m.gguf", "missing")
         assert exc.value.status_code == 404
+
+    # --- slot-action probe loop: engine-error classification (regression) ---
+    # Reproduces: a genuine structured 400 from the engine was probed 3x and
+    # surfaced as a misleading 500 that discarded the engine's real reason.
+
+    async def test_slot_action_structured_engine_error_is_terminal(self, mgr):
+        # Engine understood the request and refused it (structured 400). The
+        # other endpoint shapes perform the SAME operation, so they must NOT
+        # be probed; the engine's own code/message must surface.
+        fake = _FakeSlotClient([
+            _FakeSlotResponse(400, '{"error":{"code":"slot_save_failed",'
+                                   '"message":"slot holds no retained session",'
+                                   '"type":"invalid_request_error"}}'),
+        ])
+        mgr.client = fake
+        state_path = mgr.save_state_dir / "m.gguf.default.bin"
+        with pytest.raises(server.EngineSlotError) as exc:
+            await mgr._perform_slot_action("save", 19500, state_path)
+        assert len(fake.calls) == 1  # other shapes NOT probed
+        assert exc.value.code == "slot_save_failed"
+        assert exc.value.message == "slot holds no retained session"
+        assert exc.value.status_code == 400
+
+    async def test_slot_action_bare_404_then_200_still_probes_and_succeeds(self, mgr):
+        # A bare 404 (no structured body) legitimately means "this endpoint
+        # shape is unsupported" — the loop must continue to the next shape.
+        fake = _FakeSlotClient([
+            _FakeSlotResponse(404, ""),
+            _FakeSlotResponse(200, ""),
+        ])
+        mgr.client = fake
+        state_path = mgr.save_state_dir / "m.gguf.default.bin"
+        assert await mgr._perform_slot_action("save", 19500, state_path) is True
+        assert len(fake.calls) == 2  # first rejected, second accepted
+
+    async def test_slot_action_all_404_raises_generic_runtime_error(self, mgr):
+        # Unsupported on every shape → unchanged generic RuntimeError (→ 500),
+        # NOT an EngineSlotError. Probes all three shapes, and the final error
+        # carries the FIRST probe's body, never a later probe's.
+        fake = _FakeSlotClient([
+            _FakeSlotResponse(404, "FIRST-MARKER-aaa"),
+            _FakeSlotResponse(404, "SECOND-MARKER-bbb"),
+            _FakeSlotResponse(404, "THIRD-MARKER-ccc"),
+        ])
+        mgr.client = fake
+        state_path = mgr.save_state_dir / "m.gguf.default.bin"
+        with pytest.raises(RuntimeError) as exc:
+            await mgr._perform_slot_action("save", 19500, state_path)
+        assert not isinstance(exc.value, server.EngineSlotError)
+        assert len(fake.calls) == 3
+        msg = str(exc.value)
+        assert "failed across all slot endpoints" in msg
+        assert "FIRST-MARKER-aaa" in msg
+        assert "SECOND-MARKER-bbb" not in msg
+        assert "THIRD-MARKER-ccc" not in msg
+
+    async def test_slot_action_5xx_with_structured_body_stays_generic_500(self, mgr):
+        # A 5xx that DOES carry a structured error body must NOT become an
+        # EngineSlotError: the status_code < 500 gate wins, the >=500 break fires,
+        # and the result is the generic RuntimeError (→ caller 500). Locks the
+        # load-bearing interaction between the structured check and the 5xx break.
+        fake = _FakeSlotClient([
+            _FakeSlotResponse(500, '{"error":{"code":"oom","message":"upstream OOM"}}'),
+        ])
+        mgr.client = fake
+        state_path = mgr.save_state_dir / "m.gguf.default.bin"
+        with pytest.raises(RuntimeError) as exc:
+            await mgr._perform_slot_action("save", 19500, state_path)
+        assert not isinstance(exc.value, server.EngineSlotError)
+        assert len(fake.calls) == 1  # >=500 break: no further probing
+        assert "failed across all slot endpoints" in str(exc.value)
+
+    async def test_slot_action_forwards_engine_status_verbatim(self, mgr):
+        # The loader does NOT infer a status: it forwards the engine's own 4xx.
+        # A structured refusal the engine returned as 409 must surface as 409.
+        fake = _FakeSlotClient([
+            _FakeSlotResponse(409, '{"error":{"code":"kv_capacity_exceeded",'
+                                   '"message":"does not fit the free KV capacity",'
+                                   '"type":"invalid_request_error"}}'),
+        ])
+        mgr.client = fake
+        state_path = mgr.save_state_dir / "m.gguf.default.bin"
+        with pytest.raises(server.EngineSlotError) as exc:
+            await mgr._perform_slot_action("restore", 19500, state_path)
+        assert exc.value.status_code == 409  # engine's status, forwarded verbatim
+
+    async def test_save_state_surfaces_engine_refusal_as_400(self, mgr):
+        # End-to-end: the caller must turn a structured engine refusal into a
+        # clean 400 carrying the engine's message, NOT a 500.
+        from fastapi import HTTPException
+        fake = _FakeSlotClient([
+            _FakeSlotResponse(400, '{"error":{"code":"slot_save_failed",'
+                                   '"message":"slot holds no retained session",'
+                                   '"type":"invalid_request_error"}}'),
+        ])
+        mgr.client = fake
+        with pytest.raises(HTTPException) as exc:
+            await mgr.save_state("m.gguf", "default")
+        assert exc.value.status_code == 400
+        assert exc.value.detail == "slot holds no retained session"
+        assert len(fake.calls) == 1
+
+    async def test_save_state_all_404_still_returns_500(self, mgr):
+        # Unsupported-shape path is unchanged: still a 500.
+        from fastapi import HTTPException
+        fake = _FakeSlotClient([_FakeSlotResponse(404, "") for _ in range(3)])
+        mgr.client = fake
+        with pytest.raises(HTTPException) as exc:
+            await mgr.save_state("m.gguf", "default")
+        assert exc.value.status_code == 500
 
 
 # ===========================================================================
