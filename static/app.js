@@ -179,6 +179,7 @@ function buildButtonRowHTML(m) {
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
     <button data-act="copy-id">Copy ID</button>
+    ${m.engine === 'llama' ? '<button data-act="chat">Chat</button>' : ''}
     ${(m.engine === 'llama' || m.engine === 'strata' || m.engine === 'ninfer') ? '<button data-act="states">States</button>' : ''}
     ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>' + (isDeleteInFlight ? 'Deleting...' : 'Delete') + '</button>' : ''}
   `;
@@ -621,6 +622,9 @@ async function handleAction(id, act, btn) {
     }
     if (act === 'states') {
       openStateModal(id);
+    }
+    if (act === 'chat') {
+      openChatModal(id);
     }
     if (act === 'toggle-vision') {
       const res = await apiJSON(`/v1/models/${encodeURIComponent(id)}/vision/toggle`, {method:'POST'});

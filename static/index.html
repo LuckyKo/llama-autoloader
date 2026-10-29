@@ -331,6 +331,36 @@ Example cURL:
   </div>
 </div>
 
+<!-- Omni chat modal (testing tool for poking loaded models) -->
+<div class="modal-overlay" id="chat-overlay">
+  <div class="modal">
+    <h2>Chat · <span id="chat-model-id" style="color:var(--accent2);"></span></h2>
+    <!-- Shown only when the bound model is not loaded. -->
+    <div id="chat-load-row" style="display:none;">
+      <div class="form-row">
+        <label>Model not loaded</label>
+        <button class="primary" id="chat-load-btn">Load model</button>
+      </div>
+    </div>
+    <!-- Shown when the model is loaded. Attach row is gated on m.multimodal in JS. -->
+    <div id="chat-body" style="display:none;">
+      <div class="chat-messages" id="chat-messages"></div>
+      <div class="chat-attach" id="chat-attach-row" style="display:none;">
+        <input type="file" id="chat-file" accept=".jpg,.jpeg,.png,.tga,.bmp,.gif,.mp3,.wav,.flac,.mp4,.mov,.webm">
+        <span id="chat-file-name"></span>
+      </div>
+      <div class="chat-input-row">
+        <textarea id="chat-input" placeholder="Message… (Enter to send, Shift+Enter for a newline)"></textarea>
+        <button class="primary" id="chat-send">Send</button>
+      </div>
+    </div>
+    <div class="btn-row" style="justify-content:flex-end;margin-top:16px;">
+      <button id="chat-close">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/chat.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
