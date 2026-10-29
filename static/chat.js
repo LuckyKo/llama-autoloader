@@ -189,8 +189,16 @@ function buildUserParts(text) {
 }
 
 function toApiMsg(msg) {
-  if (msg.role === 'user') return { role: 'user', content: msg.parts };
-  return { role: 'assistant', content: msg.parts.map(p => p.text).join('') };
+  if (msg.role === 'assistant') return { role: 'assistant', content: msg.parts.map(p => p.text).join('') };
+  // Text-only user turn -> send plain string content (max compatibility with non-llama
+  // engines like strata/ninfer that may not accept the typed content-parts array).
+  // Use the typed parts array only when real media is attached (only for m.multimodal models).
+  const media = msg.parts.filter(p => p.type !== 'text');
+  if (media.length === 0) {
+    const text = msg.parts.filter(p => p.type === 'text').map(p => p.text).join('');
+    return { role: 'user', content: text };
+  }
+  return { role: 'user', content: msg.parts };
 }
 
 async function sendMessage() {

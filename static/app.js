@@ -157,6 +157,13 @@ function getInFlightState(id) {
   };
 }
 
+// Engines that serve OpenAI-compatible chat/state endpoints (llama/strata/ninfer).
+// Shared by buildButtonRowHTML (Chat/States buttons) and updateButtonRow (row-rebuild trigger)
+// so the two can never drift out of sync.
+function servesChatEndpoints(m) {
+  return m.engine === 'llama' || m.engine === 'strata' || m.engine === 'ninfer';
+}
+
 function buildButtonRowHTML(m) {
   const { act, isLoadInFlight, isUnloadInFlight, isVisionInFlight, isDeleteInFlight } = getInFlightState(m.id);
 
@@ -173,14 +180,19 @@ function buildButtonRowHTML(m) {
     loadBtn = `<button class="primary" data-act="load" ${isLoadInFlight ? 'disabled' : ''}>${isLoadInFlight ? 'Loading...' : 'Load'}</button>`;
   }
 
+  // Chat/States buttons are gated on the shared chat-capable-engine predicate; the
+  // chat panel's multimodal-attach and Speak sub-features are additionally gated
+  // by m.multimodal / m.audio, so text-only engine cards get a plain-text chat panel.
+  const servesChat = servesChatEndpoints(m);
+
   return `
     ${loadBtn}
     <button data-act="edit" ${act ? 'disabled' : ''}>Edit</button>
     ${visionBtn}
     <button data-act="copy-curl">cURL</button>
     <button data-act="copy-id">Copy ID</button>
-    ${m.engine === 'llama' ? '<button data-act="chat">Chat</button>' : ''}
-    ${(m.engine === 'llama' || m.engine === 'strata' || m.engine === 'ninfer') ? '<button data-act="states">States</button>' : ''}
+    ${servesChat ? '<button data-act="chat">Chat</button>' : ''}
+    ${servesChat ? '<button data-act="states">States</button>' : ''}
     ${m.engine !== 'llama' ? '<button class="danger" data-act="delete" ' + (act ? 'disabled' : '') + '>' + (isDeleteInFlight ? 'Deleting...' : 'Delete') + '</button>' : ''}
   `;
 }
@@ -200,7 +212,7 @@ function updateButtonRow(card, m) {
   const currentHasVision = !!btnRow.querySelector('button[data-act="toggle-vision"]');
   const currentHasStates = !!btnRow.querySelector('button[data-act="states"]');
   if (currentLoaded !== !!m.loaded || currentHasVision !== !!m.has_mmproj ||
-      currentHasStates !== (m.engine === 'llama' || m.engine === 'strata' || m.engine === 'ninfer')) {
+      currentHasStates !== servesChatEndpoints(m)) {
     btnRow.innerHTML = buildButtonRowHTML(m);
     return;
   }
