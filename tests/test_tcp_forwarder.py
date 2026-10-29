@@ -1012,3 +1012,138 @@ class TestDeclaredBodyTimeout:
                 except OSError:
                     pass
 
+
+# --------------------------------------------------------------------------- _rewrite_model_in_body
+class TestRewriteModelInBody:
+    """Unit tests for the model-field rewrite used when the forwarder falls back to a
+    resident model for an unrecognised name."""
+
+    def test_replaces_model_value(self):
+        body = b'{"model": "whatever", "messages": []}'
+        headers = b"Content-Length: 37\r\n"  # len(body) = 37
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert b'"model": "ninfer-7b"' in new_b
+        assert b"whatever" not in new_b
+        # Content-Length adjusted: "whatever"=8, "ninfer-7b"=9 → +1 → 37+1=38
+        assert b"Content-Length: 38" in new_h
+
+    def test_same_model_unchanged(self):
+        body = b'{"model": "ninfer-7b"}'
+        headers = b"Content-Length: 18\r\n"
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "ninfer-7b", "ninfer-7b")
+        assert new_h == headers
+        assert new_b == body
+
+    def test_no_model_field_unchanged(self):
+        body = b'{"messages": []}'
+        headers = b"Content-Length: 15\r\n"
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert new_h == headers
+        assert new_b == body
+
+    def test_longer_to_shorter_name(self):
+        body = b'{"model": "a-very-long-model-name-q4_k_m.gguf"}'
+        headers = b"Content-Length: 47\r\n"  # len(body) = 47
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "a-very-long-model-name-q4_k_m.gguf", "m")
+        assert b'"model": "m"' in new_b
+        # old value 34 chars, new value 1 char → -33 → 47-33=14
+        assert b"Content-Length: 14" in new_h
+
+    def test_no_content_length_header(self):
+        body = b'{"model": "x"}'
+        headers = b"Host: localhost\r\n"
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "x", "yy")
+        assert b'"model": "yy"' in new_b
+        assert new_h == headers  # no CL to adjust
+
+
+# --------------------------------------------------------------------------- model-fallback routing
+class TestModelFallbackRouting:
+    """Verify that an unrecognised model ID is routed to the loaded model and the
+    request body is rewritten so the engine sees its own name."""
+
+    def _make_manager_with_loaded(self, model_id="ninfer-7b", port=9001):
+        """A minimal fake model_manager with one loaded, ready model."""
+        class _LM:
+            def __init__(self, port):
+                self.port = port
+                self.ready = True
+                self.generation = 1
+                self.last_used = time.monotonic()
+            def touch(self):
+                self.last_used = time.monotonic()
+
+        class _QueueReg:
+            def get_or_create(self, port, mid):
+                return mid
+
+        class _Mgr:
+            def __init__(self):
+                self.loaded = {model_id: _LM(port)}
+                self.queue_registry = _QueueReg()
+                self._main_loop = None
+
+            async def resolve_request_model(self, model_id):
+                # Mimic the real resolver: unknown → fall back to loaded
+                if model_id in self.loaded:
+                    return model_id
+                return next(iter(self.loaded.keys())) if self.loaded else None
+
+        return _Mgr()
+
+    def test_resolve_target_falls_back_to_loaded(self):
+        f = _fwd()
+        f.model_manager = self._make_manager_with_loaded()
+        # "whatever" is not in the registry → should resolve to "ninfer-7b" on port 9001
+        target = f._resolve_target("whatever")
+        assert target is not None
+        port, gen, resolved_mid = target
+        assert port == 9001
+        assert resolved_mid == "ninfer-7b"
+
+    def test_resolve_target_exact_match(self):
+        f = _fwd()
+        f.model_manager = self._make_manager_with_loaded()
+        target = f._resolve_target("ninfer-7b")
+        assert target is not None
+        port, gen, resolved_mid = target
+        assert port == 9001
+        assert resolved_mid == "ninfer-7b"
+
+    def test_resolve_target_no_loaded_models(self):
+        f = _fwd()
+        mgr = self._make_manager_with_loaded()
+        mgr.loaded = {}
+        f.model_manager = mgr
+        target = f._resolve_target("whatever")
+        assert target is None
+
+    def test_body_rewrite_on_fallback(self):
+        """The full path: wrong model ID → body rewritten to the loaded model's name."""
+        f = _fwd()
+        f.model_manager = self._make_manager_with_loaded()
+        body = b'{"model": "whatever", "stream": true}'
+        headers = b"Content-Length: 33\r\n"
+        target = f._resolve_target("whatever")
+        assert target is not None
+        _port, _gen, resolved_model_id = target
+        assert resolved_model_id == "ninfer-7b"
+        new_h, new_b = f._rewrite_model_in_body(
+            headers, body, "whatever", resolved_model_id)
+        assert b'"model": "ninfer-7b"' in new_b
+        assert b"whatever" not in new_b
+
+    def test_chunked_body_skips_rewrite(self):
+        """Transfer-Encoding: chunked bodies must not be rewritten (chunk framing would break)."""
+        body = b'{"model": "whatever"}'
+        headers = b"Transfer-Encoding: chunked\r\n"
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert new_h == headers
+        assert new_b == body  # unchanged
+

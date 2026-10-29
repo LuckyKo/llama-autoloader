@@ -848,15 +848,22 @@ class RawTCPForwarder:
                     return
                 target = self._resolve_target(model_id)
                 if target:
-                    target_port, target_generation = target
+                    target_port, target_generation, resolved_model_id = target
+                    # The engine expects its own model name; when the forwarder fell back
+                    # to a resident model for an unrecognised name, rewrite the body so the
+                    # engine sees the name it was loaded with.
+                    if resolved_model_id != model_id:
+                        raw_headers, body_prefix = self._rewrite_model_in_body(
+                            raw_headers, body_prefix, model_id, resolved_model_id)
+                        log.debug(f"Rewrote model field: '{model_id}' -> '{resolved_model_id}'")
                     # Model already loaded -> pipe directly, but only after acquiring this
                     # model's FIFO ticket. The ticket is granted in strict submission order,
                     # so a state restore enqueued before this request runs first (fixes the
                     # full-reprocess race). No per-request log: this is the hot path.
-                    queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
+                    queue = self.model_manager.queue_registry.get_or_create(target_port, resolved_model_id)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
-                                           target_port, model_id, queue,
-                                           expected_generation=target_generation)
+                                             target_port, resolved_model_id, queue,
+                                             expected_generation=target_generation)
                     return
                 # BUG_0007: a model whose dead-backend reload just failed must not
                 # spawn a fresh multi-minute load attempt on every request. The
@@ -1080,6 +1087,40 @@ class RawTCPForwarder:
             return m.group(1).decode("utf-8", errors="replace")
         return None
 
+    @staticmethod
+    def _rewrite_model_in_body(raw_headers: bytes, body_prefix: bytes,
+                              old_model: str, new_model: str) -> Tuple[bytes, bytes]:
+        """Replace the ``model`` field value in a JSON request body and adjust Content-Length.
+
+        The engine (llama-server / ninfer) rejects requests whose ``model`` field does not
+        match the loaded model name.  When the forwarder falls back to a resident model for
+        an unrecognised name, the body must be rewritten so the engine sees the name it knows.
+
+        Returns ``(new_raw_headers, new_body_prefix)``.  When ``old_model == new_model`` or
+        the field is not found, the originals are returned unchanged.
+        """
+        if old_model == new_model:
+            return raw_headers, body_prefix
+        # Chunked bodies frame each chunk with a hex byte-count prefix; rewriting the
+        # model value changes the chunk's length without updating that prefix, which
+        # would corrupt the framing.  Skip the rewrite for chunked requests.
+        if re.search(rb"(?i)Transfer-Encoding:\s*chunked", raw_headers):
+            return raw_headers, body_prefix
+        m = _MODEL_RE.search(body_prefix)
+        if not m:
+            return raw_headers, body_prefix
+        new_bytes = new_model.encode("utf-8")
+        new_body = body_prefix[:m.start(1)] + new_bytes + body_prefix[m.end(1):]
+        length_diff = len(new_body) - len(body_prefix)
+        if length_diff:
+            cl = re.search(rb"(?i)Content-Length:\s*(\d+)", raw_headers)
+            if cl:
+                new_len = int(cl.group(1)) + length_diff
+                raw_headers = (raw_headers[:cl.start(1)]
+                               + str(new_len).encode()
+                               + raw_headers[cl.end(1):])
+        return raw_headers, new_body
+
     def _read_more_for_model(self, sock: socket.socket, raw_headers: bytes,
                               body_prefix: bytes) -> bytes:
         """Read additional request-body bytes until the `model` field is locatable or EOF.
@@ -1204,13 +1245,14 @@ class RawTCPForwarder:
             log.error(f"Model resolution failed for {model_id!r}: {e}")
             return None
 
-    def _resolve_target(self, model_id: str) -> Optional[Tuple[int, int]]:
-        """Return ``(port, engine_generation)`` for a loaded, ready model.
+    def _resolve_target(self, model_id: str) -> Optional[Tuple[int, int, str]]:
+        """Return ``(port, engine_generation, resolved_model_id)`` for a loaded, ready model.
 
         Resolves via :meth:`_resolve_request_model` on the MAIN event loop (never a fresh
         one). The generation is the identity token used to keep recovery and active-
         request accounting bound to THIS engine instance even after its stable port is
-        reused by a reload.
+        reused by a reload. The resolved model id is the actual loaded model name, which
+        may differ from the requested name when the fallback kicks in.
 
         ``resolve_request_model`` (not the strict variant) is deliberate: an inference
         request naming a model we do not recognise must be served by the already-loaded
@@ -1218,6 +1260,16 @@ class RawTCPForwarder:
         them could act on an unrelated resident model.
         """
         resolved_mid = self._resolve_request_model(model_id)
+        if not resolved_mid:
+            # Direct fallback: the async resolver can return None if the main loop is
+            # busy or the 5 s timeout expires. In that case, serve the first loaded
+            # model directly.  dict() takes an atomic C-level snapshot under the GIL,
+            # so the subsequent iteration is safe even if the main loop concurrently
+            # adds/removes a model (idle reaper / LRU eviction / load).
+            loaded = dict(self.model_manager.loaded) if self.model_manager else {}
+            if loaded:
+                ready = [m for m, lm in loaded.items() if lm.ready]
+                resolved_mid = ready[0] if ready else next(iter(loaded.keys()))
         if not resolved_mid:
             return None
 
@@ -1233,7 +1285,7 @@ class RawTCPForwarder:
         # raw-TCP path. touch() only writes a float (atomic under the GIL), so it is
         # safe to call from this worker thread without the manager's asyncio lock.
         lm.touch()
-        return lm.port, int(getattr(lm, "generation", 0) or 0)
+        return lm.port, int(getattr(lm, "generation", 0) or 0), resolved_mid
 
     def _resolve_target_port(self, model_id: str) -> Optional[int]:
         """Backwards-compatible port-only view of :meth:`_resolve_target`."""
@@ -1608,7 +1660,8 @@ class RawTCPForwarder:
             self._bidirectional_pipe(
                 client_sock, target_sock, liveness_check=liveness_check,
                 response_started=response_started,
-                on_response_started=on_response_started)
+                on_response_started=on_response_started,
+                cors_pending=(tracking and not response_started))
         finally:
             if tracking:
                 self._unregister_active(target_port, engine_generation,
@@ -1635,9 +1688,12 @@ class RawTCPForwarder:
         No TTFB measurement and no Cache-Status header are emitted here: prompt-cache hit/miss is
         now classified authoritatively by AC from llama.cpp's ``cached_tokens`` in the usage object.
         """
-        # Pure poll: timeout 0.0 means "return immediately" — no waiting for the backend's first
-        # bytes. Warm-cache hits have their head already in the kernel buffer and are caught here;
-        # cold misses return empty instantly and skip injection, so the data path is never delayed.
+        # Zero-wait poll: timeout 0.0 means "return immediately" — no waiting for the
+        # backend's first bytes.  A 0.5 s wait here blocks the pipe start while the
+        # engine is already generating tokens into the kernel buffer; if that buffer
+        # fills the engine blocks on write, holding its KV-cache slot and causing
+        # "context cache exhausted" under load.  CORS injection for the cold path is
+        # now handled inside _bidirectional_pipe on the first data chunk (zero delay).
         try:
             ready, _, _ = select.select([target_sock], [], [], 0.0)
         except (OSError, ValueError):
@@ -1676,7 +1732,8 @@ class RawTCPForwarder:
     def _bidirectional_pipe(self, sock_a: socket.socket, sock_b: socket.socket,
                             liveness_check: Optional[Callable[[], bool]] = None,
                             response_started: bool = False,
-                            on_response_started: Optional[Callable[[], None]] = None) -> None:
+                            on_response_started: Optional[Callable[[], None]] = None,
+                            cors_pending: bool = False) -> None:
         """Pipe bytes between two blocking sockets until both directions are closed.
 
         ``sock_a`` is the client-facing socket and ``sock_b`` the backend. When
@@ -1745,6 +1802,14 @@ class RawTCPForwarder:
                     else:
                         if sock is sock_b:
                             last_backend_activity = time.monotonic()
+                            # Zero-delay CORS injection: if the pre-pipe peek missed the
+                            # head (cold response), inject into the first data chunk here.
+                            # Only fires once, only when the head is complete in this
+                            # chunk; otherwise the data is forwarded as-is.
+                            if cors_pending and not response_started:
+                                if b"\r\n\r\n" in data:
+                                    data = _inject_cors_headers(data)
+                                cors_pending = False
                         try:
                             other.sendall(data)
                         except (ConnectionResetError, BrokenPipeError, OSError):
