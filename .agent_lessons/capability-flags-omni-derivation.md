@@ -46,3 +46,17 @@ Key decisions:
 - **`_fwd()` has `model_manager=None`**: integration tests that drive `_handle_connection` through
   the POST/WS path need `f.model_manager = MagicMock()` with `queue_registry.get_or_create` mocked,
   or the code crashes at `self.model_manager.queue_registry.get_or_create(...)`.
+
+## Addendum 2026-10-29 — running process can be STALE vs this fix
+
+While building the WebUI omni-chat panel ([[omni-chat-webui-panel]]), a live probe of the running
+autoloader on :1234 returned `multimodal=False, audio=False` for `LFM3-Omni-2B-Q8_0.gguf`
+(`model_type=text`, `tags=['omni']`, `has_mmproj=true`). The source tree is correct: the capability-set
+derivation above is present at `server.py:4811-4816`, which for those exact tags/flags evaluates to
+`multimodal=True, audio=True`. The running process simply predates the fix.
+
+Takeaway: a `False/False` from `/v1/models` against the live :1234 server is NOT evidence the
+derivation is broken — it is evidence the process is stale. Reconcile by reading `server.py` (the
+source), not the running process, and restart the server before trusting capability flags from a live
+probe. The frontend gate logic (reads `m.multimodal`/`m.audio`) is correct either way; it just
+reflects whatever the running server reports.

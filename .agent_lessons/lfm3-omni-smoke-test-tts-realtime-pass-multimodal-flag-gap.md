@@ -4,6 +4,8 @@ aliases: [omni-smoke-test, lfm3-tts-realtime-verified, multimodal-flag-gap]
 related: [[autoloader-1234-is-agents-own-llm-control-plane]], [[start-bat-port-wait-relaunch]]
 confidence: verified
 author: coder_omni-live-smoke_20261029_092439.jsonl
+contributors:
+  - coder_omni-chat-verify_20261029_122437.jsonl
 ---
 
 # LFM3-Omni smoke test: /tts + /v1/realtime routing PASS; `multimodal` flag false (classifier gap)
@@ -43,3 +45,23 @@ reported, not applied.
   artifact `temp/omni_smoke_results.json`. Each endpoint hit exactly once (GPU-tight box).
 - Cleanup verified: `POST /v1/models/LFM3-Omni-2B-Q8_0/unload` → llama-server pid gone,
   autoloader left running (it is the control plane — see [[autoloader-1234-is-agents-own-llm-control-plane]]).
+
+## Addendum (2026-10-29 12:26, llama-autoloader @ HEAD `b81c6b5`) — GAP CLOSED
+The earlier `multimodal:false / audio:false` was a **stale-process** artifact, not a live defect:
+PID 29044 started 09:25:57, **before** the capability-set fix `482b92b` (committed 10:48:42). The
+suggested one-word `type_override:"vision"` config fix above was **superseded** — the shipped fix
+is the code-level capability-set derivation in `server.py` `_models_list` payload builder
+(`"multimodal": (model_type==VISION or "omni" in tags or "vision" in tags or has_mmproj)`;
+`"audio": (model_type==AUDIO or "omni" in tags)`), so the sidecar was left at `type_override:""`
+and the model still classifies as `model_type:"text"`.
+
+Verified on a fresh restart (`restart.bat` → PID 14420, up on :1234/:1235) via `GET /v1/models`:
+- **Positive gate CONFIRMED.** `LFM3-Omni-2B-Q8_0.gguf` → `model_type:"text"`, `tags:["omni"]`,
+  `has_mmproj:true`, **`multimodal:true`, `audio:true`** (both OR-clauses fire via `"omni" in tags`).
+- **Negative gate CONFIRMED (not always-true).** text models w/o mmproj/omni → `multimodal:false,
+  audio:false`. Tally across 27 listed models: 7 `multimodal:true`, 5 `audio:true` — flags are
+  per-card, not constant. See [[omni-capability-flags-derive-from-tags]].
+- Flags are **discovery-derived, not load-derived** — `/v1/models` returns them for all discovered
+  cards regardless of `loaded`. So the capability gate is testable WITHOUT loading the model; loading
+  only flips the separate `loaded` field (and on this GPU-tight box risks OOM).
+- Autoloader left running on current code (control plane).

@@ -41,6 +41,9 @@
   "slot-action-probe-loop-hides-engine-error.md": 2,
   "engine-generation-token-always-positive-sole-writer.md": 1,
   "mmproj-pairing-heuristic-and-provenance.md": 1,
-  "start-bat-port-wait-relaunch.md": 1,
-  "lfm3-omni-smoke-test-tts-realtime-pass-multimodal-flag-gap.md": 1
+  "start-bat-port-wait-relaunch.md": 2,
+  "lfm3-omni-smoke-test-tts-realtime-pass-multimodal-flag-gap.md": 3,
+  "capability-flags-omni-derivation.md": 2,
+  "autoloader-1234-is-agents-own-llm-control-plane.md": 1,
+  "omni-chat-webui-panel.md": 1
 }
