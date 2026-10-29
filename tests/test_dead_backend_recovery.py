@@ -752,7 +752,7 @@ def test_resolve_target_carries_engine_generation(monkeypatch):
     f = _fwd(mgr)
     monkeypatch.setattr(f, "_resolve_request_model", lambda model_id: "m.gguf")
 
-    assert f._resolve_target("alias") == (9001, 42)
+    assert f._resolve_target("alias") == (9001, 42, "m.gguf")
     # The old port-only helper must keep working and agree with the new target.
     assert f._resolve_target_port("alias") == 9001
 

@@ -934,6 +934,10 @@ async function refreshAll() {
       model_type_override: d.model_type_override || '',
       model_type_label: d.model_type_label || '',
       arch: d.arch || '',
+      // Omni capability flags (server-derived, single source of truth in /v1/models):
+      // gate the chat UI's image/audio/video attach (multimodal) and TTS "speak" (audio).
+      multimodal: !!d.multimodal,
+      audio: !!d.audio,
       auxiliary: !!d.auxiliary,
       // Bridge-card fields (defaulted for llama cards).
       engine: d.engine || 'llama',
