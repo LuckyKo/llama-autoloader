@@ -275,6 +275,106 @@ class TestListModels:
             assert isinstance(m["size_mb"], (int, float))
             assert m["size_mb"] >= 0.0
 
+    @pytest.mark.asyncio
+    async def test_model_type_present_for_capability_flags(self, manager):
+        """model_type (input to multimodal/audio flag derivation) is always present and valid."""
+        from server import VALID_MODEL_TYPES
+        models = await manager.list_models()
+        for m in models:
+            assert "model_type" in m
+            assert m["model_type"] in VALID_MODEL_TYPES
+
+    @pytest.mark.asyncio
+    async def test_capability_flags_present_and_correct(self, tmp_path):
+        """multimodal and audio flags exist and match the capability-set derivation.
+
+        multimodal = model_type==vision OR "omni" in tags OR "vision" in tags OR has_mmproj
+        audio      = model_type==audio  OR "omni" in tags
+        (audio relies on tags, not arch names — a second hardcoded list is out of scope)
+        """
+        import server
+        from server import ModelManager
+        from starlette.testclient import TestClient
+
+        models_dir = tmp_path / "models"
+        models_dir.mkdir()
+
+        # 1. Vision model (model_type=vision, no tags)
+        (models_dir / "vision-model.gguf").write_bytes(b"GGUF" * 10)
+        (models_dir / "vision-model.gguf.json").write_text(
+            json.dumps({"name": "Vision", "type_override": "vision"})
+        )
+        # 2. Omni model (tags include "omni", model_type=text)
+        (models_dir / "omni-model.gguf").write_bytes(b"GGUF" * 10)
+        (models_dir / "omni-model.gguf.json").write_text(
+            json.dumps({"name": "Omni", "tags": ["omni"]})
+        )
+        # 3. TTS model (model_type=audio)
+        (models_dir / "tts-model.gguf").write_bytes(b"GGUF" * 10)
+        (models_dir / "tts-model.gguf.json").write_text(
+            json.dumps({"name": "TTS", "type_override": "audio"})
+        )
+        # 4. Plain text model (no tags, no mmproj)
+        (models_dir / "text-model.gguf").write_bytes(b"GGUF" * 10)
+        (models_dir / "text-model.gguf.json").write_text(
+            json.dumps({"name": "Text"})
+        )
+        # 5. has_mmproj-only model (text type, no tags, but has a paired mmproj)
+        (models_dir / "clip-model.gguf").write_bytes(b"GGUF" * 10)
+        (models_dir / "clip-model.gguf.json").write_text(
+            json.dumps({"name": "Mmproj"})
+        )
+        (models_dir / "mmproj-clip-model.gguf").write_bytes(b"GGUF" * 5)
+        # 6. vision-tag-only model (text type, tags=["vision"], no mmproj)
+        (models_dir / "vision-tag.gguf").write_bytes(b"GGUF" * 10)
+        (models_dir / "vision-tag.gguf.json").write_text(
+            json.dumps({"name": "VisionTag", "tags": ["vision"]})
+        )
+
+        cfg = _make_cfg({
+            "models": {
+                "root_dir": str(models_dir),
+                "save_state_dir": str(tmp_path / "states"),
+            },
+        })
+        mgr = ModelManager(cfg)
+        mgr.scan()
+
+        # Patch the module-level manager so the route handler sees our test manager.
+        orig_manager = server.manager
+        server.manager = mgr
+        try:
+            client = TestClient(server.app)
+            resp = client.get("/v1/models")
+            assert resp.status_code == 200
+            data = {m["name"]: m for m in resp.json()["data"]}
+
+            # Vision (model_type=vision): multimodal=True, audio=False
+            assert data["Vision"]["multimodal"] is True
+            assert data["Vision"]["audio"] is False
+
+            # Omni (tag "omni"): multimodal=True, audio=True
+            assert data["Omni"]["multimodal"] is True
+            assert data["Omni"]["audio"] is True
+
+            # TTS (model_type=audio): multimodal=False, audio=True
+            assert data["TTS"]["multimodal"] is False
+            assert data["TTS"]["audio"] is True
+
+            # Text (no tags, no mmproj): both False
+            assert data["Text"]["multimodal"] is False
+            assert data["Text"]["audio"] is False
+
+            # Mmproj (has_mmproj=True): multimodal=True (mmproj clause), audio=False
+            assert data["Mmproj"]["multimodal"] is True
+            assert data["Mmproj"]["audio"] is False
+
+            # VisionTag (tags=["vision"]): multimodal=True (tag clause), audio=False
+            assert data["VisionTag"]["multimodal"] is True
+            assert data["VisionTag"]["audio"] is False
+        finally:
+            server.manager = orig_manager
+
 
 # ---------------------------------------------------------------------------
 # get_config() / update_config()

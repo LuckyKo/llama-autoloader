@@ -34,7 +34,7 @@ engines:
     serve_script: N:/work/WD/Strata/serve/server.py
   ninfer:
     argv:
-    - 'N:/work/WD/ninfer-all/build-win-120a/apps/ninfer-serve.exe'
+    - N:/work/WD/ninfer-all/build-win-120a/apps/ninfer-serve.exe
     - '{artifact}'
     - --port
     - '{port}'
@@ -42,7 +42,6 @@ engines:
     - 127.0.0.1
     - --model-id
     - '{model_id}'
-    - --wddm-evictable-budget
     - --slot-save-path
     - N:/work/stuff/Beta/llama-autoloader/states
     configs_dir: N:/work/WD/ninfer-all/ninfer-cards
@@ -62,7 +61,7 @@ llama_server:
   binary: llama-server
   default_args: --no-webui --parallel 1 --jinja --kv-unified --cache-ram 32768
   default_n_gpu_layers: 999
-  selected_backend: llama.cpp-win-x86_64-nvidia-cuda13-avx2-0.6.0-custom-d6572889c
+  selected_backend: llama.cpp-win-x86_64-nvidia-cuda13-avx2-0.8.0-custom-0d334f85e
 logging:
   backup_count: 5
   enabled: true
@@ -77,3 +76,4 @@ models:
   root_dir: n:/work/stuff/Beta
   save_state_dir: N:/work/stuff/Beta/llama-autoloader/states
   save_state_max_keep: 3
+  save_state_max_bytes: 17179869184

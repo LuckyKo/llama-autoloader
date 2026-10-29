@@ -1061,6 +1061,69 @@ class TestRewriteModelInBody:
         assert b'"model": "yy"' in new_b
         assert new_h == headers  # no CL to adjust
 
+    @staticmethod
+    def _content_length(raw_headers: bytes) -> int:
+        return int(raw_headers.split(b"Content-Length: ")[1].split(b"\r\n")[0])
+
+    def test_nested_model_before_top_level_is_left_alone(self):
+        """A tool schema's `"model"` string must not be mistaken for the request model."""
+        body = (b'{"tools": [{"parameters": {"model": "other"}}], '
+                b'"model": "whatever", "stream": true}')
+        headers = f"Content-Length: {len(body)}\r\n".encode()
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert b'"model": "other"' in new_b          # nested schema untouched
+        assert b'"model": "ninfer-7b"' in new_b      # top-level rewritten
+        assert self._content_length(new_h) == len(new_b)
+
+    def test_nested_model_with_same_value_is_not_rewritten(self):
+        """When the same string also appears nested, only the top-level value changes."""
+        body = (b'{"tools": [{"parameters": {"model": "whatever"}}], '
+                b'"model": "whatever"}')
+        headers = f"Content-Length: {len(body)}\r\n".encode()
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert new_b.count(b'"model": "whatever"') == 1  # nested copy kept
+        assert new_b.count(b'"model": "ninfer-7b"') == 1
+        assert self._content_length(new_h) == len(new_b)
+
+    def test_nested_only_model_is_not_rewritten(self):
+        """Without a top-level `model` field the body is returned unchanged."""
+        body = b'{"tools": [{"parameters": {"model": "whatever"}}]}'
+        headers = f"Content-Length: {len(body)}\r\n".encode()
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert new_h == headers
+        assert new_b == body
+
+    def test_top_level_value_mismatch_unchanged(self):
+        """Never rewrite a top-level model that is not the value being replaced."""
+        body = b'{"model": "actual-model", "stream": true}'
+        headers = f"Content-Length: {len(body)}\r\n".encode()
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert new_h == headers
+        assert new_b == body
+
+    def test_escaped_quotes_in_earlier_string_do_not_confuse_scanner(self):
+        body = (b'{"note": "he said \\"model\\": \\"whatever\\"", '
+                b'"model": "whatever"}')
+        headers = f"Content-Length: {len(body)}\r\n".encode()
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert b'he said \\"model\\": \\"whatever\\"' in new_b  # note untouched
+        assert b'"model": "ninfer-7b"' in new_b
+        assert self._content_length(new_h) == len(new_b)
+
+    def test_truncated_prefix_without_top_level_model_unchanged(self):
+        """A truncated body that has not reached the top-level model is left alone."""
+        body = b'{"messages": [{"content": "unterminated'
+        headers = f"Content-Length: {len(body) + 100}\r\n".encode()
+        new_h, new_b = RawTCPForwarder._rewrite_model_in_body(
+            headers, body, "whatever", "ninfer-7b")
+        assert new_h == headers
+        assert new_b == body
+
 
 # --------------------------------------------------------------------------- model-fallback routing
 class TestModelFallbackRouting:
@@ -1146,4 +1209,262 @@ class TestModelFallbackRouting:
             headers, body, "whatever", "ninfer-7b")
         assert new_h == headers
         assert new_b == body  # unchanged
+
+
+# --------------------------------------------------------------------------- omni model endpoints
+class TestOmiPostEndpoints:
+    """Model-scoped POST endpoints (/tts, /v1/audio/transcriptions, /v1/messages) are LLM endpoints."""
+
+    def test_tts_is_llm_endpoint(self):
+        assert RawTCPForwarder._is_llm_endpoint("/tts") is True
+
+    def test_v1_audio_transcriptions_is_llm_endpoint(self):
+        assert RawTCPForwarder._is_llm_endpoint("/v1/audio/transcriptions") is True
+
+    def test_v1_messages_is_llm_endpoint(self):
+        assert RawTCPForwarder._is_llm_endpoint("/v1/messages") is True
+
+    def test_tts_with_query_string(self):
+        assert RawTCPForwarder._is_llm_endpoint("/tts?x=1") is True
+
+    def test_api_v1_tts_is_llm_endpoint(self):
+        assert RawTCPForwarder._is_llm_endpoint("/api/v1/tts") is True
+
+    def test_tts_body_model_extraction(self):
+        """The standard body-extraction mechanism works for /tts bodies."""
+        f = _fwd()
+        body = b'{"model": "lfm3-omni", "voice": "alice", "text": "hello"}'
+        assert f._extract_model(body) == "lfm3-omni"
+
+    def test_transcriptions_body_model_extraction(self):
+        f = _fwd()
+        body = b'{"model": "lfm3-omni", "file": "audio.mp3"}'
+        assert f._extract_model(body) == "lfm3-omni"
+
+
+class TestIsWsModelEndpoint:
+    """/v1/realtime is recognized as a WebSocket model endpoint."""
+
+    def test_v1_realtime_is_ws_model_endpoint(self):
+        assert RawTCPForwarder._is_ws_model_endpoint("/v1/realtime") is True
+
+    def test_v1_realtime_with_query(self):
+        assert RawTCPForwarder._is_ws_model_endpoint("/v1/realtime?model=lfm3-omni") is True
+
+    def test_api_v1_realtime(self):
+        assert RawTCPForwarder._is_ws_model_endpoint("/api/v1/realtime?model=x") is True
+
+    def test_not_llm_endpoint(self):
+        """/v1/realtime is NOT an LLM endpoint (it's a WS model endpoint)."""
+        assert RawTCPForwarder._is_llm_endpoint("/v1/realtime") is False
+
+    def test_other_paths_not_ws(self):
+        for p in ("/v1/chat/completions", "/tts", "/v1/models", "/ws", "/"):
+            assert RawTCPForwarder._is_ws_model_endpoint(p) is False, p
+
+
+class TestExtractModelFromQuery:
+    """Model extraction from URL query strings (for WS endpoints)."""
+
+    def test_simple_model_param(self):
+        assert RawTCPForwarder._extract_model_from_query("/v1/realtime?model=lfm3-omni") == "lfm3-omni"
+
+    def test_model_with_other_params(self):
+        assert RawTCPForwarder._extract_model_from_query(
+            "/v1/realtime?model=lfm3-omni&voice=alice&debug=true") == "lfm3-omni"
+
+    def test_no_query_string(self):
+        assert RawTCPForwarder._extract_model_from_query("/v1/realtime") is None
+
+    def test_no_model_param(self):
+        assert RawTCPForwarder._extract_model_from_query("/v1/realtime?voice=alice") is None
+
+    def test_empty_model_value(self):
+        assert RawTCPForwarder._extract_model_from_query("/v1/realtime?model=") is None
+
+    def test_model_first_param(self):
+        assert RawTCPForwarder._extract_model_from_query(
+            "/v1/realtime?model=llama-8b&x=1") == "llama-8b"
+
+    def test_percent_encoded_model(self):
+        """%20 is decoded to a space."""
+        assert RawTCPForwarder._extract_model_from_query(
+            "/v1/realtime?model=My%20Model") == "My Model"
+
+    def test_plus_as_space(self):
+        """+ in a query value is decoded as a space (form-encoding convention)."""
+        assert RawTCPForwarder._extract_model_from_query(
+            "/v1/realtime?model=My+Model") == "My Model"
+
+    def test_encoded_plus_is_not_space(self):
+        """%2B is a literal plus, not a space (unquote_plus handles this)."""
+        assert RawTCPForwarder._extract_model_from_query(
+            "/v1/realtime?model=my%2Bmodel") == "my+model"
+
+    def test_plain_model_unchanged(self):
+        """A plain alphanumeric model id is returned as-is (no spurious decoding)."""
+        assert RawTCPForwarder._extract_model_from_query(
+            "/v1/realtime?model=lfm3-omni") == "lfm3-omni"
+
+
+class TestOmiRoutingDecision:
+    """Routing decisions for the new omni endpoints."""
+
+    def test_existing_endpoints_unchanged(self):
+        """Existing LLM endpoints are still recognized; new ones don't interfere."""
+        for p in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
+            assert RawTCPForwarder._is_llm_endpoint(p) is True
+        for p in ("/v1/models", "/v1/status", "/ws"):
+            assert RawTCPForwarder._is_llm_endpoint(p) is False
+            assert RawTCPForwarder._is_ws_model_endpoint(p) is False
+
+
+# --------------------------------------------------------------------------- Integrated routing (handle_connection)
+class TestOmiIntegratedRouting:
+    """_handle_connection-driven tests proving the routing reaches the backend pipe."""
+
+    def test_tts_post_piped_to_backend(self):
+        """A POST /tts with a model in the body is piped to the backend (not FastAPI)."""
+        from unittest.mock import MagicMock
+        f = _fwd()
+        # Provide a mock manager so the queue_registry access doesn't crash.
+        mock_mgr = MagicMock()
+        mock_mgr.queue_registry.get_or_create.return_value = MagicMock()
+        f.model_manager = mock_mgr
+        client, fwd_side, srv = _loopback_client()
+        body = b'{"model": "lfm3-omni", "text": "hi"}'
+        req = (b"POST /tts HTTP/1.1\r\nHost: a\r\n"
+               b"Content-Type: application/json\r\n"
+               b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+               b"Connection: close\r\n\r\n" + body)
+
+        calls = {"pipe": 0, "fastapi": 0}
+        orig_pipe = f._pipe_to_backend
+
+        def _fake_pipe(sock, headers, prefix, port, label):
+            if "internal API" in label:
+                calls["fastapi"] += 1
+            else:
+                calls["pipe"] += 1
+
+        # Patch _resolve_target to return a fake target (port, generation, model_id)
+        f._resolve_target = lambda mid: (9001, 1, mid)
+        # Patch _pipe_with_ticket to count the backend pipe
+        def _fake_ticket(*a, **k):
+            calls["pipe"] += 1
+        f._pipe_with_ticket = _fake_ticket
+        f._pipe_to_backend = _fake_pipe
+
+        def _client():
+            try:
+                client.sendall(req)
+                time.sleep(0.3)
+                client.close()
+            except OSError:
+                pass
+
+        ct = threading.Thread(target=_client, daemon=True)
+        ct.start()
+        try:
+            f._handle_connection(fwd_side)
+        finally:
+            for s in (client, fwd_side, srv):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            f._pipe_to_backend = orig_pipe
+
+        assert calls["pipe"] == 1, "POST /tts should pipe to the backend"
+        assert calls["fastapi"] == 0, "POST /tts must NOT fall through to FastAPI"
+
+    def test_realtime_ws_get_piped_to_backend(self):
+        """A GET /v1/realtime?model=X (WS upgrade) is piped to the backend."""
+        from unittest.mock import MagicMock
+        f = _fwd()
+        mock_mgr = MagicMock()
+        mock_mgr.queue_registry.get_or_create.return_value = MagicMock()
+        f.model_manager = mock_mgr
+        client, fwd_side, srv = _loopback_client()
+        req = (b"GET /v1/realtime?model=lfm3-omni HTTP/1.1\r\nHost: a\r\n"
+               b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               b"Sec-WebSocket-Key: dGhlX3NlY3JldA==\r\n"
+               b"Sec-WebSocket-Version: 13\r\n"
+               b"Connection: close\r\n\r\n")
+
+        calls = {"pipe": 0}
+        f._resolve_target = lambda mid: (9001, 1, mid)
+        f._pipe_with_ticket = lambda *a, **k: calls.__setitem__("pipe", calls["pipe"] + 1)
+
+        def _client():
+            try:
+                client.sendall(req)
+                time.sleep(0.3)
+                client.close()
+            except OSError:
+                pass
+
+        ct = threading.Thread(target=_client, daemon=True)
+        ct.start()
+        try:
+            f._handle_connection(fwd_side)
+        finally:
+            for s in (client, fwd_side, srv):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+        assert calls["pipe"] == 1, "GET /v1/realtime?model=X should pipe to the backend"
+
+    def test_realtime_ws_without_model_returns_400(self):
+        """GET /v1/realtime (no ?model=) returns a 400 error response."""
+        f = _fwd()
+        client, fwd_side, srv = _loopback_client()
+        req = (b"GET /v1/realtime HTTP/1.1\r\nHost: a\r\n"
+               b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               b"Sec-WebSocket-Key: dGhlX3NlY3JldA==\r\n"
+               b"Sec-WebSocket-Version: 13\r\n"
+               b"Connection: close\r\n\r\n")
+
+        calls = {"pipe": 0, "error": 0}
+        f._resolve_target = lambda mid: (9001, 1, mid)
+        f._pipe_with_ticket = lambda *a, **k: calls.__setitem__("pipe", calls["pipe"] + 1)
+
+        orig_err = f._send_error_response
+
+        def _fake_error(sock, status, msg, headers=None):
+            calls["error"] += 1
+            assert status == 400
+            try:
+                sock.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n"
+                             b"Connection: close\r\n\r\n{}")
+            except OSError:
+                pass
+
+        f._send_error_response = staticmethod(_fake_error)
+
+        def _client():
+            try:
+                client.sendall(req)
+                time.sleep(0.3)
+                client.close()
+            except OSError:
+                pass
+
+        ct = threading.Thread(target=_client, daemon=True)
+        ct.start()
+        try:
+            f._handle_connection(fwd_side)
+        finally:
+            for s in (client, fwd_side, srv):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            f._send_error_response = orig_err
+
+        assert calls["error"] == 1, "Missing ?model= should trigger the 400 path"
+        assert calls["pipe"] == 0, "400 path must NOT pipe to the backend"
+
 

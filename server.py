@@ -4805,6 +4805,15 @@ async def list_models():
             "model_type_label": m["model_type_label"],
             "arch": m["arch"],
             "auxiliary": m["auxiliary"],
+            # Capability flags derived from a capability set (tags + model_type + has_mmproj),
+            # not a single scalar — an omni model is both vision-input AND speech-output.
+            # audio relies on tags (not arch names) to avoid a second hardcoded list.
+            "multimodal": (m["model_type"] == MODEL_TYPE_VISION
+                          or "omni" in m["tags"]
+                          or "vision" in m["tags"]
+                          or m["has_mmproj"]),
+            "audio": (m["model_type"] == MODEL_TYPE_AUDIO
+                      or "omni" in m["tags"]),
             # Bridge-card fields (defaulted for llama cards). Pass-through only —
             # required by the WebUI field whitelist (F1); the llama payload shape is unchanged.
             "engine": m["engine"],

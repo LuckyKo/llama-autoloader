@@ -42,6 +42,7 @@ import socket
 import threading
 import time
 from typing import Callable, Dict, Optional, Tuple
+from urllib.parse import unquote_plus
 
 log = logging.getLogger("autoloader")
 
@@ -812,40 +813,49 @@ class RawTCPForwarder:
             # request's backend, so a request for model B could be answered by model A.
             raw_headers = self._force_connection_close(raw_headers)
 
-            # LLM data path: only OpenAI-style generation endpoints carry a `model` field and
+            # LLM data path: model-scoped endpoints (POST with body model, or WS with query model)
             # are piped straight to llama-server. All other requests (management/status/state,
             # /ws, unknown paths) go to FastAPI.
-            if self._is_llm_endpoint(path):
-                # OPTIONS preflight on an LLM endpoint: answer directly with a CORS-allowing
+            if self._is_llm_endpoint(path) or self._is_ws_model_endpoint(path):
+                # OPTIONS preflight on a model endpoint: answer directly with a CORS-allowing
                 # response WITHOUT piping to llama-server. CWrite's current fetch is "simple" so
                 # no preflight fires today, but a future Authorization/custom-header change could
                 # trigger one; this keeps the loader as robust as the old uvicorn path.
                 if method == "OPTIONS":
                     self._send_cors_preflight_response(client_sock)
                     return
-                # Only POST (carries a `model` field in the body) is piped to llama-server. Any other
-                # method on an LLM path keeps its original fallthrough-to-FastAPI behaviour (e.g. a
-                # WebSocket upgrade or GET), which was never LLM generation traffic anyway.
-                if method != "POST":
-                    self._pipe_to_backend(client_sock, raw_headers,
-                                          body_prefix, self.internal_api_port, "internal API")
-                    return
-                model_id = self._extract_model(body_prefix)
-                # The `model` field may sit beyond the bytes we read up-front (large AC bodies, or a
-                # body split across TCP segments). Read more — bounded by content-length and a sane
-                # cap — until we can locate it. We must NEVER fall through an LLM POST to FastAPI:
-                # the LLM proxy routes were removed there, so that path only ever yields a 404.
-                if not model_id:
-                    body_prefix = self._read_more_for_model(client_sock, raw_headers, body_prefix)
+                if self._is_ws_model_endpoint(path) and method == "GET":
+                    # WebSocket upgrade: model comes from the query string, not the body.
+                    model_id = self._extract_model_from_query(path)
+                    if not model_id:
+                        log.warning(f"WS {path}: no 'model' in query string -> 400")
+                        self._send_error_response(client_sock, 400,
+                                                  "Missing 'model' query parameter for WebSocket endpoint")
+                        return
+                else:
+                    # Only POST (carries a `model` field in the body) is piped to llama-server. Any other
+                    # method on an LLM path keeps its original fallthrough-to-FastAPI behaviour (e.g. a
+                    # GET on /v1/chat/completions), which was never LLM generation traffic anyway.
+                    if method != "POST":
+                        self._pipe_to_backend(client_sock, raw_headers,
+                                              body_prefix, self.internal_api_port, "internal API")
+                        return
                     model_id = self._extract_model(body_prefix)
-                    log.info(f"LLM {method} {path}: 'model' extracted after extra read ({len(body_prefix)}B)")
-                if not model_id:
-                    # Truly unresolvable (no content-length and body has no "model", or cap hit).
-                    log.warning(f"LLM {method} {path}: no 'model' in body ({len(body_prefix)}B); "
-                                f"refusing FastAPI fallthrough -> 400")
-                    self._send_error_response(client_sock, 400,
-                                              "Could not determine 'model' from request body for LLM endpoint")
-                    return
+                    # The `model` field may sit beyond the bytes we read up-front (large AC bodies, or a
+                    # body split across TCP segments). Read more — bounded by content-length and a sane
+                    # cap — until we can locate it. We must NEVER fall through an LLM POST to FastAPI:
+                    # the LLM proxy routes were removed there, so that path only ever yields a 404.
+                    if not model_id:
+                        body_prefix = self._read_more_for_model(client_sock, raw_headers, body_prefix)
+                        model_id = self._extract_model(body_prefix)
+                        log.info(f"LLM {method} {path}: 'model' extracted after extra read ({len(body_prefix)}B)")
+                    if not model_id:
+                        # Truly unresolvable (no content-length and body has no "model", or cap hit).
+                        log.warning(f"LLM {method} {path}: no 'model' in body ({len(body_prefix)}B); "
+                                    f"refusing FastAPI fallthrough -> 400")
+                        self._send_error_response(client_sock, 400,
+                                                  "Could not determine 'model' from request body for LLM endpoint")
+                        return
                 target = self._resolve_target(model_id)
                 if target:
                     target_port, target_generation, resolved_model_id = target
@@ -893,7 +903,7 @@ class RawTCPForwarder:
                     client_sock, model_id, None, LEGACY_GENERATION,
                     f"Failed to load model '{model_id}'")
                 return
-            # Non-LLM endpoint -> forward to FastAPI.
+            # Non-model-scoped endpoint -> forward to FastAPI.
             self._pipe_to_backend(client_sock, raw_headers,
                                   body_prefix, self.internal_api_port, "internal API")
         except Exception as e:  # noqa: BLE001 — never let one connection kill the loop
@@ -1088,6 +1098,64 @@ class RawTCPForwarder:
         return None
 
     @staticmethod
+    def _find_top_level_model_span(body: bytes) -> Optional[Tuple[int, int]]:
+        """Return the ``(start, end)`` byte span of the *top-level* JSON string value for
+        the ``model`` key, excluding the surrounding quotes; ``None`` if not found.
+
+        Walks the JSON document with a small brace/bracket-aware scanner instead of a
+        regex, so a ``"model": "..."`` string nested inside tool schemas, message content
+        or nested objects can never be mistaken for the request's model field.  The body
+        may be truncated (the caller forwards the remainder of the request through the
+        pipe); scanning stops safely and returns ``None`` when the current string or the
+        document ends before a match.  Escaped quotes inside strings are skipped.
+        """
+        depth = 0
+        i = 0
+        n = len(body)
+        while i < n:
+            c = body[i:i + 1]
+            if c == b'"':
+                # Find the end of this string token, honouring backslash escapes.
+                j = i + 1
+                while j < n:
+                    if body[j:j + 1] == b"\\":
+                        j += 2
+                        continue
+                    if body[j:j + 1] == b'"':
+                        break
+                    j += 1
+                if j >= n:
+                    return None  # unterminated string in a truncated prefix
+                if depth == 1 and body[i:j + 1] == b'"model"':
+                    k = j + 1
+                    while k < n and body[k:k + 1] in b" \t\r\n":
+                        k += 1
+                    if k >= n or body[k:k + 1] != b":":
+                        return None
+                    k += 1
+                    while k < n and body[k:k + 1] in b" \t\r\n":
+                        k += 1
+                    if k >= n or body[k:k + 1] != b'"':
+                        return None  # non-string model value; nothing safe to rewrite
+                    v = k + 1
+                    while v < n:
+                        if body[v:v + 1] == b"\\":
+                            v += 2
+                            continue
+                        if body[v:v + 1] == b'"':
+                            return k + 1, v
+                        v += 1
+                    return None  # unterminated value in a truncated prefix
+                i = j + 1
+                continue
+            if c == b"{" or c == b"[":
+                depth += 1
+            elif c == b"}" or c == b"]":
+                depth -= 1
+            i += 1
+        return None
+
+    @staticmethod
     def _rewrite_model_in_body(raw_headers: bytes, body_prefix: bytes,
                               old_model: str, new_model: str) -> Tuple[bytes, bytes]:
         """Replace the ``model`` field value in a JSON request body and adjust Content-Length.
@@ -1096,8 +1164,15 @@ class RawTCPForwarder:
         match the loaded model name.  When the forwarder falls back to a resident model for
         an unrecognised name, the body must be rewritten so the engine sees the name it knows.
 
-        Returns ``(new_raw_headers, new_body_prefix)``.  When ``old_model == new_model`` or
-        the field is not found, the originals are returned unchanged.
+        Only the **top-level** ``model`` field is considered, and only when its value is
+        exactly ``old_model``.  Tool schemas and message content may legitimately contain a
+        nested ``"model": "..."`` string; rewriting the first regex match (as an earlier
+        version did) could either corrupt that payload or leave the real model field
+        unchanged while still shifting Content-Length.
+
+        Returns ``(new_raw_headers, new_body_prefix)``.  When ``old_model == new_model``,
+        the field is not found, or its value differs from ``old_model``, the originals are
+        returned unchanged.
         """
         if old_model == new_model:
             return raw_headers, body_prefix
@@ -1106,11 +1181,14 @@ class RawTCPForwarder:
         # would corrupt the framing.  Skip the rewrite for chunked requests.
         if re.search(rb"(?i)Transfer-Encoding:\s*chunked", raw_headers):
             return raw_headers, body_prefix
-        m = _MODEL_RE.search(body_prefix)
-        if not m:
+        span = RawTCPForwarder._find_top_level_model_span(body_prefix)
+        if span is None:
+            return raw_headers, body_prefix
+        start, end = span
+        if body_prefix[start:end] != old_model.encode("utf-8"):
             return raw_headers, body_prefix
         new_bytes = new_model.encode("utf-8")
-        new_body = body_prefix[:m.start(1)] + new_bytes + body_prefix[m.end(1):]
+        new_body = body_prefix[:start] + new_bytes + body_prefix[end:]
         length_diff = len(new_body) - len(body_prefix)
         if length_diff:
             cl = re.search(rb"(?i)Content-Length:\s*(\d+)", raw_headers)
@@ -1202,17 +1280,47 @@ class RawTCPForwarder:
 
     @staticmethod
     def _is_llm_endpoint(path: str) -> bool:
-        """True for OpenAI-style generation endpoints that carry a `model` field.
+        """True for model-scoped POST endpoints that carry a `model` field in the body.
 
         These are the requests we pipe straight to llama-server when the model is loaded.
         Accepts both bare (/chat/completions) and /v1-prefixed forms, plus a trailing path.
         """
         p = RawTCPForwarder._normalize_api_prefix(path.split("?", 1)[0].rstrip("/"))
         for prefix in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings",
-                       "/chat/completions", "/completions", "/embeddings"):
+                       "/chat/completions", "/completions", "/embeddings",
+                       "/tts", "/v1/tts", "/v1/audio/transcriptions", "/v1/messages"):
             if p == prefix or p.startswith(prefix + "/"):
                 return True
         return False
+
+    @staticmethod
+    def _is_ws_model_endpoint(path: str) -> bool:
+        """True for model-scoped WebSocket endpoints (model from query string).
+
+        ``/v1/realtime`` is a WebSocket whose model is specified via ``?model=<id>``
+        in the URL, not in a JSON body. The raw bidirectional pipe carries the WS
+        upgrade handshake and subsequent frames verbatim to llama-server.
+        """
+        p = RawTCPForwarder._normalize_api_prefix(path.split("?", 1)[0].rstrip("/"))
+        return p == "/v1/realtime"
+
+    @staticmethod
+    def _extract_model_from_query(path: str) -> Optional[str]:
+        """Extract the ``model`` parameter from a URL query string.
+
+        Used for WebSocket endpoints where the model is specified as a query
+        parameter (e.g. ``/v1/realtime?model=lfm3-omni``) rather than a body field.
+        The value is URL-decoded (``%20`` → space, ``+`` → space) so that model
+        names containing encoded characters match the registry.
+        """
+        if "?" not in path:
+            return None
+        query = path.split("?", 1)[1]
+        for param in query.split("&"):
+            key, sep, value = param.partition("=")
+            if key == "model" and value:
+                return unquote_plus(value)
+        return None
 
     def _resolve_request_model(self, model_id: str) -> Optional[str]:
         """Resolve a request's model on the MAIN event loop (async-only resolver).
