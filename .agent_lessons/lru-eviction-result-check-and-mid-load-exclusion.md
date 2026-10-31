@@ -44,10 +44,13 @@ At `llama-autoloader` @ `3926acecf917796ed2fbf2a0073d97685a863219` (working tree
 - Surfacing: `/v1/models/{id}/load` → 503 with the message; forwarder JIT → logged,
   returns None; recovery reload → caught and arms the BUG_0007 backoff.
 
-## Deliberate trade-off: over-cap loads are now the common case
+## ~~Deliberate trade-off: over-cap loads are now the common case~~ (superseded 2026-10-31)
+
+> **Superseded:** the soft cap below was reverted on 2026-10-31 — see the addendum at the
+> end. The load is now refused instead of proceeding over the cap.
 
 When every candidate is pinned/busy/mid-load, `_evict_lru_if_needed` warns and returns
-`None`, and **the load proceeds over `max_loaded_models`**. With `max_loaded_models: 1`
+`None`, and ~~**the load proceeds over `max_loaded_models`**~~. With `max_loaded_models: 1`
 in config.yaml, a JIT request arriving while one model is mid-start yields two resident
 engines. Nothing re-enforces the cap afterwards (`idle_reaper` only unloads on
 `idle_timeout`). This is intentional — killing a just-started engine *is* the ping-pong
@@ -112,3 +115,32 @@ shape: the mid-load model is the LRU pick and the assertion is that a *different
 model got evicted (asserting "nothing evicted" would also pass with a filter that
 wrongly excludes everything). `test_no_eviction_when_only_mid_load_candidates` pins
 the `None` return. Full suite green (397 passed) at the pin above.
+
+## Addendum 2026-10-31: the soft cap was the bug; the load is now refused
+
+Production log `logs/console.log` 2026-10-31 04:33:13 shows the exact cascade the
+soft cap permits with `models.max_loaded_models: 1`:
+
+```
+04:33:13,866 Unloading qwen3.8-flash-next-coder-iq3_xxs ... ; Launching strata ... iq3_xxs
+04:33:13,900 Model 'qwen3.8-flash-next-coder-iq1_m' not loaded; triggering JIT load...
+04:33:13,901 WARNING Max loaded models limit reached ... loading without evicting
+04:33:13,904 Launching strata for qwen3.8-flash-next-coder-iq1_m on port 9023
+04:33:13,905 Waiting for llama-server on port 9023 ...
+```
+
+Two strata engines (47 GB + 30 GB of experts) then loaded concurrently; both died
+(`EngineDied`, exit 1) because the Windows commit limit was exhausted. The trigger was
+`_evict_lru_if_needed` returning `None` because the only other resident model
+(`iq3_xxs`) was mid-recovery-reload, and `_do_load_model` treating that `None` as
+"proceed".
+
+Fix: the caller still calls `_evict_lru_if_needed`, but when it returns `None` **and**
+`len(self.loaded) >= self.max_loaded_models` it raises
+`Cannot load <id>: max_loaded_models (<n>) reached and no evictable model is available
+(pinned, busy, or mid-load)`. This matches what `README.md` and `DOCUMENTATION.md`
+already promised ("if no eligible model can be evicted ... the load is refused"). It does
+**not** re-admit mid-load models to the candidate set, so the ping-pong fix from
+BUG_0011 stands: a refused load kills nothing. The forwarder turns the refusal into a
+503; `_recover_dead_engine` catches it and arms the BUG_0007 backoff. New test:
+`TestEvictLRU::test_load_refused_when_only_mid_load_candidate`.

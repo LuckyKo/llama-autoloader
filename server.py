@@ -2354,9 +2354,10 @@ class ModelManager:
         refused. ``_unload_unlocked`` may also return ``None`` (the entry vanished
         mid-call) or raise (e.g. cancellation); those propagate to the caller's
         existing error handling.
-        When no candidate exists the load proceeds over the cap by design —
-        refusing or killing a just-started engine is the ping-pong bug this
-        predicate exists to prevent.
+        ``None`` is ambiguous on its own (under the cap vs. no candidate), so
+        callers still at/over the cap after this returns must refuse the load.
+        Killing or evicting a just-started engine is the ping-pong bug this
+        predicate exists to prevent; the caller refuses instead.
         """
         if len(self.loaded) < self.max_loaded_models:
             return None
@@ -2368,9 +2369,9 @@ class ModelManager:
         ]
         if not candidates:
             log.warning(
-                "Max loaded models limit reached, but every other model is pinned, "
-                "busy (active request), mid-load, or the target itself; "
-                "loading without evicting")
+                f"Max loaded models limit ({self.max_loaded_models}) reached and no "
+                f"evictable model is available for '{target_model_id}' (every other "
+                f"model is pinned, busy, or mid-load); refusing the load")
             return None
         candidates.sort(key=lambda item: item[1].last_used)
         lru_id, lru_lm = candidates[0]
@@ -2955,6 +2956,17 @@ class ModelManager:
                     evict_result,
                     f"Cannot load {model_id}: LRU eviction of "
                     f"{evict_result.model_id if evict_result else model_id} failed")
+                if evict_result is None and len(self.loaded) >= self.max_loaded_models:
+                    # _evict_lru_if_needed returns None both under the cap and when
+                    # every candidate is pinned/busy/mid-load. The latter used to
+                    # proceed over the cap ("soft cap"), which is exactly how two
+                    # engines ended up loading at once with max_loaded_models: 1
+                    # (2026-10-31 04:33: two strata loads, both died at the Windows
+                    # commit limit). Refuse instead; the docs already promise this.
+                    raise RuntimeError(
+                        f"Cannot load {model_id}: max_loaded_models "
+                        f"({self.max_loaded_models}) reached and no evictable model "
+                        f"is available (pinned, busy, or mid-load)")
                 cfg = self.models[model_id]
                 port = self._allocate_port(model_id)
                 # Engine dispatch: bridge cards build their own argv/cwd/env from the engine

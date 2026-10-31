@@ -913,6 +913,36 @@ class TestEvictLRU:
         assert len(manager.loaded) == 2
 
     @pytest.mark.asyncio
+    async def test_load_refused_when_only_mid_load_candidate(self, manager):
+        # max_loaded_models=1, the only resident model is mid-load. The old
+        # "soft cap" proceeded anyway, spawning a second engine on top of the
+        # first (2026-10-31 04:33: two strata loads, both died at the Windows
+        # commit limit). The load must be refused instead.
+        manager.models.clear()
+        manager.loaded.clear()
+        manager.max_loaded_models = 1
+        cfg_x = ModelConfig.default_for(Path("x.gguf"))
+        cfg_z = ModelConfig.default_for(Path("z.gguf"))
+        manager.models.update({"x.gguf": cfg_x, "z.gguf": cfg_z})
+
+        lm_x = LoadedModel("x.gguf", Path("x.gguf"), cfg_x, 9001, MagicMock(),
+                           last_used=time.time() - 100, ready=False, pid=1)
+        manager.loaded["x.gguf"] = lm_x
+
+        task = asyncio.create_task(asyncio.sleep(30))
+        manager._loading_tasks["x.gguf"] = task
+        try:
+            with pytest.raises(RuntimeError, match="max_loaded_models"):
+                await manager._do_load_model("z.gguf")
+        finally:
+            task.cancel()
+            manager._loading_tasks.pop("x.gguf", None)
+
+        assert "x.gguf" in manager.loaded
+        assert "z.gguf" not in manager.loaded
+        assert len(manager.loaded) == 1
+
+    @pytest.mark.asyncio
     async def test_load_refused_when_eviction_fails(self, manager):
         # Call-site guard: a failed eviction verdict (process still running)
         # must refuse the load and leave the registry unchanged.
