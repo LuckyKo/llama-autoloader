@@ -19,6 +19,7 @@ import logging
 import subprocess  # noqa: TCH003 - used for real subprocesses
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import psutil
@@ -59,9 +60,11 @@ def autoloader_logs():
         logger.propagate = old_propagate
 
 
-def _add_resident(mgr, model_id="engine.gguf", pid=424242, process=None):
+def _add_resident(mgr, model_id="engine.gguf", pid=424242, process=None,
+                  engine="llama"):
     """Register a resident model, mirroring tests/test_unload_reporting.py."""
     cfg = ModelConfig.default_for(Path(model_id))
+    cfg.engine = engine
     lm = LoadedModel(
         model_id=model_id,
         gguf_path=Path(model_id),
@@ -325,3 +328,206 @@ def test_tree_survivors_orphan_pass_and_recycling_guard(monkeypatch):
     survivors = server._tree_survivors({3000}, {3000: 100.0})
     assert survivors == [], (
         "a pid recycled to an unrelated process must not be descended into")
+
+
+# ---------------------------------------------------------------------------
+# BUG_0012 follow-up — graceful stop before the hard kill.
+#
+# The tracked pid is often a launcher; killing it can orphan the real engine,
+# which keeps the model's committed memory. A bridge engine that declares a
+# ``graceful_unload`` endpoint is asked to release the model FIRST; the kill is
+# still the authority on whether the tree is gone.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_graceful_unload_runs_before_kill(isolated_manager, monkeypatch):
+    mgr = isolated_manager
+    mgr.engines = {"strata": {"graceful_unload": {"path": "/v1/unload",
+                                                  "timeout_seconds": 5}}}
+    order: list[str] = []
+    seen: dict = {}
+
+    async def _post(url, json=None, timeout=None):
+        order.append("graceful")
+        seen.update(url=url, body=json, timeout=timeout)
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(mgr.client, "post", _post)
+
+    class _OrderedParent(_ParentGone):
+        def terminate(self):
+            order.append("terminate")
+
+    parent = _OrderedParent(424242)
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: parent)
+    monkeypatch.setattr(server.psutil, "wait_procs",
+                        lambda procs, timeout: ([], list(procs)))
+    monkeypatch.setattr(server, "_tree_survivors",
+                        lambda tree_pids, expected_ctime: [])
+
+    _add_resident(mgr, model_id="engine.gguf", pid=424242, engine="strata")
+    result = await mgr.unload_model("engine.gguf")
+
+    assert result is not None and result.unloaded is True
+    assert order == ["graceful", "terminate"], (
+        f"graceful unload must run before the hard kill, got {order}")
+    assert seen["url"] == "http://127.0.0.1:19555/v1/unload"
+    assert seen["body"] == {}
+    assert seen["timeout"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_graceful_unload_failure_still_kills(isolated_manager, autoloader_logs,
+                                                   monkeypatch):
+    """A failed graceful stop is a warning, never a skipped teardown."""
+    mgr = isolated_manager
+    mgr.engines = {"strata": {"graceful_unload": {"path": "/v1/unload"}}}
+
+    async def _post(url, json=None, timeout=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(mgr.client, "post", _post)
+
+    parent = _ParentGone(424242)
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: parent)
+    monkeypatch.setattr(server.psutil, "wait_procs",
+                        lambda procs, timeout: ([], list(procs)))
+    monkeypatch.setattr(server, "_tree_survivors",
+                        lambda tree_pids, expected_ctime: [])
+
+    _add_resident(mgr, model_id="engine.gguf", pid=424242, engine="strata")
+    result = await mgr.unload_model("engine.gguf")
+
+    assert result is not None and result.unloaded is True
+    assert any("Graceful stop" in m and "connection refused" in m
+               for m in autoloader_logs)
+
+
+# ---------------------------------------------------------------------------
+# BUG_0012 follow-up — Windows AccessDenied means "already terminating".
+# ---------------------------------------------------------------------------
+class _DeniedProc:
+    """A survivor whose terminate/kill both raise AccessDenied."""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+    def name(self) -> str:
+        return "engine"
+
+    def ppid(self) -> int:
+        return 1
+
+    def terminate(self):
+        raise psutil.AccessDenied(self.pid)
+
+    def kill(self):
+        raise psutil.AccessDenied(self.pid)
+
+
+def _drain_setup(monkeypatch, survivor, timeout=0.4):
+    parent = _ParentGone(424242)
+    monkeypatch.setattr(server.psutil, "Process", lambda pid: parent)
+    monkeypatch.setattr(server.psutil, "wait_procs",
+                        lambda procs, timeout: ([], list(procs)))
+    monkeypatch.setattr(server, "_tree_survivors",
+                        lambda tree_pids, expected_ctime: [survivor])
+    monkeypatch.setattr(server, "KILL_TREE_DRAIN_TIMEOUT_S", timeout)
+
+
+@pytest.mark.asyncio
+async def test_tree_drain_windows_access_denied_is_already_terminating(
+        isolated_manager, autoloader_logs, monkeypatch):
+    mgr = isolated_manager
+    _add_resident(mgr, model_id="engine.gguf", pid=424242)
+    survivor = _DeniedProc(999999)
+    _drain_setup(monkeypatch, survivor)
+    monkeypatch.setattr(server.platform, "system", lambda: "Windows")
+
+    result = await mgr.unload_model("engine.gguf")
+
+    # The engine is inside its own job object and already terminating: the
+    # AccessDenied is documented Win32 behavior, not an unkillable process.
+    assert result is not None and result.unloaded is True
+    assert not any("Tree drain timed out" in m for m in autoloader_logs)
+    assert any("already terminating" in m and "999999" in m
+               for m in autoloader_logs)
+
+
+@pytest.mark.asyncio
+async def test_tree_drain_posix_access_denied_still_fails(
+        isolated_manager, autoloader_logs, monkeypatch):
+    """The Windows carve-out must not leak to POSIX, where AccessDenied is a
+    real permission problem and the unload must stay an explicit failure."""
+    mgr = isolated_manager
+    _add_resident(mgr, model_id="engine.gguf", pid=424242)
+    survivor = _DeniedProc(999999)
+    _drain_setup(monkeypatch, survivor, timeout=0.3)
+    monkeypatch.setattr(server.platform, "system", lambda: "Linux")
+
+    result = await mgr.unload_model("engine.gguf")
+
+    assert result is not None and result.unloaded is False
+    assert "tree drain timed out" in result.reason
+    assert "999999" in result.reason
+
+
+class _BoomProc:
+    """A survivor whose terminate/kill raise an unexpected error."""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+    def name(self) -> str:
+        return "engine"
+
+    def ppid(self) -> int:
+        return 1
+
+    def terminate(self):
+        raise RuntimeError("terminate boom")
+
+    def kill(self):
+        raise RuntimeError("kill boom")
+
+
+@pytest.mark.asyncio
+async def test_tree_drain_logs_terminate_and_kill_errors(
+        isolated_manager, autoloader_logs, monkeypatch):
+    mgr = isolated_manager
+    _add_resident(mgr, model_id="engine.gguf", pid=424242)
+    survivor = _BoomProc(888888)
+    _drain_setup(monkeypatch, survivor, timeout=0.3)
+    monkeypatch.setattr(server.platform, "system", lambda: "Linux")
+
+    result = await mgr.unload_model("engine.gguf")
+
+    assert result is not None and result.unloaded is False
+    assert any("terminate failed" in m and "RuntimeError" in m and "888888" in m
+               for m in autoloader_logs), "terminate errors must be logged, not swallowed"
+    assert any("kill failed" in m and "RuntimeError" in m and "888888" in m
+               for m in autoloader_logs), "kill errors must be logged, not swallowed"
+
+
+# ---------------------------------------------------------------------------
+# The graceful-stop endpoint is engine DATA with a Strata default.
+# ---------------------------------------------------------------------------
+def test_normalize_engines_adds_strata_graceful_unload_default():
+    out = server._normalize_engines({"engines": {"strata": {"argv": ["x"]}}})
+    assert out["strata"]["graceful_unload"] == {"path": "/v1/unload",
+                                                "timeout_seconds": 20.0}
+
+    # An explicit opt-out survives.
+    out = server._normalize_engines(
+        {"engines": {"strata": {"argv": ["x"], "graceful_unload": False}}})
+    assert out["strata"]["graceful_unload"] is False
+
+    # Other engines are untouched (the key is data, not a global behavior).
+    out = server._normalize_engines({"engines": {"ninfer": {"argv": ["x"]}}})
+    assert "graceful_unload" not in out["ninfer"]
+
+
+def test_normalize_engines_legacy_strata_gets_graceful_unload():
+    out = server._normalize_engines({"strata": {"venv_python": "py",
+                                                "serve_script": "serve.py",
+                                                "root_dir": "."}})
+    assert out["strata"]["graceful_unload"]["path"] == "/v1/unload"

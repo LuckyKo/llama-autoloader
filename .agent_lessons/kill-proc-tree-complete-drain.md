@@ -74,3 +74,32 @@ success only after child+grandchild gone — note the descendants are reached vi
 process-table (orphan) pass and the pid-recycling guard are covered by `test_tree_survivors_orphan_pass_and_recycling_guard`
 (a deterministic unit test stubbing `psutil.process_iter`/`psutil.Process` directly). Full suite
 `python -m pytest tests/ test_server.py -q -n 0` = **401 passed** (baseline 398 + 3).
+
+## Follow-up (2026-10-31): AccessDenied ≠ unkillable on Windows; stop the engine gracefully first
+
+The tree-complete drain was correct in principle but produced **false failures** in production.
+The tracked pid is the venv `py.exe` launcher; the real Strata server (and its `strata.exe` /
+vision children) are its descendants. Killing the launcher ends the server via the launcher's
+job object but orphans the server's children, and `TerminateProcess` on a process that is
+**already terminating** returns `ERROR_ACCESS_DENIED`. A thread in a kernel/driver wait keeps the
+process visible longer than the 15 s drain window, so the unload reported "tree drain timed out"
+even though the termination was already in flight — which blocked LRU eviction and state restore.
+
+Two changes:
+
+1. **`ModelManager._graceful_engine_stop`** runs before `_kill_proc` (from `_unload_finish`).
+   It is data-driven by the engine spec key `graceful_unload: {path, timeout_seconds}`
+   (Strata default `{path: /v1/unload, timeout_seconds: 20}`, applied in `_normalize_engines`;
+   `false` disables). It POSTs `{}` to `http://127.0.0.1:<port><path>` so the engine releases
+   its committed memory and exits its own children. All failures are warnings; the kill is still
+   the authority. Strata's route requires `Content-Type: application/json` and no foreign Origin.
+2. **Drain diagnostics/verdict**: terminate/kill exceptions are logged once per `(pid, op)`;
+   `kill()` is retried every poll; on Windows an `AccessDenied` marks the pid as
+   *already terminating*. A window that ends with only those pids returns success with a
+   WARNING; POSIX `AccessDenied` and other stubborn survivors still fail strictly.
+
+Tests: `test_graceful_unload_runs_before_kill`, `test_graceful_unload_failure_still_kills`,
+`test_tree_drain_windows_access_denied_is_already_terminating`,
+`test_tree_drain_posix_access_denied_still_fails`,
+`test_tree_drain_logs_terminate_and_kill_errors`, plus `_normalize_engines` default/opt-out tests.
+

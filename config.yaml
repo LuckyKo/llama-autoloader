@@ -27,6 +27,9 @@ engines:
     env_scrub:
     - STRATA_API_KEY
     - STRATA_ALLOWED_HOSTS
+    graceful_unload:
+      path: /v1/unload
+      timeout_seconds: 20
     interpreter: N:/work/WD/Strata/.venv/Scripts/python.exe
     label: Strata
     min_free_vram_flag: --min-free-vram-mib

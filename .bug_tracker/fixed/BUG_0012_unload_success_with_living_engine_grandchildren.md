@@ -354,3 +354,67 @@ near-misses. Hit rate is size-dependent and will rise with the model's commit fo
   window is required regardless; (2) log `ppid` alongside the lingering pids so future occurrences
   are attributable; (3) if a regression test is written, drive a real parent+grandchild tree and
   assert absence of success-with-survivors, per the Verification section.
+
+## Follow-up fix (2026-10-31) — graceful engine stop + drain robustness
+
+### Why the tree-complete drain still produced false failures
+
+The 2026-10-31 recurrence (`logs/console.log` 04:33:13, 04:43:16, 05:10:26) showed the drain
+working as designed but turning a *successful* teardown into a failed unload:
+
+```
+04:43:00,652 [WARNING] Process termination needed a fallback ... (pid 25928): (pid=18280)
+04:43:00,782 [WARNING] Engine descendants 18280 (?, ppid=?), 996 (strata.exe, ppid=18428) still running ...
+04:43:16,001 [ERROR]   Tree drain timed out ... 996 (strata.exe, ppid=18428) still running
+```
+
+Forensics:
+
+- The tracked pid is the venv `py.exe` launcher (`N:\work\WD\Strata\.venv\Scripts\python.exe`,
+  OriginalFilename `py.exe`), which spawns `C:\Python312\python.exe` running `serve/server.py`.
+  The real server then spawns `strata.exe` and the vision encoder. Killing the launcher ends the
+  server (the launcher's kill-on-close job) but **not** the server's children.
+- Win32 semantics: `TerminateProcess` on a process that is **already terminating** fails with
+  `ERROR_ACCESS_DENIED` (documented; also Rust issue #112423), and a thread in a kernel/driver
+  wait keeps the process visible until that wait completes. So the drain's `AccessDenied` on the
+  engine was not "unkillable" — the termination was already in flight. The 15 s window was
+  shorter than the driver wait, so the unload failed and blocked LRU eviction / state restore.
+- The next request ~0.5 s later succeeded because the parent (launcher) was gone by then.
+
+### The fix
+
+1. **Graceful stop before the hard kill** (`ModelManager._graceful_engine_stop`, called from
+   `_unload_finish` just before `_kill_proc`). It is engine **data**, not a hardcoded Strata call:
+   the optional registry key `graceful_unload: {path, timeout_seconds}` is read from the model's
+   engine spec. Strata defaults to `{path: /v1/unload, timeout_seconds: 20}` in `config.yaml`,
+   in the legacy `strata:` migration, and for an existing `engines.strata` entry that predates the
+   key; `graceful_unload: false` (or `{path: null}`) disables it. The request is
+   `POST http://127.0.0.1:<port><path>` with `json={}` (Strata's `_own_page` gate requires
+   `Content-Type: application/json` and no foreign Origin). Every failure — connection error,
+   timeout, HTTP >= 400, `409 busy` — is logged and the tree-complete kill still runs. The
+   graceful unload makes the engine release its committed memory and end its own children, so the
+   queued reload can reserve its arena even if the OS keeps a process visible for a while.
+2. **Drain robustness in `_kill_proc`.** Terminate/kill errors are now logged (once per
+   `(pid, operation)`) instead of silently swallowed; `kill()` is retried on every poll, not just
+   the first; and on **Windows** an `AccessDenied` from terminate/kill is recorded as
+   "already terminating". If the bounded window ends with only such pids, the unload succeeds
+   with a WARNING instead of a false failure. Genuinely unkillable processes — and any
+   `AccessDenied` on POSIX, where it is a real permission problem — still fail strictly.
+   The primary-path fallback warning now names the exception type (`AccessDenied`), so
+   `(pid=...)` is no longer ambiguous in the log.
+
+### Verification
+
+`tests/test_kill_tree_drain.py` adds: `test_graceful_unload_runs_before_kill` (endpoint called
+with `{}` and the configured timeout before the kill), `test_graceful_unload_failure_still_kills`
+(a failed graceful stop only warns), `test_tree_drain_windows_access_denied_is_already_terminating`
+(AccessDenied-only survivors return success with a warning, no timeout ERROR),
+`test_tree_drain_posix_access_denied_still_fails` (the Windows carve-out does not leak to POSIX),
+`test_tree_drain_logs_terminate_and_kill_errors` (both errors are logged), plus two
+`_normalize_engines` tests pinning the Strata default, the explicit opt-out, and that other
+engines are untouched.
+
+Full suite `python -m pytest tests/ test_server.py -q -n 0`: **499 passed, 3 errors** — the 3
+errors are the pre-existing environment ones (`tests/test_real_model.py` needs
+`backends/llama.cpp-win-x86_64-nvidia-cuda12-avx2-local/llama-server.exe`). Zero regressions.
+

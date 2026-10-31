@@ -740,6 +740,14 @@ class GPUInfo:
 _LEGACY_STRATA_OVERLAY = {"cors_origins": ["*"], "lazy_load": False, "idle_unload_s": 0}
 _LEGACY_STRATA_ENV_SCRUB = ["STRATA_API_KEY", "STRATA_ALLOWED_HOSTS"]
 
+# BUG_0012: a bridge engine that can release its model on request gets a bounded
+# graceful stop before the hard process kill. Killing the tracked launcher can
+# orphan the real engine (and its vision encoder), which then keeps holding the
+# model's committed memory; asking it to unload lets it release that memory and
+# exit its own children first. The key is engine data, not a hardcoded call:
+# ``graceful_unload: {path, timeout_seconds}``, or false/null to disable.
+_STRATA_GRACEFUL_UNLOAD = {"path": "/v1/unload", "timeout_seconds": 20.0}
+
 # Pre-registry card directories, kept READ-ONLY as a migration aid: a card written
 # before the engine registry (no "engine" key) must keep showing. Nothing is ever
 # written here any more — new cards go to ./engine_cards (or an engine's cards_dir).
@@ -845,31 +853,43 @@ def _normalize_engines(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     Migration is one dict build plus one warning. The shipped config.yaml has no
     ``strata:`` section, so this only fires for existing user setups.
+
+    Strata's graceful-unload default is applied here (not at the unload call
+    site) so the teardown path stays data-driven: an existing registry entry
+    written before the key existed still gets it, and ``graceful_unload: false``
+    or ``{path: null}`` turns it off.
     """
     engines = cfg.get("engines")
     if isinstance(engines, dict) and engines:
-        return dict(engines)
-    legacy = cfg.get("strata")
-    if not legacy:
-        return {}
-    spec = dict(legacy)
-    spec.update({
-        "enabled": True,
-        "label": "Strata",
-        "argv": list(_DEFAULT_ARGV),
-        "interpreter": legacy.get("venv_python", ""),
-        "serve_script": legacy.get("serve_script", ""),
-        "cwd": legacy.get("root_dir", ""),
-        "derive_config": True,
-        "config_overlay": dict(_LEGACY_STRATA_OVERLAY),
-        "config_overlay_dynamic": {"aliases": ["{model_id}"]},
-        "env_scrub": list(_LEGACY_STRATA_ENV_SCRUB),
-        "min_free_vram_flag": "--min-free-vram-mib",
-        "config_key": "exe",
-        "ready_timeout_seconds": 600,
-    })
-    log.warning("legacy 'strata:' section migrated to 'engines.strata'")
-    return {"strata": spec}
+        out = {name: (dict(spec) if isinstance(spec, dict) else spec)
+               for name, spec in engines.items()}
+    else:
+        legacy = cfg.get("strata")
+        if not legacy:
+            return {}
+        spec = dict(legacy)
+        spec.update({
+            "enabled": True,
+            "label": "Strata",
+            "argv": list(_DEFAULT_ARGV),
+            "interpreter": legacy.get("venv_python", ""),
+            "serve_script": legacy.get("serve_script", ""),
+            "cwd": legacy.get("root_dir", ""),
+            "derive_config": True,
+            "config_overlay": dict(_LEGACY_STRATA_OVERLAY),
+            "config_overlay_dynamic": {"aliases": ["{model_id}"]},
+            "env_scrub": list(_LEGACY_STRATA_ENV_SCRUB),
+            "min_free_vram_flag": "--min-free-vram-mib",
+            "config_key": "exe",
+            "ready_timeout_seconds": 600,
+        })
+        log.warning("legacy 'strata:' section migrated to 'engines.strata'")
+        out = {"strata": spec}
+
+    strata = out.get("strata")
+    if isinstance(strata, dict) and "graceful_unload" not in strata:
+        strata["graceful_unload"] = dict(_STRATA_GRACEFUL_UNLOAD)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -1210,6 +1230,25 @@ class ModelManager:
                     errors.append(f"engines.{name}.configs_dir is not a directory: {cfg_dir}")
                 if not spec.get("config_key"):
                     errors.append(f"engines.{name}.config_key is required when configs_dir is set")
+            gu = spec.get("graceful_unload")
+            if gu not in (None, False):
+                if not isinstance(gu, dict):
+                    errors.append(f"engines.{name}.graceful_unload must be a mapping "
+                                  f"(or false to disable)")
+                else:
+                    path = gu.get("path")
+                    if path is not None and (not isinstance(path, str) or not path.startswith("/")):
+                        errors.append(f"engines.{name}.graceful_unload.path must be an "
+                                      f"absolute URL path starting with '/'")
+                    timeout = gu.get("timeout_seconds")
+                    if timeout is not None:
+                        try:
+                            ok = float(timeout) > 0
+                        except (TypeError, ValueError):
+                            ok = False
+                        if not ok:
+                            errors.append(f"engines.{name}.graceful_unload.timeout_seconds "
+                                          f"must be a positive number")
             if errors:
                 spec["_errors"] = "; ".join(errors)
                 log.warning(f"Engine '{name}' is misconfigured: {spec['_errors']}")
@@ -3253,6 +3292,54 @@ class ModelManager:
             lm, model_id, deliberate, killed, kill_reason,
             client_requested=client_requested)
 
+    async def _graceful_engine_stop(self, lm: LoadedModel, model_id: str) -> None:
+        """Ask a bridge engine to release its model before the hard kill (BUG_0012).
+
+        The tracked pid is often a launcher; the real engine (and its vision
+        encoder) are its children. Killing the launcher can leave those children
+        orphaned while they still hold the model's committed memory, which is
+        what made the immediate state-restore reload fail on the Windows commit
+        limit. An engine that offers a bounded unload endpoint can free that
+        memory and end its own children first, so the drain afterwards has less
+        to clean up and the memory is released even if a thread keeps the process
+        visible for a while.
+
+        Purely best-effort: every failure is logged and the tree-complete kill
+        still runs. The endpoint is engine DATA (``graceful_unload`` in the
+        registry entry), never a hardcoded call, so other engines are unaffected.
+        """
+        if not lm.ready or not lm.config.is_bridge or not lm.pid or lm.pid <= 0:
+            return
+        spec = (self.engines or {}).get(lm.config.engine) or {}
+        gu = spec.get("graceful_unload")
+        if not gu or not isinstance(gu, dict):
+            return
+        path = gu.get("path")
+        if not isinstance(path, str) or not path:
+            return
+        try:
+            timeout_s = float(gu.get("timeout_seconds", 20.0))
+        except (TypeError, ValueError):
+            timeout_s = 20.0
+        if timeout_s <= 0:
+            return
+        url = f"http://127.0.0.1:{lm.port}{path}"
+        try:
+            r = await self.client.post(url, json={}, timeout=timeout_s)
+        except Exception as e:  # noqa: BLE001 - the kill below is the real teardown
+            log.warning(f"Graceful stop of {model_id} on port {lm.port} failed "
+                        f"({type(e).__name__}: {e}); falling back to process kill")
+            return
+        if r.status_code == 409:
+            log.info(f"Graceful stop of {model_id} skipped: engine busy; "
+                     f"falling back to process kill")
+        elif r.status_code >= 400:
+            log.warning(f"Graceful stop of {model_id} returned HTTP {r.status_code}; "
+                        f"falling back to process kill")
+        else:
+            log.info(f"Engine for {model_id} released its model before unload "
+                     f"(HTTP {r.status_code})")
+
     async def _unload_finish(self, lm: LoadedModel, model_id: str) -> Tuple[bool, str]:
         """Complete an unload: auto-save, drain, drop the queue, kill, clean up.
 
@@ -3389,7 +3476,8 @@ class ModelManager:
             if alive or parent is None:
                 if primary_error is not None:
                     log.warning(f"Process termination needed a fallback for {model_id} "
-                                f"(pid {lm.pid}): {primary_error}")
+                                f"(pid {lm.pid}): {type(primary_error).__name__}: "
+                                f"{primary_error}")
                 if platform.system() == "Windows":
                     try:
                         lm.process.kill()
@@ -3475,49 +3563,93 @@ class ModelManager:
                     f"Engine descendants {', '.join(_describe_proc(p) for p in survivors)} "
                     f"still running after unload of {model_id} (parent {lm.pid} gone); "
                     f"terminating and waiting for the whole tree before reporting success")
-                for proc in survivors:
+
+                # On Windows TerminateProcess returns ERROR_ACCESS_DENIED for a
+                # process that is ALREADY terminating, and a thread in a
+                # kernel/driver wait keeps the process visible until that wait
+                # completes. That is not an unkillable process: the termination
+                # is already in flight. Track such pids so a drain window that
+                # ends with only those does not turn a successful unload into a
+                # false failure (BUG_0012: at this point the engine is inside its
+                # own job object and the launcher has already been killed).
+                # POSIX keeps strict failure: there AccessDenied is a real
+                # permission problem, not a termination-in-progress signal.
+                already_terminating: Set[int] = set()
+                reported_errors: Set[Tuple[int, str]] = set()
+
+                def _attempt(proc, how: str) -> None:
+                    """terminate/kill one survivor, recording (not hiding) failures."""
+                    key = (proc.pid, how)
                     try:
-                        proc.terminate()
+                        getattr(proc, how)()
                     except psutil.NoSuchProcess:
-                        pass
-                    except Exception:  # noqa: BLE001 - the bounded re-scan below is the truth
-                        pass
+                        already_terminating.discard(proc.pid)
+                    except psutil.AccessDenied as e:
+                        if platform.system() == "Windows":
+                            already_terminating.add(proc.pid)
+                            if key not in reported_errors:
+                                reported_errors.add(key)
+                                log.info(
+                                    f"Tree drain: {_describe_proc(proc)} is already "
+                                    f"terminating (Windows AccessDenied); waiting for it")
+                        elif key not in reported_errors:
+                            reported_errors.add(key)
+                            log.warning(f"Tree drain: cannot {how} {_describe_proc(proc)}: "
+                                        f"{type(e).__name__}: {e}")
+                    except Exception as e:  # noqa: BLE001 - the re-scan below is the truth
+                        if key not in reported_errors:
+                            reported_errors.add(key)
+                            log.warning(f"Tree drain: {how} failed for "
+                                        f"{_describe_proc(proc)}: {type(e).__name__}: {e}")
+
+                for proc in survivors:
+                    _attempt(proc, "terminate")
                 # Poll until the whole tree is gone or the bounded window expires.
-                # Escalate to a force-kill the first time a re-scan still finds
-                # survivors, mirroring the primary path's terminate -> wait ->
-                # kill -> wait sequence: a descendant that ignores SIGTERM must
-                # still be stopped (Windows TerminateProcess and SIGKILL are not
-                # catchable). Without this it would hold the model's committed
-                # memory for the whole window and the auto-load-before-restore
-                # would still fail — the exact harm this fix exists to prevent.
+                # Escalate to a force-kill on every poll (not just the first),
+                # mirroring the primary path's terminate -> wait -> kill -> wait
+                # sequence: a descendant that ignores SIGTERM must still be
+                # stopped (Windows TerminateProcess and SIGKILL are not
+                # catchable). Retrying matters when the first kill raced the
+                # process's own exit and returned AccessDenied on Windows.
                 # Unlike the primary path's 3s graceful wait, escalation here is
                 # immediate: the whole point of draining the tree is to free the
                 # commit as fast as possible for the queued reload, so a stubborn
                 # descendant is not given a long grace period first.
                 deadline = time.monotonic() + KILL_TREE_DRAIN_TIMEOUT_S
-                force_killed = False
                 while survivors:
                     if time.monotonic() >= deadline:
                         break
                     time.sleep(0.25)
                     survivors = _tree_survivors(tree_pids, expected_ctime)
-                    if survivors and not force_killed:
-                        for proc in survivors:
-                            try:
-                                proc.kill()
-                            except psutil.NoSuchProcess:
-                                pass
-                            except Exception:  # noqa: BLE001 - verified by the re-scan
-                                pass
-                        force_killed = True
+                    for proc in survivors:
+                        # An already-terminating pid cannot be killed again
+                        # (Windows keeps returning AccessDenied); the re-scan
+                        # removes it when the OS finishes the termination.
+                        if proc.pid not in already_terminating:
+                            _attempt(proc, "kill")
                 if survivors:
+                    stubborn = [p for p in survivors if p.pid not in already_terminating]
+                    if not stubborn:
+                        log.warning(
+                            f"Tree drain for {model_id} (pid {lm.pid}) ended with only "
+                            f"already-terminating pids: "
+                            f"{', '.join(_describe_proc(p) for p in survivors)}; "
+                            f"the OS is finishing their termination, so the unload is "
+                            f"not blocked")
+                        return True, ""
                     log.error(
                         f"Tree drain timed out for {model_id} (pid {lm.pid}): "
-                        f"{', '.join(_describe_proc(p) for p in survivors)} still running")
+                        f"{', '.join(_describe_proc(p) for p in stubborn)} still running")
                     return False, ("tree drain timed out: pids "
-                                   + ", ".join(str(p.pid) for p in survivors)
+                                   + ", ".join(str(p.pid) for p in stubborn)
                                    + " still running")
             return True, ""
+
+        # BUG_0012: let the engine release its model before the hard kill. This is
+        # what keeps a launcher's orphaned children from holding the committed
+        # memory the queued reload needs. Best-effort; the kill below is the
+        # authority on whether the tree is gone.
+        await self._graceful_engine_stop(lm, model_id)
 
         killed, kill_reason = await asyncio.to_thread(_kill_proc)
         if not killed:
