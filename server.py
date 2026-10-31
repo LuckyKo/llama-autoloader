@@ -768,6 +768,10 @@ SLOT_ACTION_DRAIN_TIMEOUT_S = 15.0
 # whole tree is gone, so the drain that terminates + waits for those orphans is
 # bounded by this window; exceeding it turns the unload into an explicit failure.
 KILL_TREE_DRAIN_TIMEOUT_S = 15.0
+# Skip auto-restore if a manual restore for the same model happened within
+# this many seconds. Prevents .auto.bin from clobbering a freshly restored
+# manual state that is still relevant.
+MANUAL_RESTORE_GUARD_S = 300.0
 # A state/load landing WHILE a deliberate unload is in progress is refused (409)
 # instead of silently cold-reloading the just-released model. The guard is the
 # unload itself, not a wall-clock window: the safe-mode contract (save -> unload
@@ -1155,6 +1159,9 @@ class ModelManager:
         # 08:21:04). Recovery refuses while a model is in this set; an explicit or JIT
         # load clears it, because the caller then wants the model back.
         self._release_requested: Set[str] = set()
+        # model_id -> (monotonic timestamp, state_path) of the last manual restore.
+        # Auto-restore skips if a manual restore is fresher than MANUAL_RESTORE_GUARD_S.
+        self._last_manual_restore: Dict[str, Tuple[float, Path]] = {}
 
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
         self._poll_interval = cfg.get("gpu", {}).get("poll_interval_seconds", 2)
@@ -3107,21 +3114,31 @@ class ModelManager:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 if state_path.exists():
-                    self._begin_slot_action(port)
-                    try:
-                        log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
-                        # Hold the FIFO ticket so the restore runs before any LLM request.
-                        ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=60.0)
+                    # Skip auto-restore if a manual restore for this model is fresher
+                    # than the guard window, so .auto.bin doesn't clobber it.
+                    _mtr = self._last_manual_restore.get(model_id)
+                    _age = (time.monotonic() - _mtr[0]) if _mtr else 0.0
+                    if _mtr and _age < MANUAL_RESTORE_GUARD_S:
+                        log.info(
+                            f"Auto-restore skipped for {model_id}: "
+                            f"manual restore {_mtr[1].name} {_age:.0f}s ago is newer"
+                        )
+                    else:
+                        self._begin_slot_action(port)
                         try:
-                            await self._perform_slot_restore(port, state_path, timeout=30.0, model_id=model_id)
-                            lm.state_path = state_path
+                            log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
+                            # Hold the FIFO ticket so the restore runs before any LLM request.
+                            ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=60.0)
+                            try:
+                                await self._perform_slot_restore(port, state_path, timeout=30.0, model_id=model_id)
+                                lm.state_path = state_path
+                            finally:
+                                queue.release_ticket(ticket)
+                        except Exception as e:
+                            log.warning(f"Auto-restore failed for {model_id}: {e}")
                         finally:
-                            queue.release_ticket(ticket)
-                    except Exception as e:
-                        log.warning(f"Auto-restore failed for {model_id}: {e}")
-                    finally:
-                        # Runs on every path so the drain counter cannot leak.
-                        self._end_slot_action(port)
+                            # Runs on every path so the drain counter cannot leak.
+                            self._end_slot_action(port)
 
             return lm
         except asyncio.CancelledError:
@@ -3685,6 +3702,7 @@ class ModelManager:
                 result = await self._unload_unlocked(mid, client_requested=True)
             if result is None or result.unloaded:
                 self._clear_recovery_failure(mid)
+                self._last_manual_restore.pop(mid, None)
             return result
 
     async def unload_model_exact(self, model_id: str) -> Optional[UnloadResult]:
@@ -3699,6 +3717,7 @@ class ModelManager:
                 result = await self._unload_unlocked(model_id, client_requested=True)
             if result is None or result.unloaded:
                 self._clear_recovery_failure(model_id)
+                self._last_manual_restore.pop(model_id, None)
             return result
 
     async def unload_all(self) -> Dict[str, Any]:
@@ -3719,6 +3738,7 @@ class ModelManager:
             result = next((r for r in results if r is not None and r.model_id == mid), None)
             if result is None or result.unloaded:
                 self._clear_recovery_failure(mid)
+                self._last_manual_restore.pop(mid, None)
         return {"unloaded_all": not failed, "unloaded": unloaded, "failed": failed}
 
     # ---------------- GPU info ----------------
@@ -4077,7 +4097,8 @@ class ModelManager:
             raise HTTPException(500, f"restore failed: {e}")
 
         lm.state_path = state_path
-        
+        self._last_manual_restore[model_id] = (time.monotonic(), state_path)
+
         return state_path
 
     async def list_states(self, model_id_input: str) -> List[str]:
