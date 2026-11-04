@@ -15,7 +15,7 @@
   "strata-restore-fifo-ordering-gap.md": 6,
   "model-type-derived-vs-override-split.md": 2,
   "status-cache-stale-commit-race.md": 2,
-  "put-model-config-route-was-missing.md": 1,
+  "put-model-config-route-was-missing.md": 2,
   "multi-instance-three-ports.md": 2,
   "powershell-splice-corrupts-encoding.md": 1,
   "httpx-dead-socket-exception-signals.md": 4,
@@ -27,7 +27,7 @@
   "bug-id-comment-citations-can-be-mistagged.md": 1,
   "lru-eviction-result-check-and-mid-load-exclusion.md": 3,
   "forwarder-generation-keyed-state-retirement.md": 2,
-  "bug-tracker-entry-format-convention.md": 2,
+  "bug-tracker-entry-format-convention.md": 3,
   "kill-proc-tree-complete-drain.md": 2,
   "native-exe-engine-blockers.md": 2,
   "stt-integrates-as-bridge-engine.md": 1,
@@ -49,5 +49,6 @@
   "bridge-card-auto-save-state-must-be-forced-off.md": 2,
   "ninfer-launch-cards-configured-26600be6.md": 1,
   "autoloader-aba-switch-facts-2026-10-31.md": 1,
-  "load-state-catch-all-swallows-inner-httpexception-codes.md": 1
+  "load-state-catch-all-swallows-inner-httpexception-codes.md": 1,
+  "memory_stats.json": 1
 }

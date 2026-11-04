@@ -5527,6 +5527,34 @@ async def unload_all_ep():
         return JSONResponse(status_code=500, content=result)
     return result
 
+@app.post("/v1/restart")
+async def restart_server():
+    """Restart the autoloader server process in place (re-exec).
+
+    Re-launches the same interpreter + argv, so the process image is replaced
+    (POSIX) / a new image is spawned inheriting this console and the old one
+    exits (Windows). The terminal that started the server stays the running
+    server — nothing is detached. In-flight LLM requests are dropped (clients
+    should retry); on-disk state (states/, engine_cards/) is untouched.
+
+    Loaded models are unloaded first so their engine subprocesses are stopped
+    cleanly — the hard re-exec skips the FastAPI lifespan shutdown, so an
+    explicit unload is what keeps them from being orphaned. Pin
+    ``--internal-port`` at startup for a reproducible internal port across
+    restarts (without a pin, a taken internal port auto-advances).
+    """
+    log.warning("Server restart requested via POST /v1/restart")
+    # Hard re-exec skips the lifespan shutdown -> stop the engine subprocesses
+    # explicitly, or loaded llama-server/bridge processes get orphaned.
+    try:
+        result = await manager.unload_all()
+        if result["failed"]:
+            log.warning(f"Restart: {len(result['failed'])} model(s) failed to unload; re-exec anyway: {result['failed']}")
+    except Exception as e:  # best-effort: a failed unload must not block the restart
+        log.warning(f"Restart: unload_all raised ({e}); re-exec anyway")
+    from server_restart import restart_server_process
+    restart_server_process()  # re-execs; does not return on success
+
 # ---------- state save / load ----------
 @app.post("/v1/models/{model_id}/state/save")
 async def save_state_ep(model_id: str, body: StateLabel):
