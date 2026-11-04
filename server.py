@@ -3939,16 +3939,90 @@ class ModelManager:
             log.debug(f"State temp cleanup failed: {e}")
         return removed
 
-    async def _perform_slot_action(self, action: str, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
-        """Attempt a slot action (save/restore) trying supported endpoint formats."""
+    async def _resolve_session_slot(self, port: int, model_id: str, session_digest: str,
+                                    timeout: float = 120.0) -> int:
+        """Map a session digest to the catalog cell that retains it (BUG_0187).
+
+        NInfer publishes one retained session per catalog cell through ``GET /slots``
+        and reports the digest of the cell a finished turn was retained under. The
+        caller captures that digest from its final SSE chunk, so it identifies the
+        caller's own KV. Refusing when no retained cell carries it is deliberate: the
+        old behaviour saved ``slot 0`` blindly, which under concurrent fleet traffic
+        captured whichever sibling dominated the single shared slot — an unrelated
+        agent's conversation written into the caller's state file.
+
+        Raises EngineSlotError (→ faithful 409) when the digest cannot be resolved, so
+        the caller fails honestly instead of saving a sibling's session.
+        """
+        base = f"http://127.0.0.1:{port}"
+        model_param = f"?model={model_id}" if model_id else ""
+        try:
+            r = await self.client.get(f"{base}/slots{model_param}", timeout=timeout)
+        except Exception as e:
+            detail = str(e) or repr(e)
+            raise EngineSlotError(
+                "slot_session_mismatch",
+                f"cannot list slots to resolve session digest {session_digest}: {detail}",
+                409)
+        if r.status_code != 200:
+            raise EngineSlotError(
+                "slot_session_mismatch",
+                f"cannot list slots to resolve session digest {session_digest}: HTTP {r.status_code}",
+                409)
+        try:
+            slots = r.json()
+        except Exception:
+            slots = None
+        if not isinstance(slots, list):
+            raise EngineSlotError(
+                "slot_session_mismatch",
+                f"slot listing is not a JSON array; cannot resolve session digest {session_digest}",
+                409)
+        for entry in slots:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("retained") and entry.get("session_digest") == session_digest:
+                try:
+                    return int(entry.get("id"))
+                except (TypeError, ValueError):
+                    break
+        log.warning(
+            f"Refusing slot save: no retained slot carries session digest {session_digest} "
+            f"on port {port} (the caller's session was evicted or replaced); "
+            f"slot 0 may hold a sibling's KV"
+        )
+        raise EngineSlotError(
+            "slot_session_mismatch",
+            f"no retained slot carries session digest {session_digest}; "
+            f"refusing to save another session's slot",
+            409)
+
+    async def _perform_slot_action(self, action: str, port: int, state_path: Path,
+                                   timeout: float = 120.0, model_id: str = "",
+                                   session_digest: str = "") -> bool:
+        """Attempt a slot action (save/restore) trying supported endpoint formats.
+
+        ``session_digest`` (BUG_0187), when supplied for a save, selects the catalog
+        cell NInfer retained that session in and adds an ``if_digest`` precondition, so
+        the save cannot capture whichever sibling currently occupies slot 0.
+        """
         base = f"http://127.0.0.1:{port}"
         # Bridge engines (NInfer) require ?model= to identify the target model.
         # llama-server ignores unknown query params, so this is safe for all engines.
         model_param = f"&model={model_id}" if model_id else ""
+
+        slot_id = 0
+        if action == "save" and session_digest:
+            slot_id = await self._resolve_session_slot(port, model_id, session_digest, timeout)
+            log.info(f"Saving session {session_digest} from slot {slot_id} to file: {state_path}")
+
+        payload = {"filename": state_path.name}
+        if action == "save" and session_digest:
+            payload["if_digest"] = session_digest
         attempts = [
-            ("/slots/0", {"filename": state_path.name}, f"URL param: ?action={action}"),
-            ("/slots", {"id_slot": 0, "filename": state_path.name}, f"URL param: ?action={action}"),
-            ("/slots", {"action": action, "id_slot": 0, "filename": state_path.name}, "JSON body params"),
+            (f"/slots/{slot_id}", dict(payload), f"URL param: ?action={action}"),
+            ("/slots", {"id_slot": slot_id, **payload}, f"URL param: ?action={action}"),
+            ("/slots", {"action": action, "id_slot": slot_id, **payload}, "JSON body params"),
         ]
 
         first_err = None
@@ -4010,14 +4084,22 @@ class ModelManager:
 
         raise RuntimeError(f"{action} failed across all slot endpoints. First error: {first_err}")
 
-    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
+    async def _perform_slot_save(self, port: int, state_path: Path, timeout: float = 120.0,
+                                 model_id: str = "", session_digest: str = "") -> bool:
         """Attempt to save slot state trying supported endpoint formats."""
         state_path.parent.mkdir(parents=True, exist_ok=True)
         # A save killed mid-write leaves a multi-GB scratch file behind; reclaim
         # the stale ones right before writing another one (never touches .bin).
         self._cleanup_state_temps()
-        log.info(f"Saving slot 0 state to file: {state_path}")
-        return await self._perform_slot_action("save", port, state_path, timeout, model_id=model_id)
+        if session_digest:
+            # _perform_slot_action logs the resolved cell; naming "slot 0" here would be
+            # actively misleading (BUG_0187: the resolved cell is usually not 0).
+            log.info(f"Saving session state to file: {state_path}")
+        else:
+            log.info(f"Saving slot 0 state to file: {state_path}")
+        return await self._perform_slot_action("save", port, state_path, timeout,
+                                               model_id=model_id,
+                                               session_digest=session_digest)
 
     async def _perform_slot_restore(self, port: int, state_path: Path, timeout: float = 120.0, model_id: str = "") -> bool:
         """Attempt to restore slot state trying supported endpoint formats."""
@@ -4026,7 +4108,8 @@ class ModelManager:
         log.info(f"Restoring slot 0 state from file: {state_path}")
         return await self._perform_slot_action("restore", port, state_path, timeout, model_id=model_id)
 
-    async def save_state(self, model_id_input: str, label: str = "default") -> Path:
+    async def save_state(self, model_id_input: str, label: str = "default",
+                         session_digest: str = "") -> Path:
         model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
             raise HTTPException(400, "Model not loaded")
@@ -4044,7 +4127,14 @@ class ModelManager:
                 queue = self.queue_registry.get_or_create(model_id, lm.port)
                 ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
                 try:
-                    await self._perform_slot_save(lm.port, state_path, timeout=120.0, model_id=model_id)
+                    # Only pass the kwarg when a digest is actually supplied, so the
+                    # legacy path stays byte-for-byte compatible with existing callers
+                    # and test doubles (BUG_0187).
+                    save_kwargs = {"model_id": model_id}
+                    if session_digest:
+                        save_kwargs["session_digest"] = session_digest
+                    await self._perform_slot_save(lm.port, state_path, timeout=120.0,
+                                                  **save_kwargs)
                 finally:
                     queue.release_ticket(ticket)
             finally:
@@ -4812,6 +4902,10 @@ class SelectBackendPayload(BaseModel):
 
 class StateLabel(BaseModel):
     label: str = "default"
+    # NInfer's identity for the retained session to save (BUG_0187). When present the
+    # manager resolves it to the matching catalog cell and enforces it with if_digest;
+    # empty keeps the legacy single-slot (slot 0) behaviour.
+    session_digest: str = ""
 
 # ---------- status / dashboard / health ----------
 @app.get("/")
@@ -5561,7 +5655,8 @@ async def save_state_ep(model_id: str, body: StateLabel):
     # State save/restore is supported by both llama.cpp and Strata engines.
     # (Previously gated to llama-only; Strata's serve exposes the same /slots/0?action=save endpoint.)
     try:
-        p = await manager.save_state(model_id, body.label)
+        p = await manager.save_state(model_id, body.label,
+                                     session_digest=body.session_digest)
         size = p.stat().st_size
         log.info(f"State saved for model={model_id} label={body.label} path={p.name} size={size} bytes")
         return {"id": model_id, "label": body.label, "path": str(p)}
