@@ -48,9 +48,9 @@ class ModelCommandQueue:
             queue.release_ticket(ticket)
     """
 
-    def __init__(self, port: int, model_id: str):
-        self.port = port
+    def __init__(self, model_id: str, port: int = 0):
         self.model_id = model_id
+        self.port = port
         self._pending: Deque[Tuple[int, threading.Event]] = deque()  # FIFO queue
         self._granted_id: Optional[int] = None   # ticket ID currently held
         self._granted_event: Optional[threading.Event] = None
@@ -157,31 +157,40 @@ class ModelCommandQueue:
 
 
 class ModelQueueRegistry:
-    """Registry of per-model FIFO ticket queues, keyed by engine port."""
+    """Registry of per-model FIFO ticket queues, keyed by model id.
+
+    Non-re-entrant: a single ``_granted_id`` per queue means a second
+    ``acquire_ticket`` on the same queue blocks until the holder releases.
+    """
 
     def __init__(self):
-        self._queues: Dict[int, ModelCommandQueue] = {}
+        self._queues: Dict[str, ModelCommandQueue] = {}
         self._lock = threading.Lock()
 
-    def get_or_create(self, port: int, model_id: str) -> ModelCommandQueue:
-        """Return the queue for ``port``, creating it on first use."""
+    def get_or_create(self, model_id: str, port: int = 0) -> ModelCommandQueue:
+        """Return the queue for ``model_id``, creating it on first use.
+
+        If an existing queue has a different port, update it (a reload onto a
+        new port reuses the same queue) and log at debug.
+        """
         with self._lock:
-            q = self._queues.get(port)
+            q = self._queues.get(model_id)
             if q is None:
-                q = ModelCommandQueue(port, model_id)
-                self._queues[port] = q
-            elif q.model_id != model_id:
-                # Expected: aliases (e.g. engine name vs autoloader internal ID) resolve
-                # to the same port. Debug-level only to avoid spam on every request.
+                q = ModelCommandQueue(model_id, port)
+                self._queues[model_id] = q
+            elif q.port != port and port != 0:
+                # A reload assigned a new port to the same model; keep the queue
+                # but update the informational port field.
+                old = q.port
+                q.port = port
                 log.debug(
-                    f"queue for port {port} created with model_id={q.model_id!r}, "
-                    f"requested with {model_id!r} — returning existing queue")
+                    f"queue for model {model_id!r} port updated {old} -> {port}")
             return q
 
-    def remove(self, port: int) -> None:
-        """Stop and drop the queue for ``port`` (no-op if absent)."""
+    def remove(self, model_id: str) -> None:
+        """Stop and drop the queue for ``model_id`` (no-op if absent)."""
         with self._lock:
-            q = self._queues.pop(port, None)
+            q = self._queues.pop(model_id, None)
         if q is not None:
             q.stop()
 

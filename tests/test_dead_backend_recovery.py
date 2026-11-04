@@ -84,10 +84,10 @@ class _FakeRegistry:
         self.calls = []
         self.queues = {}
 
-    def get_or_create(self, port: int, model_id: str) -> _FakeQueue:
-        self.calls.append((port, model_id))
-        self.queues.setdefault(port, _FakeQueue())
-        return self.queues[port]
+    def get_or_create(self, model_id: str, port: int = 0) -> _FakeQueue:
+        self.calls.append((model_id, port))
+        self.queues.setdefault(model_id, _FakeQueue())
+        return self.queues[model_id]
 
 
 class _StoppedQueue:
@@ -672,7 +672,7 @@ def test_pipe_with_ticket_recovers_and_retries_same_request(monkeypatch):
     assert all(label == _LLAMA_SERVER_LABEL for _, label in calls)
     assert errors == []
     # Retry must use the recovered port's queue.
-    assert mgr.queue_registry.calls == [(9002, "dead.gguf")]
+    assert mgr.queue_registry.calls == [("dead.gguf", 9002)]
 
 
 def test_pipe_with_ticket_returns_503_when_recovery_fails(monkeypatch):
@@ -719,7 +719,7 @@ def test_pipe_with_ticket_joins_recovery_after_queue_stop(monkeypatch):
 
     assert calls == [9002]
     assert errors == []
-    assert mgr.queue_registry.calls == [(9002, "dead.gguf")]
+    assert mgr.queue_registry.calls == [("dead.gguf", 9002)]
 
 
 def test_pipe_with_ticket_only_retries_once(monkeypatch):

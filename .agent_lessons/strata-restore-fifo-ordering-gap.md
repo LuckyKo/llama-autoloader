@@ -6,6 +6,7 @@ confidence: verified
 author: researcher_strata-restore-fifo-investigation_20261015_042252.jsonl
 contributors:
   - coder_autoloader-fifo-queue-build_20261015_045500.jsonl
+  - researcher_digger0018_20261103_110015.jsonl
 ---
 
 # Autoloader has no per-model FIFO queue → Strata restore races with LLM requests
@@ -43,3 +44,26 @@ Implemented in `model_queue.py` (`ModelCommandQueue` + `ModelQueueRegistry`), in
 - `server.py` `_unload_unlocked`: **auto-save is intentionally NOT ticketed** — teardown path, no later LLM request depends on it, and the engine's own FIFO already serializes it; ticketing it would hold the asyncio lock across a long ticket wait for no ordering gain (reviewer MAJOR). The queue IS stopped/dropped (`queue_registry.remove(port)`) before the process is killed. `ModelManager.stop()` calls `queue_registry.stop_all()`.
 
 **Timeout note:** forwarder ticket timeout 300s; state-op ticket timeout 120s (per design). A generation longer than 120s can make a queued save/restore time out — deliberate, matches the design; revisit only if contested long generations are observed.
+
+---
+
+## Addendum (2026-11-03, researcher digger0018 — llama-autoloader @ `f510e2b`)
+
+**The "uncontested at load" claim in the `_do_load_model` bullet above is wrong for the manual
+`load_state` path.** It holds for chat-triggered JIT loads (every concurrent forwarder request *joins*
+the same load task, so the auto-restore does reach the engine first) — but not when `load_state` itself
+triggers the load: `load_state` acquires its ticket only **after** `load_model` returns, while the
+forwarder's post-JIT request takes its ticket the moment the load task completes and wins (direct call
+vs `asyncio.to_thread`). That is BUG_0018: the restore lands, a concurrent continuation was already
+cataloged, and the next request re-prefills at 0% instead of ~98.8%.
+
+**Why the obvious fix is blocked, and what it requires:** see
+[[ticket-queue-port-keyed-blocks-pre-load-reservation]] — the registry is keyed by engine *port*, which
+does not exist until after the load, so a pre-load reservation is impossible without re-keying by
+model_id. That memory also records the non-re-entrancy consequence (a 60 s "Auto-restore failed" burn,
+not a deadlock) and why a `skip_auto_restore` parameter is dropped by the load-task join.
+
+**Line numbers in this memory are stale** (pinned to the 2026-10-15 tree). Live ticket sites at
+`f510e2b`: `save_state` ~`:4001`, `load_state` `:4084-4085`, auto-restore `:3131`, forwarder post-JIT
+`:893-895`. Re-derive from the symbol names, not the numbers.
+Plan: `N:\work\WD\AgentWorkspace\plans\BUG_0018_load_window_ticket_plan.md`.

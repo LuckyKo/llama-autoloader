@@ -90,12 +90,12 @@ def mgr(isolated_manager):
 
 
 def _watch_queue_removals(mgr_, order):
-    """Record when an unload drops a port's FIFO queue (the observable boundary)."""
+    """Record when an unload drops a model's FIFO queue (the observable boundary)."""
     real_remove = mgr_.queue_registry.remove
 
-    def watched_remove(port):
+    def watched_remove(model_id):
         order.append("queue-dropped")
-        real_remove(port)
+        real_remove(model_id)
 
     mgr_.queue_registry.remove = watched_remove
 
@@ -205,7 +205,7 @@ class TestUnloadDrain:
 
     async def test_no_drain_when_no_slot_action_is_in_flight(self, mgr, autoloader_logs):
         """Nothing counted against the port -> no wait, no INFO line."""
-        mgr.queue_registry.get_or_create(19500, "m.gguf").acquire_ticket(timeout=5.0)  # a queue holder, not a slot action
+        mgr.queue_registry.get_or_create("m.gguf", 19500).acquire_ticket(timeout=5.0)  # a queue holder, not a slot action
         assert mgr._inflight_slot_actions == {}
         await mgr.unload_model("m.gguf")
         assert not any("waiting for in-flight slot action" in m for m in autoloader_logs)
@@ -354,3 +354,278 @@ class TestStateTempSweep:
         in_flight.write_bytes(b"x")
         assert mgr._cleanup_state_temps() == 0
         assert in_flight.exists()
+
+
+# ===========================================================================
+# BUG_0018: load-window ticket ordering regression guards
+# ===========================================================================
+
+
+class TestLoadWindowTicketOrdering:
+    """The pre-load reservation guarantees the restore's ticket is granted
+    before any chat request that lands in the load window."""
+
+    async def test_restore_ticket_granted_before_chat_ticket(self, mgr):
+        """Drive load_state on an unloaded model; a chat-side acquire_ticket
+        must be granted AFTER the restore releases its ticket.
+
+        The discriminating observable is the SHARED order list: without the
+        pre-load reservation the chat ticket would be granted first (order
+        would be ["llm", "restore", ...]).
+        """
+        order: list[str] = []
+        load_gate = asyncio.Event()
+
+        # Remove the model from loaded so load_state triggers a JIT load.
+        del mgr.loaded["m.gguf"]
+        mgr.models["m.gguf"].ready = False
+
+        async def _fake_load(model_id):
+            # Block until the test signals the load is complete.
+            await load_gate.wait()
+            lm = MagicMock()
+            lm.port = 19500
+            lm.ready = True
+            lm.config = mgr.models["m.gguf"]
+            lm.state_path = None
+            lm.pid = 4242
+            lm.generation = 1
+            mgr.loaded[model_id] = lm
+            return lm
+
+        with patch.object(mgr, "load_model", new=AsyncMock(side_effect=_fake_load)):
+            with patch.object(mgr, "_perform_slot_restore", new=AsyncMock()) as mock_restore:
+                async def _restore(port, path, timeout=None, model_id=None):
+                    order.append("restore")
+                    await asyncio.sleep(0.05)  # hold the ticket briefly
+                    order.append("restore-end")
+
+                mock_restore.side_effect = _restore
+                task = asyncio.create_task(mgr.load_state("m.gguf", "lbl"))
+
+                # Wait until the pre-load reservation has granted the ticket.
+                queue = mgr.queue_registry.get_or_create("m.gguf", 19500)
+                await wait_until(lambda: queue._granted_id is not None,
+                                 "pre-load ticket granted", deadline=5.0)
+
+                # Now try a chat-side ticket: it must queue behind the restore.
+                import threading
+
+                def _chat():
+                    tid = queue.acquire_ticket(timeout=5.0)
+                    order.append("llm")
+                    queue.release_ticket(tid)
+
+                t = threading.Thread(target=_chat)
+                t.start()
+
+                # Unblock the load; the restore will run and release the ticket.
+                load_gate.set()
+                await task
+                t.join(timeout=5.0)
+
+                # The discriminating assertion: the SHARED order list proves
+                # the restore ran before the chat ticket was granted.
+                assert order == ["restore", "restore-end", "llm"], \
+                    f"ticket ordering wrong (pre-load reservation missing?): {order}"
+
+    async def test_auto_restore_suppressed_while_reservation_held(self, mgr, autoloader_logs):
+        """With the pre-load ticket held, _do_load_model's auto-restore must NOT
+        call acquire_ticket (no 60 s stall, no 'Auto-restore failed' log).
+
+        We assert the suppression flag is armed *inside* the fake load (proving
+        it is set before load_model runs), and that no auto-restore failure
+        appears in the logs.
+        """
+        del mgr.loaded["m.gguf"]
+        mgr.models["m.gguf"].ready = False
+        flag_armed: list[bool] = []
+
+        async def _fake_load(model_id):
+            # Prove the suppression flag is armed BEFORE the load body runs.
+            flag_armed.append(model_id in mgr._suppress_auto_restore)
+            lm = MagicMock()
+            lm.port = 19500
+            lm.ready = True
+            lm.config = mgr.models["m.gguf"]
+            lm.state_path = None
+            lm.pid = 4242
+            lm.generation = 1
+            mgr.loaded[model_id] = lm
+            return lm
+
+        with patch.object(mgr, "load_model", new=AsyncMock(side_effect=_fake_load)):
+            with patch.object(mgr, "_perform_slot_restore", new=AsyncMock()):
+                await mgr.load_state("m.gguf", "lbl")
+
+        # The flag was armed before the load body ran.
+        assert flag_armed == [True], "suppression flag not armed before load"
+        # No auto-restore failure was logged (the gate saw the flag and skipped).
+        assert "Auto-restore failed" not in " ".join(autoloader_logs)
+
+    async def test_reservation_failure_leaves_no_leak(self, mgr):
+        """If the reservation raises (queue stopped), no _inflight_slot_actions
+        entry leaks and no _granted_id is held."""
+        del mgr.loaded["m.gguf"]
+        mgr.models["m.gguf"].ready = False
+
+        # Stop the queue so acquire_ticket raises RuntimeError.
+        q = mgr.queue_registry.get_or_create("m.gguf", 19500)
+        q.stop()
+
+        async def _fake_load(model_id):
+            lm = MagicMock()
+            lm.port = 19500
+            lm.ready = True
+            lm.config = mgr.models["m.gguf"]
+            lm.state_path = None
+            lm.pid = 4242
+            lm.generation = 1
+            mgr.loaded[model_id] = lm
+            return lm
+
+        with patch.object(mgr, "load_model", new=AsyncMock(side_effect=_fake_load)):
+            with pytest.raises(HTTPException) as exc:
+                await mgr.load_state("m.gguf", "lbl")
+            # The RuntimeError from the stopped queue is caught by the catch-all 500.
+            assert exc.value.status_code == 500
+
+        # No leaked slot-action counter entry.
+        assert mgr._inflight_slot_actions == {}
+        # No held ticket on the (stopped) queue.
+        assert q._granted_id is None
+
+    async def test_load_failure_releases_ticket(self, mgr):
+        """If load_model raises while the ticket is held, the ticket is released
+        (no leaked _granted_id, no pending waiters)."""
+        del mgr.loaded["m.gguf"]
+        mgr.models["m.gguf"].ready = False
+
+        async def _failing_load(model_id):
+            raise RuntimeError("engine spawn failed")
+
+        q = mgr.queue_registry.get_or_create("m.gguf", 19500)
+        with patch.object(mgr, "load_model", new=AsyncMock(side_effect=_failing_load)):
+            with pytest.raises(HTTPException) as exc:
+                await mgr.load_state("m.gguf", "lbl")
+            # The load failure is surfaced as 503 (the inner except catches it).
+            assert exc.value.status_code == 503
+
+        # The ticket was released in the outer finally.
+        assert q._granted_id is None
+        assert q.pending_count() == 0
+
+    # ---------------------------------------------------------------------------
+    # BUG_0015: auto-restore pre-load reservation (the AUTO path in _do_load_model)
+    # ---------------------------------------------------------------------------
+
+    async def test_auto_restore_reserves_ticket_preload(self, mgr):
+        """BUG_0015: the auto-restore path in _do_load_model reserves the FIFO ticket
+        *before* the engine is ready, so a chat request that lands in the JIT-load
+        window queues *behind* the auto-restore (not ahead of it).
+
+        Discriminating observable: while the pre-load ticket is held in the load window
+        (_wait_until_ready gated), a chat-side acquire_ticket must be granted only AFTER
+        the auto-restore runs and releases the ticket. Without the fix the ticket is
+        acquired only after readiness, so a chat request landing in the window would be
+        granted first (order ["llm", "restore", ...]).
+        """
+        # Unload the model so _do_load_model runs a real (mocked) load.
+        del mgr.loaded["m.gguf"]
+        cfg = mgr.models["m.gguf"]
+        cfg.ready = False
+        mgr.default_auto_save_state = True  # enable the auto-restore gate
+        mgr.gguf_paths["m.gguf"] = mgr.root_dir / "m.gguf"
+
+        # The auto state file must exist for the auto-restore to fire.
+        (mgr.save_state_dir / "m.gguf.auto.bin").write_bytes(b"auto-state")
+
+        order: list[str] = []
+        load_gate = asyncio.Event()
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        fake_proc.stdout = None
+
+        async def _fake_wait(port, proc=None, timeout=None, abort_probe=None):
+            # Hold the pre-load ticket in the load window until the test releases it.
+            await load_gate.wait()
+            return True
+
+        async def _fake_restore(port, path, timeout=None, model_id=None):
+            order.append("restore")
+            await asyncio.sleep(0.02)  # hold the ticket briefly
+            order.append("restore-end")
+
+        with patch.object(mgr, "_allocate_port", return_value=19500), \
+             patch.object(server, "_launch_llama", return_value=(["llama-server"], None, None)), \
+             patch.object(server.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(mgr, "_start_log_thread", return_value=None), \
+             patch.object(mgr, "_invalidate_status", return_value=None), \
+             patch.object(mgr, "_wait_until_ready", new=AsyncMock(side_effect=_fake_wait)), \
+             patch.object(mgr, "_perform_slot_restore", new=AsyncMock(side_effect=_fake_restore)):
+            task = asyncio.create_task(mgr._do_load_model("m.gguf"))
+
+            # Wait until the pre-load reservation has granted the ticket (the
+            # discriminating precondition: it is held *before* the engine is ready).
+            queue = mgr.queue_registry.get_or_create("m.gguf", 19500)
+            await wait_until(lambda: queue._granted_id is not None,
+                             "pre-load ticket granted", deadline=5.0)
+
+            # Now a chat-side ticket: it must queue behind the auto-restore.
+            import threading
+
+            def _chat():
+                tid = queue.acquire_ticket(timeout=5.0)
+                order.append("llm")
+                queue.release_ticket(tid)
+
+            t = threading.Thread(target=_chat)
+            t.start()
+
+            # Release the load window: _wait_until_ready returns, the auto-restore runs
+            # under the pre-load ticket, then the ticket is released in the finally.
+            load_gate.set()
+            await task
+            t.join(timeout=5.0)
+
+            # The discriminating assertion: the SHARED order list proves the auto-restore
+            # ran before the chat ticket was granted.
+            assert order == ["restore", "restore-end", "llm"], \
+                f"ticket ordering wrong (pre-load reservation missing?): {order}"
+
+    async def test_auto_restore_ticket_released_on_failed_load(self, mgr):
+        """BUG_0015: if the load fails (not ready), the pre-load ticket is released in
+        the finally — no leaked _granted_id that would wedge the queue behind a holder
+        that will never return.
+
+        This is the *release*-path leak guard (the pre-load hoist itself is proven by
+        test_auto_restore_reserves_ticket_preload above); a missing finally release is
+        what this test catches.
+        """
+        del mgr.loaded["m.gguf"]
+        cfg = mgr.models["m.gguf"]
+        cfg.ready = False
+        mgr.default_auto_save_state = True
+        mgr.gguf_paths["m.gguf"] = mgr.root_dir / "m.gguf"
+
+        fake_proc = MagicMock()
+        fake_proc.pid = 99999
+        fake_proc.stdout = None
+
+        async def _fake_wait(port, proc=None, timeout=None, abort_probe=None):
+            return False  # the engine never becomes ready
+
+        with patch.object(mgr, "_allocate_port", return_value=19500), \
+             patch.object(server, "_launch_llama", return_value=(["llama-server"], None, None)), \
+             patch.object(server.subprocess, "Popen", return_value=fake_proc), \
+             patch.object(mgr, "_start_log_thread", return_value=None), \
+             patch.object(mgr, "_invalidate_status", return_value=None), \
+             patch.object(mgr, "_wait_until_ready", new=AsyncMock(side_effect=_fake_wait)), \
+             patch.object(mgr, "_unload_unlocked", new=AsyncMock(return_value=None)):
+            queue = mgr.queue_registry.get_or_create("m.gguf", 19500)
+            with pytest.raises(RuntimeError, match="failed to start"):
+                await mgr._do_load_model("m.gguf")
+
+            # The pre-load ticket was released in the finally (no leak).
+            assert queue._granted_id is None

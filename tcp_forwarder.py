@@ -870,7 +870,7 @@ class RawTCPForwarder:
                     # model's FIFO ticket. The ticket is granted in strict submission order,
                     # so a state restore enqueued before this request runs first (fixes the
                     # full-reprocess race). No per-request log: this is the hot path.
-                    queue = self.model_manager.queue_registry.get_or_create(target_port, resolved_model_id)
+                    queue = self.model_manager.queue_registry.get_or_create(resolved_model_id, target_port)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
                                              target_port, resolved_model_id, queue,
                                              expected_generation=target_generation)
@@ -889,12 +889,12 @@ class RawTCPForwarder:
                 log.info(f"Model '{model_id}' not loaded; triggering JIT load...")
                 target = self._jit_load_and_wait_target(model_id)
                 if target:
-                    target_port, target_generation = target
+                    target_port, target_generation, resolved_model_id = target
                     # Acquire the ticket only AFTER the model is loaded and ready, so the
                     # load itself is never gated by the queue.
-                    queue = self.model_manager.queue_registry.get_or_create(target_port, model_id)
+                    queue = self.model_manager.queue_registry.get_or_create(resolved_model_id, target_port)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
-                                           target_port, model_id, queue,
+                                           target_port, resolved_model_id, queue,
                                            expected_generation=target_generation)
                     return
                 # JIT load failed (unknown model / timeout / spawn error / cooldown).
@@ -1509,13 +1509,16 @@ class RawTCPForwarder:
         target = self._jit_load_and_wait_target(model_id)
         return target[0] if target else None
 
-    def _jit_load_and_wait_target(self, model_id: str) -> Optional[Tuple[int, int]]:
+    def _jit_load_and_wait_target(self, model_id: str) -> Optional[Tuple[int, int, str]]:
         """Trigger a JIT load of ``model_id`` and block until it is ready.
 
-        Returns ``(port, engine_generation)`` on success, or None on failure
-        (unknown model / timeout / error). The generation is captured from the same
-        LoadedModel that returned ready, so it identifies the exact instance even if
-        another load replaces it immediately afterwards.
+        Returns ``(port, engine_generation, resolved_model_id)`` on success, or
+        None on failure (unknown model / timeout / error). The generation is
+        captured from the same LoadedModel that returned ready, so it identifies
+        the exact instance even if another load replaces it immediately
+        afterwards. The resolved_model_id is the canonical registry key (the
+        request name resolved against the loaded set), used to key the FIFO
+        ticket queue.
 
         The request's model is resolved FIRST, so an unknown name that already has a
         resident fallback joins that model's load instead of trying to load a model
@@ -1559,7 +1562,7 @@ class RawTCPForwarder:
             generation = int(getattr(lm, "generation", 0) or 0)
             log.info(f"Model '{model_id}' loaded on port {lm.port} "
                      f"(generation {generation})")
-            return lm.port, generation
+            return lm.port, generation, model_id
         log.error(f"Model '{model_id}' load completed but not ready")
         return None
 
@@ -1621,7 +1624,7 @@ class RawTCPForwarder:
             new_port, new_generation = recovered
             log.info(f"Retrying request for model '{model_id}' on recovered port "
                      f"{new_port} (generation {new_generation})")
-            retry_queue = self.model_manager.queue_registry.get_or_create(new_port, model_id)
+            retry_queue = self.model_manager.queue_registry.get_or_create(model_id, new_port)
             self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
                                    new_port, model_id, retry_queue,
                                    expected_generation=new_generation,
@@ -1632,7 +1635,7 @@ class RawTCPForwarder:
                 client_sock, 503,
                 f"Model '{model_id}' is busy (queue wait exceeded {_QUEUE_WAIT_TIMEOUT:.0f}s)")
         except RuntimeError as e:
-            # The recovery path drops the dead port's FIFO queue, which wakes any
+            # The recovery path drops the dead model's FIFO queue, which wakes any
             # requests still waiting on it. They are not doomed: join the recovery and
             # retry once on the replacement port instead of surfacing a spurious 503.
             active = getattr(self.model_manager, "recovery_in_progress", None)
@@ -1651,7 +1654,7 @@ class RawTCPForwarder:
                 if recovered:
                     new_port, new_generation = recovered
                     retry_queue = self.model_manager.queue_registry.get_or_create(
-                        new_port, model_id)
+                        model_id, new_port)
                     self._pipe_with_ticket(client_sock, raw_headers, body_prefix,
                                            new_port, model_id, retry_queue,
                                            expected_generation=new_generation,

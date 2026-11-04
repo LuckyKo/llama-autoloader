@@ -1142,7 +1142,7 @@ class TestModelFallbackRouting:
                 self.last_used = time.monotonic()
 
         class _QueueReg:
-            def get_or_create(self, port, mid):
+            def get_or_create(self, mid, port=0):
                 return mid
 
         class _Mgr:

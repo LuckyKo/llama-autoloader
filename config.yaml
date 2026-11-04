@@ -53,6 +53,37 @@ engines:
     enabled: true
     label: NInfer
     ready_timeout_seconds: 600
+  basalt:
+    argv:
+    - N:/work/WD/basalt/bin/basalt.exe
+    - serve
+    - --config
+    - '{derived_config}'
+    - --port
+    - '{port}'
+    - --host
+    - 127.0.0.1
+    config_key: server
+    config_overlay:
+      server:
+        cors-origin: '*'
+        idle-unload: 0
+        lazy: false
+      engine:
+        conversation-cache-dir: N:/work/stuff/Beta/llama-autoloader/states/basalt
+        conversation-cache-disk-mib: 4096
+    config_overlay_dynamic:
+      server:
+        alias: '{model_id}'
+    configs_dir: N:/work/WD/basalt
+    cwd: N:/work/WD/basalt
+    enabled: true
+    label: Basalt
+    min_free_vram_flag: --min-free-vram-mib
+    ready_timeout_seconds: 600
+    graceful_unload:
+      path: /v1/unload
+      timeout_seconds: 20
 gpu:
   poll_interval_seconds: 5
 launcher:

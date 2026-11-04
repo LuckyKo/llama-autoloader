@@ -35,7 +35,7 @@ from model_queue import ModelCommandQueue, ModelQueueRegistry  # noqa: E402
 class TestFifoOrdering:
     def test_granted_order_matches_ticket_order_under_contention(self):
         """Many concurrent acquirers must be granted in strict ticket order."""
-        q = ModelCommandQueue(9001, "m")
+        q = ModelCommandQueue("m", 9001)
         n = 8
         granted: list[int] = []
         glock = threading.Lock()
@@ -60,7 +60,7 @@ class TestFifoOrdering:
     def test_no_self_regrant(self):
         """Regression for the §3.5 design bug: releasing must grant the NEXT
         waiter, never re-grant the just-released ticket."""
-        q = ModelCommandQueue(9002, "m")
+        q = ModelCommandQueue("m", 9002)
         first = q.acquire_ticket(timeout=5.0)   # granted immediately (no contention)
         assert first == 1
 
@@ -78,7 +78,7 @@ class TestFifoOrdering:
 
     def test_state_op_before_llm_is_granted_first(self):
         """The core fix: a restore enqueued before an LLM request runs first."""
-        q = ModelCommandQueue(9003, "m")
+        q = ModelCommandQueue("m", 9003)
         order: list[str] = []
 
         def restore():
@@ -105,7 +105,7 @@ class TestFifoOrdering:
 class TestTimeoutAndStop:
     def test_timeout_removes_pending_entry(self):
         """A waiter that times out must not leak into the pending list."""
-        q = ModelCommandQueue(9004, "m")
+        q = ModelCommandQueue("m", 9004)
         held = q.acquire_ticket(timeout=5.0)
         try:
             q.acquire_ticket(timeout=0.2)
@@ -121,7 +121,7 @@ class TestTimeoutAndStop:
         q.release_ticket(nxt)
 
     def test_stop_wakes_waiter_and_refuses_new_tickets(self):
-        q = ModelCommandQueue(9005, "m")
+        q = ModelCommandQueue("m", 9005)
         held = q.acquire_ticket(timeout=5.0)
         err: dict[str, str] = {}
 
@@ -150,7 +150,7 @@ class TestTimeoutAndStop:
 
 class TestReleaseSafety:
     def test_spurious_release_ignored(self):
-        q = ModelCommandQueue(9006, "m")
+        q = ModelCommandQueue("m", 9006)
         tid = q.acquire_ticket(timeout=5.0)
         q.release_ticket(999)                    # wrong id -> ignored, no wrong grant
         assert q.pending_count() == 0
@@ -162,7 +162,7 @@ class TestReleaseSafety:
 
     def test_context_manager_releases_on_exception(self):
         """A body that raises must still release the ticket (no deadlock)."""
-        q = ModelCommandQueue(9007, "m")
+        q = ModelCommandQueue("m", 9007)
         try:
             with q.ticket(timeout=5.0):
                 raise ValueError("boom")
@@ -177,18 +177,27 @@ class TestReleaseSafety:
 class TestRegistry:
     def test_get_or_create_is_idempotent(self):
         reg = ModelQueueRegistry()
-        a = reg.get_or_create(9008, "x")
-        b = reg.get_or_create(9008, "x")
+        a = reg.get_or_create("x", 9008)
+        b = reg.get_or_create("x", 9008)
         assert a is b
-        # Different port -> different queue.
-        c = reg.get_or_create(9009, "y")
+        # Different model -> different queue.
+        c = reg.get_or_create("y", 9009)
         assert c is not a
+
+    def test_same_model_new_port_after_reload_returns_same_queue(self):
+        """A reload onto a new port reuses the same queue (pre-load reservation)."""
+        reg = ModelQueueRegistry()
+        a = reg.get_or_create("m.gguf")
+        b = reg.get_or_create("m.gguf", port=9024)
+        assert a is b
+        # The port was updated on the existing queue.
+        assert a.port == 9024
 
     def test_remove_and_stop_all_are_idempotent(self):
         reg = ModelQueueRegistry()
-        q = reg.get_or_create(9010, "x")
-        reg.remove(9010)
-        reg.remove(9010)                         # no-op on absent port
+        q = reg.get_or_create("x", 9010)
+        reg.remove("x")
+        reg.remove("x")                         # no-op on absent model
         reg.stop_all()                           # no-op on empty registry
         # A removed queue is stopped: new acquires raise.
         try:

@@ -56,7 +56,7 @@ from bridge_adapter import _launch_llama, _launch_bridge, _expand_token
 
 # Per-model FIFO ticket queue: orders LLM requests (TCP forwarder) against state
 # save/restore (FastAPI) so a restore enqueued first runs before the next request.
-from model_queue import ModelQueueRegistry
+from model_queue import ModelCommandQueue, ModelQueueRegistry
 from tcp_forwarder import (LEGACY_GENERATION, RawTCPForwarder,
                           failure_record_applies, gen_matches)
 
@@ -1130,7 +1130,7 @@ class ModelManager:
         # A cooldown suppresses repeated spawn/readiness attempts after a deterministic
         # failure (missing binary, bad config, GPU allocation failure, ...).
         self._recovery_failures: Dict[str, RecoveryFailure] = {}
-        # Per-model FIFO ticket queues (keyed by engine port). The TCP forwarder and
+        # Per-model FIFO ticket queues (keyed by model id). The TCP forwarder and
         # the state save/restore paths both acquire a ticket here so operations for a
         # model run in strict FIFO order. See model_queue.py.
         self.queue_registry = ModelQueueRegistry()
@@ -1151,6 +1151,17 @@ class ModelManager:
         # landing after the unload finished is the legitimate safe-mode one and
         # is allowed through.
         self._unload_in_progress: Set[str] = set()
+        # model_ids whose load_state is holding a pre-load FIFO ticket: the
+        # auto-restore gate in _do_load_model skips its own acquire_ticket for
+        # these (a manager-level flag, not a load_model parameter, because
+        # _load_model_serialized joins an already-running load task and would
+        # silently drop a parameter). Any load that STARTS after the flag is
+        # armed sees it; a load already past the gate is unaffected — its
+        # auto-restore will wait the full 60 s timeout and log "Auto-restore
+        # failed" (a bounded stall, not a deadlock). The "no Auto-restore
+        # failed" verification claim is conditional on which side wins that
+        # race.
+        self._suppress_auto_restore: Set[str] = set()
         # model_ids whose DELIBERATE unload failed (the engine process could not be
         # verified dead, BUG_0014). The model stays tracked with ready=False and a dead
         # engine port — exactly the shape dead-backend recovery treats as "relaunch it",
@@ -2986,6 +2997,11 @@ class ModelManager:
         if not model_id or not model_id.strip():
             raise ValueError("Model ID must be a non-empty string")
         try:
+            # BUG_0015: the pre-load FIFO ticket (reserved after the lock, before
+            # _wait_until_ready) and its queue. Initialized here so the outer finally
+            # can release them on every path (success / CancelledError / 503).
+            queue: Optional["ModelCommandQueue"] = None
+            ticket: Optional[int] = None
             async with self._lock:
                 existing = self.loaded.get(model_id)
                 if existing is not None and (force or not existing.ready):
@@ -3074,6 +3090,27 @@ class ModelManager:
                 self._start_log_thread(model_id, proc)
                 self._invalidate_status()  # Force status cache rebuild after load
 
+            # BUG_0015: reserve the model's FIFO ticket *before* the engine is ready, so
+            # the auto-restore below (and any chat request that lands in the JIT-load
+            # window) is ordered through one queue. Without this, a chat request that
+            # reaches the engine between "model ready" and "ticket acquired" holds KV
+            # first, and the auto-restore's state/load 400s ("snapshot does not fit the
+            # free KV capacity"). The auto-restore is the ticket owner for a normal load;
+            # the manual load_state path holds the ticket itself and sets
+            # _suppress_auto_restore, in which case the load must NOT re-acquire — the
+            # FIFO ticket is non-re-entrant, so a second acquire on the same queue would
+            # block behind its own holder and burn the 60 s timeout.
+            queue = self.queue_registry.get_or_create(model_id, port)
+            if model_id not in self._suppress_auto_restore:
+                try:
+                    ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=60.0)
+                except TimeoutError:
+                    # The model is busy (a chat request has held the ticket for 60 s).
+                    # The load itself succeeded; only the auto-restore is skipped.
+                    # Non-fatal, same contract as a failed auto-restore below.
+                    log.warning(f"Auto-restore ticket reservation timed out for {model_id} "
+                                f"(model busy); auto-restore skipped")
+
             # Wait until ready OUTSIDE the lock! Bridge first loads can be slow (multi-GPU),
             # so the timeout comes from the engine entry; llama keeps the original 120s.
             ready = await self._wait_until_ready(
@@ -3103,14 +3140,16 @@ class ModelManager:
             # failed-recovery circuit breaker for this model (BUG_0007).
             self._clear_recovery_failure(model_id)
 
-            # Start this model's FIFO queue now that it is ready, so the auto-restore
-            # below and any concurrent LLM request are ordered through one queue.
-            queue = self.queue_registry.get_or_create(port, model_id)
-
             # Auto-restore session state if enabled and cached auto state exists.
             # Slot save/restore is supported by llama-server and NInfer; other bridge
-            # engines (e.g. Strata) handle it internally via config.
-            if (cfg.auto_save_state or self.default_auto_save_state) and (cfg.is_llama or cfg.engine == "ninfer"):
+            # engines (e.g. Strata) handle it internally via config. The pre-load FIFO
+            # ticket (BUG_0015) is held across this span, so the restore runs before any
+            # LLM request that landed in the load window. _suppress_auto_restore also
+            # skips an in-flight auto load that started before the manual load_state path
+            # armed the flag: benign, the manual path's reservation just queues behind the
+            # in-flight holder and the manual restore wins (no deadlock).
+            if (cfg.auto_save_state or self.default_auto_save_state) and (cfg.is_llama or cfg.engine == "ninfer") \
+                    and model_id not in self._suppress_auto_restore and ticket is not None:
                 mid_clean = self._sanitize_model_id(model_id)
                 state_path = self.save_state_dir / f"{mid_clean}.auto.bin"
                 if state_path.exists():
@@ -3127,13 +3166,10 @@ class ModelManager:
                         self._begin_slot_action(port)
                         try:
                             log.info(f"Auto-restoring session state for {model_id} from {state_path}...")
-                            # Hold the FIFO ticket so the restore runs before any LLM request.
-                            ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=60.0)
-                            try:
-                                await self._perform_slot_restore(port, state_path, timeout=30.0, model_id=model_id)
-                                lm.state_path = state_path
-                            finally:
-                                queue.release_ticket(ticket)
+                            # Run the restore under the pre-load ticket (BUG_0015); it is
+                            # released in the outer finally so no path leaks it.
+                            await self._perform_slot_restore(port, state_path, timeout=30.0, model_id=model_id)
+                            lm.state_path = state_path
                         except Exception as e:
                             log.warning(f"Auto-restore failed for {model_id}: {e}")
                         finally:
@@ -3145,6 +3181,14 @@ class ModelManager:
             async with self._lock:
                 await self._unload_unlocked(model_id)
             raise
+        finally:
+            # Release the pre-load ticket on every path (success, CancelledError, a
+            # not-ready load, or an auto-restore failure) so a failed load never wedges
+            # the queue behind a holder that will never return. Safe on a stopped queue
+            # (release_ticket is a no-op when the ticket is not the current holder), so a
+            # concurrent unload that already dropped the queue is fine.
+            if ticket is not None and queue is not None:
+                queue.release_ticket(ticket)
 
     def _start_log_thread(self, model_id: str, proc: subprocess.Popen):
         def _worker():
@@ -3207,7 +3251,7 @@ class ModelManager:
                 # The queue was dropped before the kill; restore it so the still-
                 # resident engine keeps its FIFO ordering for future requests.
                 try:
-                    self.queue_registry.get_or_create(lm.port, model_id)
+                    self.queue_registry.get_or_create(model_id, lm.port)
                 except Exception as e:  # noqa: BLE001 - tracking correctness comes first
                     log.warning(f"Could not restore FIFO queue for {model_id} after failed unload: {e}")
                 self._invalidate_status()
@@ -3398,8 +3442,8 @@ class ModelManager:
             log.warning(f"Unload of {model_id} cancelled while draining; dropping the queue and killing anyway")
 
         # Stop and drop this model's FIFO queue before killing the process, so no new
-        # ticket is granted to a port that is about to die and any waiters are woken.
-        self.queue_registry.remove(lm.port)
+        # ticket is granted to a model whose engine is about to die and any waiters are woken.
+        self.queue_registry.remove(model_id)
 
         # Kill entire process group reliably across platforms. This function
         # VERIFIES the outcome instead of trusting a successful call: a refusal
@@ -3827,7 +3871,7 @@ class ModelManager:
     async def _drain_inflight_slot_action(self, port: int) -> None:
         """Wait (bounded) for the slot actions counted against ``port`` to finish.
 
-        An unload calls this before dropping the port's FIFO queue and killing
+        An unload calls this before dropping the model's FIFO queue and killing
         the engine: otherwise a save mid-write is truncated, which is what left
         the orphan ``*.bin.<hash>.tmp`` in states/. Counted holders include
         actions still WAITING for a ticket — model_queue grants the next waiter
@@ -3997,7 +4041,7 @@ class ModelManager:
         try:
             self._begin_slot_action(lm.port)
             try:
-                queue = self.queue_registry.get_or_create(lm.port, model_id)
+                queue = self.queue_registry.get_or_create(model_id, lm.port)
                 ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
                 try:
                     await self._perform_slot_save(lm.port, state_path, timeout=120.0, model_id=model_id)
@@ -4032,6 +4076,28 @@ class ModelManager:
 
         return state_path
 
+    async def _reserve_model_ticket(self, model_id: str) -> Tuple["ModelCommandQueue", int]:
+        """Reserve the model's FIFO ticket *before* a load, so the restore is
+        guaranteed to run before any chat request that lands in the load window.
+
+        Returns ``(queue, ticket_id)``. The caller MUST release on the *same*
+        queue object (do not re-fetch from the registry) so a concurrent unload
+        that drops/stops the queue does not leave a dangling reservation.
+
+        Known hazard (plan §3.8): if _unload_unlocked runs while the reservation
+        is held, remove(model_id) drops/stops this queue and the failed-kill path
+        creates a NEW queue object — the ordering guarantee no longer covers the
+        new queue. Safe today because the engine is being killed (no chat traffic
+        reaches the dead port). A stale pre-load queue also survives a failed
+        load (the model stays unloaded), so the next load_state re-creates it
+        via get_or_create (same model_id key → same queue if not removed).
+
+        Raises TimeoutError if the ticket is not granted within 120 s.
+        """
+        queue = self.queue_registry.get_or_create(model_id)
+        ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
+        return queue, ticket
+
     async def load_state(self, model_id_input: str, label: str = "default") -> Path:
         model_id = await self.resolve_model_id_strict(model_id_input)
         if not model_id:
@@ -4040,14 +4106,9 @@ class ModelManager:
         async with self._lock:
             lm = self.loaded.get(model_id)
 
+        # 409 refusal stays ahead of the reservation: a refused restore never
+        # waits behind a running generation.
         if lm is None or not lm.ready:
-            # This endpoint is being released right now. Silently cold-reloading
-            # here is what made a racing/abandoned restore look like a success
-            # while burning a full model load; refuse instead so the caller can
-            # decide (409 = conflict with the release request). Once the unload
-            # has completed the flag is cleared and the restore is allowed —
-            # that is the legitimate post-command restore of the safe-mode
-            # contract, which by design lands seconds after unload_all returns.
             if model_id in self._unload_in_progress:
                 log.info(
                     f"Refusing state restore for '{model_id}' (label '{label}'): an unload of "
@@ -4058,43 +4119,69 @@ class ModelManager:
                     f"unload in progress: model '{model_id}' is being released; reload it "
                     f"explicitly if a state restore is intended",
                 )
-            log.info(f"Auto-loading model '{model_id}' before state restore")
-            try:
-                # Bridge engines legitimately take up to ready_timeout_seconds
-                # (600s by default); the old fixed 60s timeout cancelled them.
-                load_timeout = self.ready_timeout_for(model_id) + 30.0
-                lm = await asyncio.wait_for(self.load_model(model_id), timeout=load_timeout)
-            except asyncio.TimeoutError:
-                raise HTTPException(504, f"Timeout loading model '{model_id}' for state restore")
-            except Exception as e:
-                log.error(f"Failed to load model '{model_id}' before state restore: {e}")
-                raise HTTPException(503, f"Failed to load model before state restore: {e}")
 
-        async with self._lock:
-            lm = self.loaded.get(model_id)
-        if lm is None or not lm.ready:
-            raise HTTPException(503, f"Model '{model_id}' is no longer loaded")
-        mid_clean = self._sanitize_model_id(model_id)
-        label_clean = self._sanitize_label(label)
-        state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
-
+        # Reserve the FIFO ticket BEFORE the load (BUG_0018 fix): the restore is
+        # guaranteed to run before any chat request that lands in the load window.
+        # The ticket is released in the outer finally so every path (success,
+        # 503/504/500, CancelledError) releases it on the same queue object.
+        queue: Optional["ModelCommandQueue"] = None
+        ticket: Optional[int] = None
         try:
+            try:
+                queue, ticket = await self._reserve_model_ticket(model_id)
+            except TimeoutError:
+                raise HTTPException(
+                    503,
+                    f"Model '{model_id}' is busy (queue wait exceeded 120s); retry shortly")
+
+            # If the model needs loading, suppress the auto-restore's own
+            # acquire_ticket (it would queue behind its own holder — a
+            # non-re-entrant deadlock that burns the 60 s timeout).
+            if lm is None or not lm.ready:
+                self._suppress_auto_restore.add(model_id)
+                try:
+                    log.info(f"Auto-loading model '{model_id}' before state restore")
+                    try:
+                        # Bridge engines legitimately take up to ready_timeout_seconds
+                        # (600s by default); the old fixed 60s timeout cancelled them.
+                        load_timeout = self.ready_timeout_for(model_id) + 30.0
+                        lm = await asyncio.wait_for(self.load_model(model_id), timeout=load_timeout)
+                    except asyncio.TimeoutError:
+                        raise HTTPException(504, f"Timeout loading model '{model_id}' for state restore")
+                    except Exception as e:
+                        log.error(f"Failed to load model '{model_id}' before state restore: {e}")
+                        raise HTTPException(503, f"Failed to load model before state restore: {e}")
+                finally:
+                    self._suppress_auto_restore.discard(model_id)
+
+            async with self._lock:
+                lm = self.loaded.get(model_id)
+            if lm is None or not lm.ready:
+                raise HTTPException(503, f"Model '{model_id}' is no longer loaded")
+            mid_clean = self._sanitize_model_id(model_id)
+            label_clean = self._sanitize_label(label)
+            state_path = self.save_state_dir / f"{mid_clean}.{label_clean}.bin"
+
+            # The drain counter is port-keyed and the port is only known post-load,
+            # so _begin/_end_slot_action stay here (not hoisted into the reservation
+            # window — there is no engine I/O to protect during the reservation).
             self._begin_slot_action(lm.port)
             try:
-                queue = self.queue_registry.get_or_create(lm.port, model_id)
-                ticket = await asyncio.to_thread(queue.acquire_ticket, timeout=120.0)
-                try:
-                    await self._perform_slot_restore(lm.port, state_path, timeout=120.0, model_id=model_id)
-                finally:
-                    queue.release_ticket(ticket)
+                await self._perform_slot_restore(lm.port, state_path, timeout=120.0, model_id=model_id)
             finally:
                 self._end_slot_action(lm.port)
         except EngineSlotError as e:
             # The engine understood the restore request and refused it — surface a
             # faithful 4xx with the engine's own message, not a generic 500.
             raise HTTPException(e.status_code, e.message)
+        except HTTPException:
+            # Faithful status codes (409/503/504) must not be re-wrapped as 500.
+            raise
         except Exception as e:
             raise HTTPException(500, f"restore failed: {e}")
+        finally:
+            if ticket is not None and queue is not None:
+                queue.release_ticket(ticket)
 
         lm.state_path = state_path
         self._last_manual_restore[model_id] = (time.monotonic(), state_path)
