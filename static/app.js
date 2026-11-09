@@ -508,6 +508,17 @@ function renderCard(m, pm) {
   return card;
 }
 
+// Insert `node` after `prev` in `parent` ONLY when it is not already in that position.
+// This matters beyond DOM churn: re-appending an already-placed node is a remove+insert,
+// which blurs whatever inside it has focus and makes Chromium re-run scroll anchoring on
+// the moved subtree. A card button keeps focus after a click, so on the next 1 Hz WS
+// render the page used to jump upward (back to the top of the models section) while the
+// user was clicking buttons on cards further down the page.
+function placeAfter(parent, node, prev) {
+  const next = prev ? prev.nextElementSibling : parent.firstElementChild;
+  if (next !== node) parent.insertBefore(node, next);
+}
+
 function renderModels() {
   updateLoadedBar();
   renderTypeChips();
@@ -569,6 +580,9 @@ function renderModels() {
 
   const perModel = (statusCache && statusCache.per_model) || {};
 
+  // Sections live after the (usually empty) #models-grid placeholder, so sync them in
+  // canonical order without re-appending the ones already in place.
+  let prevSection = emptySlot;
   for (const t of types) {
     let g = groupNodes.get(t);
     if (!g) {
@@ -591,13 +605,15 @@ function renderModels() {
     g.section.style.setProperty('--type-color', meta.color);
     g.descEl.textContent = meta.desc || '';
     g.countEl.textContent = `${byType.get(t).length}`;
+    placeAfter(container, g.section, prevSection);
+    prevSection = g.section;
 
+    let prevCard = null;
     for (const m of byType.get(t)) {
-      // appendChild MOVES an existing node, so this inserts new cards and re-orders the
-      // existing ones without rebuilding anything (important: the WS pushes ~1 Hz).
-      g.grid.appendChild(renderCard(m, perModel[m.id] || {}));
+      const card = renderCard(m, perModel[m.id] || {});
+      placeAfter(g.grid, card, prevCard);
+      prevCard = card;
     }
-    container.appendChild(g.section);
   }
 }
 function formatUptime(id) {
