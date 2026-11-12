@@ -90,6 +90,7 @@ models:
   vram:
     enabled: true
     headroom_mb: 1024
+    marginal_shortfall_mb: 64
     ram_headroom_mb: 4096
     unknown: evict_all
     reclaim_wait_s: 1.5
@@ -123,6 +124,7 @@ to evict. LRU remains the only eviction policy — only the timing changes.
 |-----|---------|---------|
 | `enabled` | `true` | Enable measured-memory admission (inert while profiling is off) |
 | `headroom_mb` | `1024` | Free VRAM kept per GPU for the desktop and other apps |
+| `marginal_shortfall_mb` | `64` | Per-card/RAM MB shortfall tolerated once eviction is exhausted (`0` = strict) |
 | `ram_headroom_mb` | `4096` | Free system RAM/commit kept as a safety margin |
 | `unknown` | `evict_all` | Policy for a model with no profile for this hardware + launch config |
 | `reclaim_wait_s` | `1.5` | Pause after an eviction before re-sampling free memory |
@@ -131,8 +133,13 @@ For a pending load, the stored footprint is compared per GPU (not as a sum, so a
 `-ts` split is checked against each device) plus RAM, against the memory free right now
 minus headroom and minus reservations for loads still starting. If it fits, all residents
 stay and the model co-loads. If not, the LRU model is evicted one at a time until it fits;
-if no evictable model can make room, the load is refused rather than soft-capping memory.
-Pinned, busy, and mid-load models are never victims.
+if no evictable model can make room and the remaining shortfall is within
+`marginal_shortfall_mb` (MB, per card or RAM), the load is admitted with a warning — the
+measured profile is a coarse system delta and the desktop's own VRAM moves, so a few MB
+must not become a hard refusal. That tolerance is applied only while the hard count cap
+still has a free slot, so it can never raise the resident count; the engine's own fit
+check remains the final authority. Anything larger, or a full count cap, is refused rather
+than soft-capping memory. Pinned, busy, and mid-load models are never victims.
 
 A model with no profile for this hardware + launch config is *new*. The default
 `unknown: evict_all` unloads every evictable resident first so the new model can be

@@ -928,6 +928,13 @@ STATE_TEMP_MAX_AGE_S = 3600.0
 # bound total disk usage when many models each sit below their keep-N.
 _DEFAULT_STATE_MAX_BYTES = 8 * 1024**3
 
+# Admission tolerance when a load misses the free-memory test by a hair AFTER every
+# evictable resident is gone: headroom plus a coarse system-delta profile commonly
+# leave a single-digit-to-tens-of-MB gap (e.g. 9MB on a 16GB card) even though the
+# engine loads fine. Only applied while the hard count cap still has room, never to
+# bypass it. 0 = strict (refuse any shortfall).
+_DEFAULT_VRAM_MARGINAL_SHORTFALL_MB = 64
+
 # Engine scratch files that can collide with a known-model state prefix
 # (e.g. ``Qwen2.5-…gguf.probe.bin`` reads as a state of ``Qwen2.5-…gguf``).
 # Never counted against the budget nor evicted as state. NOTE: excluding
@@ -1219,6 +1226,12 @@ class ModelManager:
         # Post-eviction pause before re-sampling free memory. Unload verifies the process is
         # gone; this covers the driver/OS handing the pages back.
         self.reclaim_wait_s = float(vram_cfg.get("reclaim_wait_s", 1.5))
+        # Tolerated per-card/RAM shortfall once nothing evictable is left (MB). Covers the
+        # last few MB of a coarse profile and transient desktop VRAM, which otherwise turn
+        # a load the engine handles fine into a hard refusal. Only consulted while the
+        # count cap has room, so it can never be a soft cap. 0 = strict.
+        self.admission_marginal_shortfall_mb = int(
+            vram_cfg.get("marginal_shortfall_mb", _DEFAULT_VRAM_MARGINAL_SHORTFALL_MB))
         self.save_state_max_keep = cfg["models"].get("save_state_max_keep", 5)
         self.save_state_max_bytes = cfg["models"].get("save_state_max_bytes", _DEFAULT_STATE_MAX_BYTES)
         self.default_auto_save_state = cfg["models"].get("auto_save_state", False)
@@ -1501,6 +1514,10 @@ class ModelManager:
         if isinstance(reclaim, bool) or not isinstance(reclaim, (int, float)) or reclaim < 0:
             raise ValueError(f"Config 'models.vram.reclaim_wait_s' must be a non-negative "
                              f"number, got {reclaim!r}")
+        marginal = vram.get("marginal_shortfall_mb", _DEFAULT_VRAM_MARGINAL_SHORTFALL_MB)
+        if isinstance(marginal, bool) or not isinstance(marginal, int) or marginal < 0:
+            raise ValueError(f"Config 'models.vram.marginal_shortfall_mb' must be a "
+                             f"non-negative int (0 = strict), got {marginal!r}")
         save_state_max_keep = models.get("save_state_max_keep", 5)
         if not isinstance(save_state_max_keep, int) or save_state_max_keep < 1:
             raise ValueError(f"Config 'models.save_state_max_keep' must be >= 1, got {save_state_max_keep!r}")
@@ -2694,6 +2711,51 @@ class ModelManager:
             return False, avail_gpu, ram_avail
         return True, avail_gpu, ram_avail
 
+    def _memory_shortfall(self, need: Dict[str, Any], avail_gpu: Dict[str, int],
+                          ram_avail: int) -> Tuple[Dict[str, int], int]:
+        """Per-card and RAM shortfall of one measured need in MB (empty/0 when it fits)."""
+        short_gpu: Dict[str, int] = {}
+        for gkey, mb in (need.get("gpus_mb") or {}).items():
+            gap = int(mb) - avail_gpu.get(gkey, 0)
+            if gap > 0:
+                short_gpu[gkey] = gap
+        return short_gpu, max(0, int(need.get("ram_mb", 0)) - ram_avail)
+
+    def _marginal_shortfall_allowed(self, short_gpu: Dict[str, int], short_ram: int) -> bool:
+        """True when the remaining shortfall is within the configured tolerance.
+
+        Only meaningful once eviction has been exhausted: ``_make_room_for`` decides
+        *when* to consult it, and the count cap is checked there, so this can never
+        widen the hard cap.
+        """
+        tolerance = self.admission_marginal_shortfall_mb
+        if tolerance <= 0 or not (short_gpu or short_ram):
+            return False
+        return max(short_gpu.values(), default=0) <= tolerance and short_ram <= tolerance
+
+    def _eviction_blockers(self, model_id: str) -> str:
+        """Explain why no resident can be evicted for ``model_id`` (for refusal text)."""
+        parts = []
+        for mid, lm in self.loaded.items():
+            if mid == model_id:
+                continue
+            why = []
+            if lm.config.pinned:
+                why.append("pinned")
+            if lm.active_requests:
+                why.append(f"busy: {lm.active_requests} active request(s)")
+            if self._is_loading(mid):
+                why.append("mid-load")
+            parts.append(f"{mid} ({', '.join(why) or 'not evictable'})")
+        return "; ".join(parts) or "no other residents"
+
+    def _reserve_occupancy(self, model_id: str, need: Dict[str, Any]) -> None:
+        """Record the in-flight claim so a concurrent admission must count it."""
+        self._occupancy_reservations[model_id] = {
+            "gpus_mb": dict(need["gpus_mb"]),
+            "ram_mb": int(need["ram_mb"]),
+        }
+
     @staticmethod
     def _format_memory_map(values: Dict[str, int],
                            gpus: Optional[List[GPUInfo]] = None) -> str:
@@ -2719,6 +2781,11 @@ class ModelManager:
 
         A model with no profile for this hardware+launch is *new*: by default evacuate
         every evictable resident so it runs solo and the profiler can measure it.
+
+        When eviction is exhausted and the load is still a few MB short (the profile is a
+        coarse system delta, and the desktop's own VRAM moves), the shortfall may be
+        tolerated per ``models.vram.marginal_shortfall_mb`` — but only while the hard count
+        cap still has room. The engine's own fit check remains the final authority.
         """
         if not self.vram_admission_enabled:
             # Legacy path: evict LRU only when the hard count cap is reached. The cap
@@ -2749,10 +2816,7 @@ class ModelManager:
         while True:
             fits, avail_gpu, ram_avail = self._memory_fits(need, gpus_list)
             if fits:
-                self._occupancy_reservations[model_id] = {
-                    "gpus_mb": dict(need["gpus_mb"]),
-                    "ram_mb": int(need["ram_mb"]),
-                }
+                self._reserve_occupancy(model_id, need)
                 log.info(
                     f"Admit {model_id} by measured occupancy: need VRAM "
                     f"{self._format_memory_map(need['gpus_mb'], gpus_list)} / "
@@ -2763,14 +2827,36 @@ class ModelManager:
                 return
             candidate = self._pick_lru_eviction_candidate(model_id)
             if candidate is None:
+                short_gpu, short_ram = self._memory_shortfall(need, avail_gpu, ram_avail)
+                # Nothing can be evicted any more. A hair-thin shortfall is tolerated ONLY
+                # while the count cap still has room (checked here, not in the helper), so
+                # this stays a memory tolerance and never a soft cap.
+                if (len(self.loaded) < self.max_loaded_models
+                        and self._marginal_shortfall_allowed(short_gpu, short_ram)):
+                    self._reserve_occupancy(model_id, need)
+                    log.warning(
+                        f"Admit {model_id} with a marginal memory shortfall: need VRAM "
+                        f"{self._format_memory_map(need['gpus_mb'], gpus_list)} / "
+                        f"RAM {need['ram_mb']}MB; available VRAM "
+                        f"{self._format_memory_map(avail_gpu, gpus_list)} / RAM "
+                        f"{ram_avail}MB; short by VRAM "
+                        f"{self._format_memory_map(short_gpu, gpus_list)} / RAM "
+                        f"{short_ram}MB, within models.vram.marginal_shortfall_mb="
+                        f"{self.admission_marginal_shortfall_mb}"
+                        + (f"; evicted {', '.join(evicted)}" if evicted else "")
+                        + "; the engine's own fit check decides")
+                    return
                 raise RuntimeError(
                     f"Cannot load {model_id}: measured need VRAM "
                     f"{self._format_memory_map(need['gpus_mb'], gpus_list)} / "
                     f"RAM {need['ram_mb']}MB "
                     f"exceeds available VRAM "
                     f"{self._format_memory_map(avail_gpu, gpus_list)} / RAM "
-                    f"{ram_avail}MB and no evictable model is available "
-                    f"(pinned, busy, or mid-load)")
+                    f"{ram_avail}MB by VRAM {self._format_memory_map(short_gpu, gpus_list)}"
+                    f" / RAM {short_ram}MB "
+                    f"(models.vram.marginal_shortfall_mb="
+                    f"{self.admission_marginal_shortfall_mb}, 0 = strict) and no "
+                    f"evictable model is available: {self._eviction_blockers(model_id)}")
             victim_id, victim_lm = candidate
             log.info(
                 f"Evicting LRU model {victim_id} "

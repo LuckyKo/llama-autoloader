@@ -114,6 +114,7 @@ models:
   save_state_max_bytes: 17179869184
   vram:
     enabled: true
+    marginal_shortfall_mb: 64
     headroom_mb: 512
     ram_headroom_mb: 4096
     unknown: evict_all

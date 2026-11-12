@@ -5,7 +5,9 @@ LRU is still the only eviction policy. The change is *when* we evict:
   * it does not fit -> evict LRU, one at a time, until it fits or no candidate remains
   * no measurable profile (new/unknown, or a changed launch config) -> evict everything
     evictable so the model can be measured solo (``models.vram.unknown: evict_all``)
-  * still no room -> refuse (never soft-cap)
+  * still no room -> refuse (never soft-cap); a shortfall within
+    ``models.vram.marginal_shortfall_mb`` (MB) is tolerated after eviction is exhausted,
+    as long as the hard count cap still has room
 
 These tests never touch nvidia-smi or real processes.
 """
@@ -42,7 +44,7 @@ def _gpu(index=0, free=20000, total=24576, uuid="GPU-aaaa"):
 
 
 def _manager(tmp_path, *, max_loaded=3, headroom=0, ram_headroom=0,
-             unknown="evict_all", occupancy=True):
+             unknown="evict_all", occupancy=True, marginal=0):
     return server.ModelManager(build_cfg(
         tmp_path,
         max_loaded_models=max_loaded,
@@ -53,6 +55,7 @@ def _manager(tmp_path, *, max_loaded=3, headroom=0, ram_headroom=0,
             "ram_headroom_mb": ram_headroom,
             "unknown": unknown,
             "reclaim_wait_s": 0,
+            "marginal_shortfall_mb": marginal,
         },
     ))
 
@@ -371,6 +374,125 @@ async def test_other_load_reservation_reduces_available_memory(tmp_path):
 
     with pytest.raises(RuntimeError, match="exceeds available"):
         await _admit(mgr, cfg, artifact)
+
+
+# ---------------------------------------------------------------------------
+# Marginal shortfall (eviction exhausted, a few MB short)
+# ---------------------------------------------------------------------------
+
+async def test_marginal_shortfall_admitted_after_eviction(tmp_path):
+    """A 9MB post-eviction gap must not turn a working load into a refusal.
+
+    Replays the real shape: one resident holding the only slot, the profile's need is
+    9MB above what is free after the eviction.
+    """
+    mgr = _manager(tmp_path, max_loaded=1, marginal=64)
+    artifact = _artifact(tmp_path)
+    _resident(mgr, "a.gguf")
+    before = [_gpu(0, free=20000, uuid="GPU-aaaa"),
+              _gpu(1, free=10240, uuid="GPU-bbbb")]
+    after = [_gpu(0, free=20000, uuid="GPU-aaaa"),
+             _gpu(1, free=9991, uuid="GPU-bbbb")]
+    calls = {"n": 0}
+
+    def gpus_fn():
+        calls["n"] += 1
+        return before if calls["n"] == 1 else after
+
+    mgr.gpus = gpus_fn
+    mgr.system_ram = lambda: {"free_mb": 80000}
+    cfg = ModelConfig.default_for(artifact)
+    _set_need(mgr, cfg, artifact, before, {"GPU-aaaa": 5000, "GPU-bbbb": 10000}, 0)
+
+    await _admit(mgr, cfg, artifact)
+
+    assert mgr.loaded == {}                     # the resident was still evicted
+    assert mgr._occupancy_reservations["target.gguf"]["gpus_mb"] == {
+        "GPU-aaaa": 5000, "GPU-bbbb": 10000}
+
+
+async def test_shortfall_beyond_tolerance_is_refused_with_the_gap_named(tmp_path):
+    mgr = _manager(tmp_path, max_loaded=1, marginal=64)
+    artifact = _artifact(tmp_path)
+    _resident(mgr, "a.gguf")
+    before = [_gpu(0, free=20000, uuid="GPU-aaaa"),
+              _gpu(1, free=10240, uuid="GPU-bbbb")]
+    after = [_gpu(0, free=20000, uuid="GPU-aaaa"),
+             _gpu(1, free=9900, uuid="GPU-bbbb")]
+    calls = {"n": 0}
+
+    def gpus_fn():
+        calls["n"] += 1
+        return before if calls["n"] == 1 else after
+
+    mgr.gpus = gpus_fn
+    mgr.system_ram = lambda: {"free_mb": 80000}
+    cfg = ModelConfig.default_for(artifact)
+    _set_need(mgr, cfg, artifact, before, {"GPU-aaaa": 5000, "GPU-bbbb": 10000}, 0)
+
+    with pytest.raises(RuntimeError, match="GPU1: 100MB"):
+        await _admit(mgr, cfg, artifact)
+
+    assert mgr._occupancy_reservations == {}
+
+
+async def test_zero_tolerance_is_strict(tmp_path):
+    mgr = _manager(tmp_path, max_loaded=3, marginal=0)
+    artifact = _artifact(tmp_path)
+    gpus = [_gpu(free=9991, uuid="GPU-aaaa")]
+    mgr.gpus = lambda: gpus
+    mgr.system_ram = lambda: {"free_mb": 80000}
+    cfg = ModelConfig.default_for(artifact)
+    _set_need(mgr, cfg, artifact, gpus, {"GPU-aaaa": 10000}, 0)
+
+    with pytest.raises(RuntimeError, match="exceeds available"):
+        await _admit(mgr, cfg, artifact)
+
+
+async def test_marginal_shortfall_never_bypasses_the_count_cap(tmp_path):
+    """A tolerated gap still may not raise the resident count above the hard cap."""
+    mgr = _manager(tmp_path, max_loaded=1, marginal=64)
+    artifact = _artifact(tmp_path)
+    _resident(mgr, "pinned.gguf", pinned=True)
+    gpus = [_gpu(free=9991, uuid="GPU-aaaa")]
+    mgr.gpus = lambda: gpus
+    mgr.system_ram = lambda: {"free_mb": 80000}
+    cfg = ModelConfig.default_for(artifact)
+    _set_need(mgr, cfg, artifact, gpus, {"GPU-aaaa": 10000}, 0)
+
+    with pytest.raises(RuntimeError, match="no evictable model is available: "
+                                          "pinned.gguf \\(pinned\\)"):
+        await _admit(mgr, cfg, artifact)
+
+    assert list(mgr.loaded) == ["pinned.gguf"]
+    assert mgr._occupancy_reservations == {}
+
+
+async def test_marginal_ram_shortfall_is_tolerated(tmp_path):
+    mgr = _manager(tmp_path, max_loaded=3, marginal=64)
+    artifact = _artifact(tmp_path)
+    gpus = [_gpu(free=20000)]
+    mgr.gpus = lambda: gpus
+    mgr.system_ram = lambda: {"free_mb": 9995}
+    cfg = ModelConfig.default_for(artifact)
+    _set_need(mgr, cfg, artifact, gpus, {"GPU-aaaa": 1000}, 10000)
+
+    await _admit(mgr, cfg, artifact)
+
+    assert mgr._occupancy_reservations["target.gguf"]["ram_mb"] == 10000
+
+
+def test_marginal_shortfall_defaults_to_production_constant(tmp_path):
+    mgr = server.ModelManager(build_cfg(tmp_path, vram={}))
+    assert (mgr.admission_marginal_shortfall_mb
+            == server._DEFAULT_VRAM_MARGINAL_SHORTFALL_MB)
+
+
+def test_config_rejects_invalid_marginal_shortfall(tmp_path):
+    for bad in (-1, 1.5, "64", True):
+        cfg = build_cfg(tmp_path, vram={"marginal_shortfall_mb": bad})
+        with pytest.raises(ValueError, match="marginal_shortfall_mb"):
+            server.ModelManager.validate_config(cfg)
 
 
 # ---------------------------------------------------------------------------

@@ -55,6 +55,7 @@ models:
   vram:                              # memory-aware admission (needs occupancy_profiles)
     enabled: true
     headroom_mb: 1024                # per-GPU MB kept free for desktop/other apps
+    marginal_shortfall_mb: 64        # MB shortfall tolerated once eviction is exhausted (0 = strict)
     ram_headroom_mb: 4096            # system commit-limit guard
     unknown: evict_all               # evict_all | refuse | allow (new model, no profile)
     reclaim_wait_s: 1.5              # pause after eviction before re-sampling
@@ -246,6 +247,7 @@ check decides *when* LRU eviction runs, not *which* model is evicted:
 |-----|---------|---------|
 | `enabled` | `true` | Use measured memory for admission (inert while profiling is off) |
 | `headroom_mb` | `1024` | Free VRAM kept per GPU for the desktop and other apps |
+| `marginal_shortfall_mb` | `64` | Per-card/RAM shortfall tolerated once eviction is exhausted (`0` = strict) |
 | `ram_headroom_mb` | `4096` | Free system RAM/commit kept as a safety margin |
 | `unknown` | `evict_all` | Policy when the incoming model has no profile for this hardware + launch config |
 | `reclaim_wait_s` | `1.5` | Pause after an eviction before re-sampling free memory |
@@ -257,9 +259,12 @@ persists them to `config.yaml`.
 For a pending load the manager compares the stored footprint (per GPU, plus RAM) against
 what is free right now, minus headroom and minus reservations for loads that are still
 starting. If it fits, every resident stays loaded and the model co-loads. If not, the
-LRU model is evicted one at a time until it fits; if no evictable model can make room,
-the load is refused rather than soft-capping memory. Pinned, busy, and mid-load models
-are never victims.
+LRU model is evicted one at a time until it fits; if no evictable model can make room, a
+shortfall within `marginal_shortfall_mb` is still admitted (the profile is a coarse
+system delta and the desktop's own VRAM moves), otherwise the load is refused rather than
+soft-capping memory. The tolerance is only applied while `max_loaded_models` still has a
+free slot, so it can never raise the resident count; the engine's own fit check remains
+the final authority. Pinned, busy, and mid-load models are never victims.
 
 A model with no profile for this hardware + launch configuration is new. With the default
 `unknown: evict_all`, every evictable resident is unloaded first so the new model runs
