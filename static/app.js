@@ -107,6 +107,96 @@ function fmtBytes(mb) {
   return (mb/1024).toFixed(2) + ' GB';
 }
 
+// ---- occupancy profiles (auto-measured VRAM/RAM, see server.py _capture_occupancy) ----
+// Values are coarse before/after deltas, not a calibrated measurement, so everything is
+// rendered with a leading "≈" and a tooltip that explains where the number came from.
+function fmtOccupancyMb(mb) {
+  if (mb == null) return '—';
+  if (mb < 1024) return Math.round(mb) + ' MB';
+  return (mb/1024).toFixed(2) + ' GB';
+}
+
+function currentHardwareFingerprint() {
+  return (statusCache && statusCache.hardware && statusCache.hardware.fingerprint) || '';
+}
+
+// Resolve a profile's per-card key (UUID, or "index:N" when the driver exposes no UUID)
+// against the GPUs reported in the live status, so the UI can label cards by their real
+// physical index instead of an enumeration position.
+function gpuForKey(key) {
+  const gpus = (statusCache && statusCache.gpus) || [];
+  return gpus.find(g => (g.uuid || `index:${g.index}`) === key) || null;
+}
+
+// Per-card VRAM need from a profile, ordered by physical GPU index. A profile records
+// every card present at measurement time; cards this model does not use are 0 MB.
+function occupancyGpuParts(profile) {
+  const gpusMb = (profile && profile.gpus_mb) || {};
+  return Object.entries(gpusMb).map(([key, mb]) => {
+    const g = gpuForKey(key);
+    return { key, mb, index: g ? g.index : null, name: g ? g.name : '' };
+  }).sort((a, b) => {
+    const ai = a.index == null ? Number.MAX_SAFE_INTEGER : a.index;
+    const bi = b.index == null ? Number.MAX_SAFE_INTEGER : b.index;
+    return ai - bi;
+  });
+}
+
+// The stored profile key is "<hardware fp>:<launch-config fp>". The UI cannot compute the
+// config half, so it picks the newest stored profile measured on the CURRENT hardware.
+function findStoredOccupancy(m) {
+  const hw = currentHardwareFingerprint();
+  const profiles = m && m.occupancy_profiles;
+  if (!hw || !profiles || typeof profiles !== 'object') return null;
+  let best = null;
+  for (const [key, p] of Object.entries(profiles)) {
+    if (!key.startsWith(hw + ':') || !p || typeof p !== 'object') continue;
+    if (!best || (p.measured_at || 0) > (best.measured_at || 0)) best = p;
+  }
+  return best;
+}
+
+// Prefer the one-shot measured profile for a loaded engine, else the profile stored in
+// the sidecar (so offline cards can still show what the model costs on this machine).
+function occupancyFor(m, pm) {
+  if (pm && pm.occupancy && typeof pm.occupancy === 'object') {
+    return { profile: pm.occupancy, live: true };
+  }
+  const stored = findStoredOccupancy(m);
+  return stored ? { profile: stored, live: false } : null;
+}
+
+function occupancyTooltip(info) {
+  const p = info.profile || {};
+  const lines = [info.live
+    ? 'Occupancy measured on this engine\'s first streaming request (approximate)'
+    : 'Stored occupancy for this hardware (approximate; a previous launch config)'];
+  const gpus = occupancyGpuParts(p);
+  if (gpus.length) {
+    gpus.forEach(g => {
+      const where = g.index != null
+        ? `GPU ${g.index}${g.name ? ' ' + g.name : ''}`
+        : g.key;
+      lines.push(`${where}: ${fmtOccupancyMb(g.mb)}`);
+    });
+    lines.push(`VRAM total: ${fmtOccupancyMb(p.vram_mb)}`);
+  } else {
+    lines.push(`VRAM: ${fmtOccupancyMb(p.vram_mb)}`);
+  }
+  let ram = `RAM: ${fmtOccupancyMb(p.ram_mb)}`;
+  const parts = [];
+  if (p.ram_delta_mb != null) parts.push(`system Δ ${fmtOccupancyMb(p.ram_delta_mb)}`);
+  if (p.ram_rss_mb != null) parts.push(`resident ${fmtOccupancyMb(p.ram_rss_mb)}`);
+  if (p.ram_private_mb != null) parts.push(`commit ${fmtOccupancyMb(p.ram_private_mb)}`);
+  if (parts.length) ram += ` (${parts.join(', ')})`;
+  lines.push(ram);
+  if (p.source) lines.push(`Source: ${p.source}`);
+  if (!info.live && p.measured_at) {
+    lines.push(`Measured: ${new Date(p.measured_at * 1000).toLocaleString()}`);
+  }
+  return lines.join('\n');
+}
+
 function statusBadge(loaded, ready) {
   if (loaded && ready) return '<span class="status-badge status-loaded">Ready</span>';
   if (loaded) return '<span class="status-badge status-loading">Loading...</span>';
@@ -486,10 +576,32 @@ function renderCard(m, pm) {
 
   const statsDiv = card.querySelector('.model-stats');
   if (statsDiv) {
+    // VRAM/RAM prefer the measured occupancy profile (the one shot taken on the engine's
+    // first streaming request, else the stored sidecar profile for this hardware). The
+    // per-PID VRAM number is dead on WDDM, so the profile is the only useful figure there.
+    const occ = occupancyFor(m, pm);
     const vramEl = statsDiv.querySelector('[data-stat="vram"]');
-    if (vramEl) vramEl.innerHTML = `VRAM: <b>${pm.vram_mb ? fmtBytes(pm.vram_mb) : '—'}</b>`;
+    if (vramEl) {
+      // Per card, never a single aggregate: the same model can be recorded using one
+      // card, a different card, or an autofit split, and co-loading is decided per card.
+      const parts = occ ? occupancyGpuParts(occ.profile).filter(x => x.mb > 0) : [];
+      vramEl.innerHTML = parts.length
+        ? 'VRAM: ' + parts.map(x =>
+            `${x.index != null ? 'GPU' + x.index : esc(x.key.slice(0, 8))} <b>≈${fmtOccupancyMb(x.mb)}</b>`
+          ).join(' · ')
+        : `VRAM: <b>${(occ ? occ.profile.vram_mb : pm.vram_mb) ? '≈' + fmtBytes(occ ? occ.profile.vram_mb : pm.vram_mb) : '—'}</b>`;
+      vramEl.classList.toggle('stat-stored', !!occ && !occ.live);
+      if (occ) vramEl.title = occupancyTooltip(occ);
+      else vramEl.removeAttribute('title');
+    }
     const ramEl = statsDiv.querySelector('[data-stat="ram"]');
-    if (ramEl) ramEl.innerHTML = `RAM:  <b>${pm.ram_mb ? fmtBytes(pm.ram_mb) : '—'}</b>`;
+    if (ramEl) {
+      const ramMb = occ ? occ.profile.ram_mb : pm.ram_mb;
+      ramEl.innerHTML = `RAM:  <b>${ramMb ? '≈' + fmtBytes(ramMb) : '—'}</b>`;
+      ramEl.classList.toggle('stat-stored', !!occ && !occ.live);
+      if (occ) ramEl.title = occupancyTooltip(occ);
+      else ramEl.removeAttribute('title');
+    }
     // Only llama reports ctx; the row is meaningless for a bridge engine, and once
     // removed ctxEl is null on later renders — so the removal is idempotent.
     const ctxEl = statsDiv.querySelector('[data-stat="ctx"]');
@@ -957,6 +1069,8 @@ async function refreshAll() {
       max_ctx_size: d.max_ctx_size,
       n_gpu_layers: d.n_gpu_layers,
       estimated_vram_mb: d.estimated_vram_mb,
+      // Auto-measured VRAM/RAM profiles (observational; rendered on the card).
+      occupancy_profiles: d.occupancy_profiles || {},
       args: d.args,
       gguf_name: d.gguf_name,
       // Classification (backend-sourced). model_type drives grouping/badge/filter chips,
@@ -1162,6 +1276,8 @@ async function loadSettings() {
     const s = await apiJSON('/v1/settings');
     $('s-idle').value = s.idle_timeout_seconds ?? '';
     $('s-max-loaded').value = s.max_loaded_models ?? '';
+    $('s-vram-headroom').value = s.vram_headroom_mb ?? '';
+    $('s-ram-headroom').value = s.ram_headroom_mb ?? '';
     $('s-save-state-max-keep').value = s.save_state_max_keep ?? '';
     $('s-save-state-max-bytes').value = s.save_state_max_bytes != null ? s.save_state_max_bytes / GiB : '';
     $('s-poll').value = s.poll_interval_seconds ?? '';
@@ -1180,6 +1296,8 @@ async function loadSettings() {
 async function saveSettings() {
   const idle = Number($('s-idle').value);
   const maxLoaded = Number($('s-max-loaded').value);
+  const vramHeadroom = Number($('s-vram-headroom').value);
+  const ramHeadroom = Number($('s-ram-headroom').value);
   const saveStateMaxKeep = Number($('s-save-state-max-keep').value);
   const saveStateMaxBytesRaw = $('s-save-state-max-bytes').value;
   const saveStateMaxBytesGiB = Number(saveStateMaxBytesRaw);
@@ -1192,6 +1310,14 @@ async function saveSettings() {
   }
   if (isNaN(maxLoaded) || maxLoaded < 1 || !Number.isInteger(maxLoaded)) {
     showToast('Max loaded models must be an integer ≥ 1', 'error');
+    return;
+  }
+  if (isNaN(vramHeadroom) || vramHeadroom < 0 || !Number.isInteger(vramHeadroom)) {
+    showToast('VRAM headroom must be an integer ≥ 0 MiB', 'error');
+    return;
+  }
+  if (isNaN(ramHeadroom) || ramHeadroom < 0 || !Number.isInteger(ramHeadroom)) {
+    showToast('RAM headroom must be an integer ≥ 0 MiB', 'error');
     return;
   }
   if (isNaN(saveStateMaxKeep) || saveStateMaxKeep < 1 || !Number.isInteger(saveStateMaxKeep)) {
@@ -1214,6 +1340,8 @@ async function saveSettings() {
   const body = {
     idle_timeout_seconds: idle,
     max_loaded_models: maxLoaded,
+    vram_headroom_mb: vramHeadroom,
+    ram_headroom_mb: ramHeadroom,
     save_state_max_keep: saveStateMaxKeep,
     poll_interval_seconds: poll,
     base_port: basePort,

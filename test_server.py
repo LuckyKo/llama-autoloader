@@ -36,6 +36,8 @@ def _make_cfg(overrides: dict | None = None) -> dict:
             "idle_timeout_seconds": 300,
             "max_loaded_models": 1,
             "auto_save_state": False,
+            # Hermetic: no nvidia-smi shells during unrelated manager tests.
+            "occupancy_profiles": False,
         },
         "llama_server": {
             "binary": "llama-server",
@@ -1177,6 +1179,43 @@ class TestSettingsPersist:
         manager.save_state_max_bytes = 98765
         body = await server.get_settings()
         assert body["save_state_max_bytes"] == 98765
+
+    @pytest.mark.asyncio
+    async def test_patch_applies_and_persists_headroom(self, manager, tmp_path, monkeypatch):
+        # Desired VRAM/RAM headroom must be settable from the WebUI settings modal:
+        # applied to the live manager AND written under models.vram in config.yaml.
+        cfg_path = tmp_path / "config.yaml"
+        manager.cfg["models"]["vram"] = {"unknown": "refuse", "reclaim_wait_s": 0.5}
+        cfg_path.write_text(yaml.safe_dump(manager.cfg))
+        monkeypatch.setattr(server, "manager", manager)
+        monkeypatch.setattr(server, "CONFIG_PATH", str(cfg_path))
+        await server.update_settings(self._FakeRequest({
+            "vram_headroom_mb": 2048, "ram_headroom_mb": 8192}))
+        written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        assert written["models"]["vram"]["headroom_mb"] == 2048
+        assert written["models"]["vram"]["ram_headroom_mb"] == 8192
+        assert manager.vram_headroom_mb == 2048
+        assert manager.ram_admission_headroom_mb == 8192
+        # Other vram keys already in config must survive a headroom-only update.
+        assert written["models"]["vram"]["unknown"] == "refuse"
+        assert written["models"]["vram"]["reclaim_wait_s"] == 0.5
+
+    @pytest.mark.asyncio
+    async def test_get_settings_exposes_headroom(self, manager, monkeypatch):
+        monkeypatch.setattr(server, "manager", manager)
+        manager.vram_headroom_mb = 1536
+        manager.ram_admission_headroom_mb = 3072
+        body = await server.get_settings()
+        assert body["vram_headroom_mb"] == 1536
+        assert body["ram_headroom_mb"] == 3072
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["vram_headroom_mb", "ram_headroom_mb"])
+    async def test_patch_rejects_bad_headroom(self, manager, monkeypatch, key):
+        monkeypatch.setattr(server, "manager", manager)
+        for bad in (-1, True, 1.5, "2048"):
+            with pytest.raises(HTTPException):
+                await server.update_settings(self._FakeRequest({key: bad}))
 
 
 # ---------------------------------------------------------------------------

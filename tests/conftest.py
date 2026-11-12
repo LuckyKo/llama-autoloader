@@ -37,8 +37,16 @@ def build_cfg(tmp_path: Path, *, root_dir=None, save_state_dir=None, backends_di
               base_port: int = 19001, port: int = 19123, host: str = "127.0.0.1",
               max_loaded_models: int = 4, idle_timeout_seconds: int = 3600,
               poll_interval_seconds: float = 2, default_args: str = "",
-              auto_save_state: bool = False) -> dict:
-    """Build a minimal, fully-isolated config dict pointing at tmp_path dirs."""
+              auto_save_state: bool = False,
+              occupancy_profiles: bool = False,
+              vram: dict | None = None) -> dict:
+    """Build a minimal, fully-isolated config dict pointing at tmp_path dirs.
+
+    ``occupancy_profiles`` defaults to False so the profiler never shells out to
+    nvidia-smi during unrelated tests; the occupancy tests opt in explicitly.
+    ``vram`` is the memory-admission block (defaults to ``{}`` = enabled, but inert
+    whenever profiling is off).
+    """
     root_dir = Path(root_dir) if root_dir else tmp_path / "models"
     save_state_dir = Path(save_state_dir) if save_state_dir else tmp_path / "states"
     backends_dir = Path(backends_dir) if backends_dir else tmp_path / "backends"
@@ -52,6 +60,8 @@ def build_cfg(tmp_path: Path, *, root_dir=None, save_state_dir=None, backends_di
             "idle_timeout_seconds": idle_timeout_seconds,
             "max_loaded_models": max_loaded_models,
             "auto_save_state": auto_save_state,
+            "occupancy_profiles": occupancy_profiles,
+            "vram": vram if vram is not None else {},
         },
         "llama_server": {
             "binary": binary,

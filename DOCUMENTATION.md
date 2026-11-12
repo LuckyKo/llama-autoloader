@@ -84,8 +84,15 @@ models:
   auto_save_state: false
   idle_timeout_seconds: 3600
   max_loaded_models: 1
+  occupancy_profiles: true
   root_dir: n:/work/stuff/Beta
   save_state_dir: ./states
+  vram:
+    enabled: true
+    headroom_mb: 1024
+    ram_headroom_mb: 4096
+    unknown: evict_all
+    reclaim_wait_s: 1.5
 ```
 
 **Section Details:**
@@ -101,8 +108,41 @@ models:
 - **models.auto_save_state**: Global default for auto-save/restore (can be overridden per-model)
 - **models.idle_timeout_seconds**: Seconds of inactivity before a model is unloaded (default: 3600)
 - **models.max_loaded_models**: Maximum number of models that can be loaded simultaneously (default: 1)
+- **models.occupancy_profiles**: Auto-measure each model's VRAM/RAM footprint while it is solo-loaded and store it in its sidecar (default: true). Feeds memory-aware admission; without it, eviction stays count-based.
 - **models.root_dir**: Directory to scan for `.gguf` files (recursive)
 - **models.save_state_dir**: Directory where KV cache state files are saved
+- **models.vram**: Memory-aware admission block (VRAM **and** RAM). Effective only while `occupancy_profiles` is on; see [Memory-aware admission](#memory-aware-admission) for the keys.
+
+#### Memory-aware admission
+
+`max_loaded_models` is always a hard **count** cap. When `models.occupancy_profiles` and
+`models.vram.enabled` are both on, the measured per-model footprint also decides *when*
+to evict. LRU remains the only eviction policy — only the timing changes.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Enable measured-memory admission (inert while profiling is off) |
+| `headroom_mb` | `1024` | Free VRAM kept per GPU for the desktop and other apps |
+| `ram_headroom_mb` | `4096` | Free system RAM/commit kept as a safety margin |
+| `unknown` | `evict_all` | Policy for a model with no profile for this hardware + launch config |
+| `reclaim_wait_s` | `1.5` | Pause after an eviction before re-sampling free memory |
+
+For a pending load, the stored footprint is compared per GPU (not as a sum, so a
+`-ts` split is checked against each device) plus RAM, against the memory free right now
+minus headroom and minus reservations for loads still starting. If it fits, all residents
+stay and the model co-loads. If not, the LRU model is evicted one at a time until it fits;
+if no evictable model can make room, the load is refused rather than soft-capping memory.
+Pinned, busy, and mid-load models are never victims.
+
+A model with no profile for this hardware + launch config is *new*. The default
+`unknown: evict_all` unloads every evictable resident first so the new model can be
+measured solo; `refuse` refuses the load, and `allow` falls back to count-only behaviour.
+Profiles captured while another model was resident are discarded, so a co-loaded engine's
+next solo load refreshes its measurement.
+
+Both headroom values can be set at runtime in the WebUI **Global Settings** modal
+(`VRAM Headroom per GPU` and `RAM Headroom`, in MiB) or via `PUT /v1/settings`; changes
+apply immediately and persist to `models.vram`.
 
 ### Environment Variables
 
@@ -118,6 +158,7 @@ Tunables that have no `config.yaml` key are read from the process environment. A
 | `AUTOLOADER_LIVENESS_PROBE_INTERVAL` | 10 | Minimum seconds between `/health` probes per engine, preventing a health-check stampede |
 | `AUTOLOADER_RECOVERY_BACKOFF_BASE` | 5 | Base seconds for exponential recovery backoff (doubled per consecutive failure) |
 | `AUTOLOADER_RECOVERY_BACKOFF_MAX` | 300 | Cap on recovery backoff in seconds |
+| `AUTOLOADER_GRACEFUL_SHUTDOWN_S` | 5 | Seconds Ctrl+C waits for in-flight ASGI tasks (notably the WebUI `/ws` socket) before cancelling them; `0` waits forever. The client-facing forwarder stops accepting immediately on the signal |
 
 ### Model Sidecar JSON Format
 
@@ -137,6 +178,17 @@ Each model can have an optional sidecar config file named `model.gguf.json` plac
   "use_mmproj": true,
   "mmproj_file": "mmproj-MyModel-F16.gguf",
   "estimated_vram_mb": 5000,
+  "occupancy_profiles": {
+    "a1b2c3d4e5f6:0a1b2c3d4e5f": {
+      "vram_mb": 14200,
+      "gpus_mb": {"GPU-1234...": 14200},
+      "ram_mb": 22100,
+      "ram_delta_mb": 22100,
+      "ram_rss_mb": 21400,
+      "ram_private_mb": 21400,
+      "source": "stream"
+    }
+  },
   "tags": ["chat", "7B"]
 }
 ```
@@ -157,8 +209,25 @@ Each model can have an optional sidecar config file named `model.gguf.json` plac
 | `use_mmproj` | bool | `true` | Enable vision projector if an `mmproj` file is detected |
 | `mmproj_file` | string | `""` | Explicit vision projector filename (auto-detected if empty) |
 | `estimated_vram_mb` | int | `0` | Estimated VRAM usage hint (display only) |
+| `occupancy_profiles` | object | `{}` | Auto-measured VRAM/RAM occupancy, keyed by `<hardware>:<launch-config>` fingerprint. Written by the profiler, not user-editable |
 | `tags` | string[] | `[]` | Tags for filtering in the WebUI |
 | `type_override` | string | `""` | Pin the card to a model type; empty = auto-detect |
+
+> `occupancy_profiles` is filled automatically: once per hardware + launch configuration
+> (GPU set/driver, engine/backend, normalized argv, model file size/mtime), measured while
+> the model is the only resident engine. The single sample is taken on the model's first
+> streaming request after a load, then frozen: later requests do not resample it, and a
+> model that already has a profile for its current key is not measured again until that
+> key changes (e.g. edited args, new backend/driver, replaced model file). Values are
+> coarse before/after deltas, not a calibrated figure. `ram_mb` is
+> `max(system RAM delta, process RSS)`; commit charge is retained for diagnostics but
+> excluded because GPU-backed engines can commit tens of GB that are never resident in
+> RAM. Setting `models.occupancy_profiles: false` disables the measurement and
+> memory-aware admission (count-only LRU then applies). The WebUI card shows VRAM
+> **per card** (`GPU0 ≈… · GPU1 ≈…`) — placement is per card (`--devices`/tensor
+> split/autofit) and admission is decided per card — with a hover tooltip containing card
+> names, the total, system Δ / resident RSS / commit, source and measurement time
+> (measured profile when loaded, stored profile when offline).
 
 > `arch` and `model_type` also exist on `ModelConfig` but are **derived**: they are
 > recomputed from the GGUF header on every scan and are deliberately NOT written to the
@@ -756,6 +825,8 @@ Select global backend. Request body: `{ "backend": "<folder_name>" }`.
 
 Detailed system status including GPU/RAM info, loaded models, and process states.
 
+It also reports the occupancy profiler state: `hardware` (`fingerprint` + readable `label`), `occupancy_profiles` (whether measurement is enabled), and, for each entry in `per_model`, an `occupancy` object with the measured `vram_mb`, per-GPU `gpus_mb`, `ram_mb`, `source` and `measured_at` when a profile exists for the current hardware + launch configuration.
+
 The response includes a `recovery_failures` list (sorted by model) with one entry per model currently under a recovery cooldown: `model`, `port`, `generation`, `attempts` (consecutive failed reloads), `reason` (last failure), `failed_at` (monotonic timestamp of the failure), and `retry_after_s` (seconds remaining before the next attempt). It is an empty list when no model is in a failed-recovery state.
 
 #### `GET /v1/settings`
@@ -767,6 +838,8 @@ Get current autoloader runtime settings.
 {
   "idle_timeout_seconds": 3600,
   "max_loaded_models": 1,
+  "vram_headroom_mb": 1024,
+  "ram_headroom_mb": 4096,
   "auto_save_state": false,
   "poll_interval_seconds": 2,
   "base_port": 9001,
@@ -786,6 +859,8 @@ Update autoloader runtime settings (partial update, persists to `config.yaml`). 
 |-------|------|------------|-------|
 | `idle_timeout_seconds` | number | > 0 | Seconds before idle model is unloaded |
 | `max_loaded_models` | integer | >= 1 | Max concurrent loaded models |
+| `vram_headroom_mb` | integer | >= 0 | Per-GPU VRAM kept free for other apps (MiB); writes `models.vram.headroom_mb` |
+| `ram_headroom_mb` | integer | >= 0 | System RAM/commit kept free (MiB); writes `models.vram.ram_headroom_mb` |
 | `auto_save_state` | boolean | — | Global default for auto-save/restore |
 | `poll_interval_seconds` | number | > 0 | GPU polling interval |
 | `default_args` | string | — | Default llama-server CLI args |
@@ -1037,7 +1112,7 @@ When agents need to switch models:
 
 3. **Load ordering**: The autoloader loads models serially to avoid port conflicts, but other requests are queued.
 
-4. **Eviction awareness**: If `max_loaded_models` is reached, the least-recently-used unpinned model is evicted to make room. Models that are pinned, actively generating, or still loading are excluded from eviction candidates; if no eligible model can be evicted (or the eviction fails), the new load is refused with an error rather than proceeding.
+4. **Eviction awareness**: `max_loaded_models` is a hard count cap. Eviction picks the least-recently-used unpinned model. With `models.vram` enabled, measured VRAM/RAM decides *when* to evict: a model that fits co-loads, otherwise evict the LRU until it fits. Models that are pinned, actively generating, or still loading are excluded from eviction candidates; if no eligible model can be evicted (or the eviction fails), the new load is refused with an error rather than proceeding.
 
 5. **Best practice**: Design agents to use a consistent primary model when possible to reduce switching overhead. Use pinned models for critical paths.
 

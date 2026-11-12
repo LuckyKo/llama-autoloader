@@ -125,6 +125,20 @@ Example cURL:
       <input id="s-max-loaded" type="number" min="1" />
     </div>
     <div class="form-row">
+      <label>VRAM Headroom per GPU (MiB)</label>
+      <input id="s-vram-headroom" type="number" min="0" step="1" />
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+        Free VRAM kept for the desktop and other apps during memory-aware admission.
+      </div>
+    </div>
+    <div class="form-row">
+      <label>RAM Headroom (MiB)</label>
+      <input id="s-ram-headroom" type="number" min="0" step="1" />
+      <div style="font-size:11px;color:var(--muted);margin-top:4px;">
+        Free system RAM/commit kept as a safety margin (Windows commit-limit guard).
+      </div>
+    </div>
+    <div class="form-row">
       <label>Max State Files to Keep</label>
       <input id="s-save-state-max-keep" type="number" min="1" />
     </div>

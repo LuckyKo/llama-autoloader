@@ -49,8 +49,15 @@ llama_server:
 models:
   root_dir: "/path/to/your/models"   # directory to scan recursively for *.gguf
   idle_timeout_seconds: 300
-  max_loaded_models: 1               # LRU eviction threshold
+  max_loaded_models: 1               # LRU eviction threshold (hard count cap)
   auto_save_state: false             # auto save/restore session state on switch
+  occupancy_profiles: true           # auto-measure per-model VRAM/RAM in the sidecar
+  vram:                              # memory-aware admission (needs occupancy_profiles)
+    enabled: true
+    headroom_mb: 1024                # per-GPU MB kept free for desktop/other apps
+    ram_headroom_mb: 4096            # system commit-limit guard
+    unknown: evict_all               # evict_all | refuse | allow (new model, no profile)
+    reclaim_wait_s: 1.5              # pause after eviction before re-sampling
   save_state_dir: ./states
 
 gpu:
@@ -178,6 +185,17 @@ Each model can have an optional sidecar JSON file (`<model>.gguf.json`) placed n
   "use_mmproj": true,
   "mmproj_file": "mmproj-MyModel-F16.gguf",
   "estimated_vram_mb": 5000,
+  "occupancy_profiles": {
+    "a1b2c3d4e5f6:0a1b2c3d4e5f": {
+      "vram_mb": 14200,
+      "gpus_mb": {"GPU-1234...": 14200},
+      "ram_mb": 22100,
+      "ram_delta_mb": 22100,
+      "ram_rss_mb": 21400,
+      "ram_private_mb": 21400,
+      "source": "stream"
+    }
+  },
   "tags": ["chat", "7B"],
   "type_override": ""
 }
@@ -197,8 +215,57 @@ Each model can have an optional sidecar JSON file (`<model>.gguf.json`) placed n
 | `use_mmproj`       | bool     | `true`  | Enable vision projector if an `mmproj` file is detected                     |
 | `mmproj_file`      | string   | `""`    | Explicit vision projector filename (auto-detected if empty)                 |
 | `estimated_vram_mb`| int      | `0`     | Estimated VRAM usage hint (for display only)                                |
+| `occupancy_profiles`| object  | `{}`    | Auto-measured VRAM/RAM occupancy, keyed by hardware + launch fingerprint (written by the profiler, not user-editable) |
 | `tags`             | string[] | `[]`    | Tags for filtering in the WebUI                                             |
 | `type_override`    | string   | `""`    | Pin the card to a model type; empty = auto-detect (see below)                |
+
+`occupancy_profiles` is filled in automatically, once per hardware + launch
+configuration (GPU set/driver, engine/backend, normalized argv, model file size/mtime),
+while the model is the only resident engine. The sample is taken on the model's first
+streaming request after a load, then frozen: later requests do not resample it, and a
+model that already has a profile for its current key is not measured again until the key
+changes (edited args, new backend/driver, replaced model file). It records a coarse
+before/after VRAM delta per GPU plus `max(system RAM delta, process RSS)` —
+approximations, not calibrated measurements. Commit charge is stored for diagnostics but
+excluded from `ram_mb`, since a GPU-backed engine can commit tens of GB that are never
+resident in RAM. Disable with `models.occupancy_profiles: false`.
+
+The WebUI card shows VRAM **per card** (`GPU0 ≈… · GPU1 ≈…`), because placement is
+per card (`--devices`/tensor split/autofit) and admission is decided per card; hover for
+card names, the total, system Δ / resident RSS / commit, source and measurement time. A
+loaded engine shows its measured profile; an offline card shows the newest stored profile
+for the current hardware.
+
+### Memory-aware admission
+
+When both `models.occupancy_profiles` and `models.vram.enabled` are on, load admission
+uses the measured profiles. `max_loaded_models` remains a hard **count** cap; the memory
+check decides *when* LRU eviction runs, not *which* model is evicted:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `enabled` | `true` | Use measured memory for admission (inert while profiling is off) |
+| `headroom_mb` | `1024` | Free VRAM kept per GPU for the desktop and other apps |
+| `ram_headroom_mb` | `4096` | Free system RAM/commit kept as a safety margin |
+| `unknown` | `evict_all` | Policy when the incoming model has no profile for this hardware + launch config |
+| `reclaim_wait_s` | `1.5` | Pause after an eviction before re-sampling free memory |
+
+Both headroom values are editable at runtime from the WebUI **Global Settings** modal
+(`VRAM Headroom per GPU` / `RAM Headroom`, in MiB); saving applies them immediately and
+persists them to `config.yaml`.
+
+For a pending load the manager compares the stored footprint (per GPU, plus RAM) against
+what is free right now, minus headroom and minus reservations for loads that are still
+starting. If it fits, every resident stays loaded and the model co-loads. If not, the
+LRU model is evicted one at a time until it fits; if no evictable model can make room,
+the load is refused rather than soft-capping memory. Pinned, busy, and mid-load models
+are never victims.
+
+A model with no profile for this hardware + launch configuration is new. With the default
+`unknown: evict_all`, every evictable resident is unloaded first so the new model runs
+solo and can be measured cleanly; `refuse` refuses the load, and `allow` falls back to
+count-only behaviour. A profile captured while another model was resident is discarded,
+so a co-loaded engine's next solo load refreshes the measurement.
 
 ---
 
@@ -772,8 +839,22 @@ curl http://127.0.0.1:9124/v1/status
   "models_total": 26,
   "idle_timeout": 300,
   "max_loaded_models": 1,
+  "hardware": {
+    "fingerprint": "a1b2c3d4e5f6",
+    "label": "NVIDIA GeForce RTX 4090 / driver 555.99"
+  },
+  "occupancy_profiles": true,
   "per_model": {
-    "MyModel-Q4_K_M.gguf": {"ram_mb": 350, "vram_mb": 4800}
+    "MyModel-Q4_K_M.gguf": {
+      "ram_mb": 350,
+      "vram_mb": 4800,
+      "occupancy": {
+        "vram_mb": 14200,
+        "gpus_mb": {"GPU-1234...": 14200},
+        "ram_mb": 21000,
+        "source": "stream"
+      }
+    }
   },
   "uptime_models": [
     {
@@ -919,7 +1000,7 @@ API type: **OpenAI-compatible**. No API key required.
 2. **JIT Load** — When an API request arrives for a model that isn't loaded, spawns a `llama-server` subprocess on an available port
 3. **Proxy** — Forwards the request to the model's `llama-server` process and streams the response back
 4. **Idle Reaper** — A background task checks every 10 seconds and unloads models that have been idle longer than `idle_timeout_seconds`
-5. **LRU Eviction** — If `max_loaded_models` is reached, the least-recently-used unpinned model (excluding pinned, busy, and mid-load models) is unloaded before loading a new one. If no eligible model can be evicted, or the eviction fails, the load is refused with an error rather than proceeding over surviving processes.
+5. **LRU Eviction** — `max_loaded_models` is a hard count cap. Eviction picks the least-recently-used unpinned model (excluding pinned, busy, and mid-load models). With `models.vram` enabled, measured VRAM/RAM decides *when* to evict: a model that fits co-loads, otherwise evict the LRU until it fits. If no eligible model can be evicted, or the eviction fails, the load is refused with an error rather than proceeding over surviving processes.
 6. **Dead-Backend Recovery** — If a resident engine dies silently, the next LLM request detects the refused connection, evicts/reloads that model once (shared by concurrent requests), and retries the request instead of returning a permanent 502
 
 ---

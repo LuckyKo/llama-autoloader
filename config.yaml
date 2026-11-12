@@ -106,8 +106,15 @@ logging:
 models:
   auto_save_state: false
   idle_timeout_seconds: 3600
-  max_loaded_models: 1
+  max_loaded_models: 3
+  occupancy_profiles: true
   root_dir: n:/work/stuff/Beta
   save_state_dir: N:/work/stuff/Beta/llama-autoloader/states
   save_state_max_keep: 3
   save_state_max_bytes: 17179869184
+  vram:
+    enabled: true
+    headroom_mb: 512
+    ram_headroom_mb: 4096
+    unknown: evict_all
+    reclaim_wait_s: 1.5

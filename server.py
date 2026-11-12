@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import os
@@ -508,6 +509,10 @@ class ModelConfig:
     artifact: str = ""              # per-card engine artifact path (e.g. NInfer .ninfer) carried to argv[1]
     min_free_vram_mib: int = 0      # 0 = off; >0 → the engine's min_free_vram_flag (VRAM safety net)
     extra_args: List[str] = field(default_factory=list)  # appended verbatim to the serve argv
+    # Auto-measured VRAM/RAM occupancy per hardware+launch fingerprint, keyed by
+    # "<hw_fp>:<cfg_fp>" (see _capture_occupancy). Persisted so it travels with the model;
+    # purely observational for now (the scheduler does not read it yet).
+    occupancy_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     @property
     def is_bridge(self) -> bool:
@@ -543,6 +548,7 @@ class ModelConfig:
             artifact="",
             min_free_vram_mib=0,
             extra_args=[],
+            occupancy_profiles={},
         )
 
     @classmethod
@@ -558,6 +564,7 @@ class ModelConfig:
                 for k, v in data.items():
                     if hasattr(base, k):
                         setattr(base, k, v)
+                _normalize_occupancy_profiles(base.occupancy_profiles)
                 return base
             except Exception as e:
                 log.warning(f"Failed to read sidecar {sidecar}: {e}")
@@ -593,6 +600,9 @@ class ModelConfig:
             "engine": self.engine or "llama",
             # Self-describing: lets each card file record its engine config path.
             "engine_config": self.engine_config,
+            # Auto-measured occupancy profiles are part of the card's persistent data; a
+            # config edit must not drop them (they are never user-edited here).
+            "occupancy_profiles": self.occupancy_profiles,
         }
         _atomic_write_text(
             card_path,
@@ -643,6 +653,22 @@ class LoadedModel:
     # cannot distinguish a dead generation from its replacement. Recovery and active-
     # request accounting compare this token instead.
     generation: int = 0
+    # ---- occupancy profiling (see _capture_occupancy) ----
+    # Set when the engine became ready; load_s = ready_at - starting_at.
+    ready_at: float = 0.0
+    # "<hw_fp>:<cfg_fp>" for this engine's hardware + launch configuration ("" = unsupported).
+    occupancy_key: str = ""
+    # Snapshot taken immediately before spawn: per-GPU used MB + system RAM used MB.
+    occupancy_baseline: Dict[str, Any] = field(default_factory=dict)
+    # A sample is wanted (set on the first streaming request) until one is captured.
+    occupancy_wanted: bool = False
+    # True once any request has touched this engine (profile source = "stream").
+    occupancy_streamed: bool = False
+    # The one measured profile for this engine's key (VRAM per GPU + RAM). Once set,
+    # the model is never sampled again in this process: no drift between requests.
+    occupancy_best: Dict[str, Any] = field(default_factory=dict)
+    # Sidecar write bookkeeping: the measured profile is written exactly once per key.
+    occupancy_saved: bool = False
 
     def touch(self):
         self.last_used = time.time()
@@ -729,6 +755,120 @@ class GPUInfo:
     used_mb: int
     free_mb: int
     utilization_pct: float
+    # Stable device identity for occupancy profiles. ``index`` is not stable (it changes
+    # when devices are added/removed or the driver reorders them), so profiles key on UUID.
+    # Defaults keep positional construction used elsewhere/tests working.
+    uuid: str = ""
+    driver_version: str = ""
+
+
+# Launch flags whose VALUES are per-instance/per-machine noise: they must not participate
+# in the occupancy profile key, or every load and every config edit would look like a new
+# hardware/config combination. The flags themselves are dropped with their value.
+_OCCUPANCY_VOLATILE_ARG_FLAGS = frozenset({
+    "--port", "--host", "--alias", "--slot-save-path", "--model-id",
+})
+
+
+def _occupancy_argv_flavor(argv: List[str]) -> str:
+    """Normalize an engine argv for occupancy-profile fingerprinting.
+
+    Drops the volatile ``--flag value`` pairs (and ``--flag=value`` forms) that change per
+    instance without changing memory use. Everything else is kept verbatim: model path,
+    ``-ts``, ``-ngl``, ``-ctk/-ctv``, ``--cache-ram``, ``--mmproj``, spec-decode, etc.
+    """
+    out: List[str] = []
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _OCCUPANCY_VOLATILE_ARG_FLAGS:
+            skip_next = True
+            continue
+        if any(tok.startswith(f + "=") for f in _OCCUPANCY_VOLATILE_ARG_FLAGS):
+            continue
+        out.append(tok)
+    return " ".join(out)
+
+
+def _gpu_identity(gpus: List[GPUInfo]) -> Dict[str, Any]:
+    """Hardware identity for an occupancy profile: what the model runs on, not its load."""
+    if not gpus:
+        return {"os": platform.system().lower(), "gpus": [], "driver": ""}
+    return {
+        "os": platform.system().lower(),
+        "gpus": [
+            {
+                # ``index`` is only a fallback for drivers that do not expose a UUID.
+                "id": g.uuid or f"index:{g.index}",
+                "index": g.index,
+                "name": g.name,
+                "total_mb": g.total_mb,
+            }
+            for g in gpus
+        ],
+        "driver": next((g.driver_version for g in gpus if g.driver_version), ""),
+    }
+
+
+def _occupancy_hash(obj: Any) -> str:
+    """Short, stable hash for a JSON-serializable identity dict."""
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _profile_ram_mb(entry: Any) -> int:
+    """Effective RAM estimate from one stored occupancy profile entry.
+
+    Profiles written before the RSS fix stored ``ram_mb = max(system Δ, commit)``.
+    Commit charge is NOT resident RAM: a GPU-backed engine can commit tens of GB
+    (WDDM evictable budget) while only a few GB are resident. Legacy entries are
+    therefore read by their system delta; entries written since the fix carry
+    ``ram_rss_mb`` and already hold ``max(Δ, RSS)``.
+    """
+    if not isinstance(entry, dict):
+        return 0
+    if "ram_rss_mb" not in entry and entry.get("ram_delta_mb") is not None:
+        try:
+            return max(0, int(entry.get("ram_delta_mb", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return max(0, int(entry.get("ram_mb", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _normalize_occupancy_profiles(profiles: Any) -> None:
+    """Rewrite legacy profile entries in place to the RSS-based RAM estimate.
+
+    Runs when a sidecar/card is read so admission and the WebUI never see the old
+    commit-based number, even before that model's next load rewrites its profile.
+    """
+    if not isinstance(profiles, dict):
+        return
+    for entry in profiles.values():
+        if isinstance(entry, dict) and "ram_rss_mb" not in entry and "ram_delta_mb" in entry:
+            entry["ram_mb"] = _profile_ram_mb(entry)
+
+
+def _gpu_key(g: GPUInfo) -> str:
+    """Per-device key used in sidecar profiles (UUID when available)."""
+    return g.uuid or f"index:{g.index}"
+
+
+def _hardware_label(gpus: List[GPUInfo]) -> str:
+    """Human-readable hardware string stored alongside a profile for debuggability."""
+    if not gpus:
+        return f"{platform.system()} / no GPU"
+    counts: Dict[str, int] = {}
+    for g in gpus:
+        counts[g.name] = counts.get(g.name, 0) + 1
+    parts = [f"{n}x {name}" if n > 1 else name for name, n in counts.items()]
+    driver = next((g.driver_version for g in gpus if g.driver_version), "")
+    label = " + ".join(parts)
+    return f"{label} / driver {driver}" if driver else label
 
 
 # --------------------------------------------------------------------------
@@ -1062,6 +1202,23 @@ class ModelManager:
         self.save_state_dir.mkdir(parents=True, exist_ok=True)
         self.idle_timeout = cfg["models"].get("idle_timeout_seconds", 300)
         self.max_loaded_models = cfg["models"].get("max_loaded_models", 1)
+        self.occupancy_profiles_enabled = bool(cfg["models"].get("occupancy_profiles", True))
+        # Memory-aware admission (phase 2). Effective only when profiling is on: without
+        # measured profiles there is nothing trustworthy to compare against, so the legacy
+        # count-only LRU path stays in charge. ``models.vram`` covers VRAM *and* RAM.
+        vram_cfg = cfg["models"].get("vram") or {}
+        self.vram_admission_enabled = (
+            bool(vram_cfg.get("enabled", True)) and self.occupancy_profiles_enabled)
+        self.vram_headroom_mb = int(vram_cfg.get("headroom_mb", 1024))
+        self.ram_admission_headroom_mb = int(vram_cfg.get("ram_headroom_mb", 4096))
+        # What to do when the incoming model has no profile for this hardware+launch:
+        #   evict_all — evict every evictable resident so the new model can be measured solo
+        #   refuse    — refuse the load
+        #   allow     — legacy count-only behaviour (co-load without a measurement)
+        self.admission_unknown = str(vram_cfg.get("unknown", "evict_all"))
+        # Post-eviction pause before re-sampling free memory. Unload verifies the process is
+        # gone; this covers the driver/OS handing the pages back.
+        self.reclaim_wait_s = float(vram_cfg.get("reclaim_wait_s", 1.5))
         self.save_state_max_keep = cfg["models"].get("save_state_max_keep", 5)
         self.save_state_max_bytes = cfg["models"].get("save_state_max_bytes", _DEFAULT_STATE_MAX_BYTES)
         self.default_auto_save_state = cfg["models"].get("auto_save_state", False)
@@ -1097,6 +1254,11 @@ class ModelManager:
         self._mmproj_paths: List[Path] = []
         self._mmproj_sig: Tuple[Tuple[str, int, int], ...] = ()
         self.loaded: Dict[str, LoadedModel] = {}      # id -> loaded instance
+        # Admission reservations for loads that are spawned but not yet ready: their VRAM
+        # is not visible in nvidia-smi yet, so a concurrent admission must still count it.
+        # {model_id: {"gpus_mb": {gpu_key: MB}, "ram_mb": MB}}. Created under ``_lock``
+        # right before Popen and dropped in _do_load_model's finally.
+        self._occupancy_reservations: Dict[str, Dict[str, Any]] = {}
         # Bridge-card engine registry: {} => feature fully inert (no engines: section).
         self.engines = _normalize_engines(cfg)
         self.cards_dir = Path(cfg.get("cards_dir", "./engine_cards"))
@@ -1316,6 +1478,29 @@ class ModelManager:
         max_loaded = models.get("max_loaded_models", 1)
         if not isinstance(max_loaded, int) or max_loaded < 1:
             raise ValueError(f"Config 'models.max_loaded_models' must be >= 1, got {max_loaded!r}")
+        occupancy_profiles = models.get("occupancy_profiles", True)
+        if not isinstance(occupancy_profiles, bool):
+            raise ValueError(f"Config 'models.occupancy_profiles' must be a boolean, got {occupancy_profiles!r}")
+        vram = models.get("vram", {})
+        if vram is None:
+            vram = {}
+        if not isinstance(vram, dict):
+            raise ValueError(f"Config 'models.vram' must be a mapping, got {vram!r}")
+        if not isinstance(vram.get("enabled", True), bool):
+            raise ValueError(f"Config 'models.vram.enabled' must be a boolean, "
+                             f"got {vram.get('enabled')!r}")
+        for key, default in (("headroom_mb", 1024), ("ram_headroom_mb", 4096)):
+            val = vram.get(key, default)
+            if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                raise ValueError(f"Config 'models.vram.{key}' must be a non-negative int, got {val!r}")
+        unknown = vram.get("unknown", "evict_all")
+        if unknown not in ("evict_all", "refuse", "allow"):
+            raise ValueError(f"Config 'models.vram.unknown' must be one of "
+                             f"'evict_all', 'refuse', 'allow'; got {unknown!r}")
+        reclaim = vram.get("reclaim_wait_s", 1.5)
+        if isinstance(reclaim, bool) or not isinstance(reclaim, (int, float)) or reclaim < 0:
+            raise ValueError(f"Config 'models.vram.reclaim_wait_s' must be a non-negative "
+                             f"number, got {reclaim!r}")
         save_state_max_keep = models.get("save_state_max_keep", 5)
         if not isinstance(save_state_max_keep, int) or save_state_max_keep < 1:
             raise ValueError(f"Config 'models.save_state_max_keep' must be >= 1, got {save_state_max_keep!r}")
@@ -1672,6 +1857,8 @@ class ModelManager:
         # Force AFTER the overlay: a card file must not be able to re-engine the card.
         base.engine = engine_name
         base.engine_config = str(cfg_path)
+        # Legacy (commit-based) occupancy entries are read by their system delta.
+        _normalize_occupancy_profiles(base.occupancy_profiles)
         # A card file must not be able to flip auto_save_state either; the global
         # default_auto_save_state still governs at the use sites (cfg.auto_save_state
         # or self.default_auto_save_state), so per-card opt-in is intentionally not
@@ -2078,6 +2265,8 @@ class ModelManager:
                 "max_ctx_size": cfg.max_ctx_size,
                 "n_gpu_layers": cfg.n_gpu_layers,
                 "estimated_vram_mb": cfg.estimated_vram_mb,
+                # Auto-measured VRAM/RAM occupancy per hardware+launch key (observational).
+                "occupancy_profiles": cfg.occupancy_profiles,
                 "args": cfg.args,
                 "gguf_name": cfg.gguf_name,
                 "size_mb": round(size_mb, 1),
@@ -2396,13 +2585,32 @@ class ModelManager:
         log.error(f"Timed out waiting for llama-server on port {port} after {timeout}s")
         return False
 
+    def _pick_lru_eviction_candidate(
+            self, target_model_id: str) -> Optional[Tuple[str, LoadedModel]]:
+        """Return the LRU evictable resident, or None (caller must hold self._lock).
+
+        A model is a candidate only when it is not the target, not pinned, has no active
+        requests, and is not mid-load (an incomplete task in ``_loading_tasks`` — evicting
+        one causes a load/evict ping-pong cascade).
+        """
+        candidates = [
+            (mid, lm) for mid, lm in self.loaded.items()
+            if mid != target_model_id and not lm.config.pinned
+            and lm.active_requests == 0
+            and not self._is_loading(mid)
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[1].last_used)
+        return candidates[0]
+
     async def _evict_lru_if_needed(self, target_model_id: str) -> Optional[UnloadResult]:
         """If loaded models count >= max_loaded_models, unload the LRU evictable model
         (caller must hold self._lock).
 
-        A model is an eviction candidate only when it is not the target, not pinned,
-        has no active requests, and is not mid-load (an incomplete task in
-        ``_loading_tasks`` — evicting one causes a load/evict ping-pong cascade).
+        This is the LEGACY count-only path, used when memory-aware admission is disabled
+        (``models.vram.enabled: false`` or profiling off). Memory-aware loads go through
+        :meth:`_make_room_for`.
 
         Returns the ``UnloadResult`` of the eviction, or ``None`` when no eviction
         was needed or no candidate existed. Callers MUST check the result: a
@@ -2418,22 +2626,217 @@ class ModelManager:
         """
         if len(self.loaded) < self.max_loaded_models:
             return None
-        candidates = [
-            (mid, lm) for mid, lm in self.loaded.items()
-            if mid != target_model_id and not lm.config.pinned
-            and lm.active_requests == 0
-            and not self._is_loading(mid)
-        ]
-        if not candidates:
+        candidate = self._pick_lru_eviction_candidate(target_model_id)
+        if candidate is None:
             log.warning(
                 f"Max loaded models limit ({self.max_loaded_models}) reached and no "
                 f"evictable model is available for '{target_model_id}' (every other "
                 f"model is pinned, busy, or mid-load); refusing the load")
             return None
-        candidates.sort(key=lambda item: item[1].last_used)
-        lru_id, lru_lm = candidates[0]
+        lru_id, lru_lm = candidate
         log.info(f"Auto-evicting LRU model {lru_id} (last used {round(time.time() - lru_lm.last_used, 1)}s ago) to free slot")
         return await self._unload_unlocked(lru_id)
+
+    # ---- memory-aware admission (uses the measured occupancy profiles) ----
+    def _reservation_totals_locked(self) -> Tuple[Dict[str, int], int]:
+        """Sum of in-flight load reservations (caller holds ``_lock``)."""
+        gpus: Dict[str, int] = {}
+        ram = 0
+        for res in self._occupancy_reservations.values():
+            for gkey, mb in (res.get("gpus_mb") or {}).items():
+                gpus[str(gkey)] = gpus.get(str(gkey), 0) + int(mb)
+            ram += int(res.get("ram_mb", 0) or 0)
+        return gpus, ram
+
+    def _memory_need_for(self, cfg: ModelConfig, key: str) -> Optional[Dict[str, Any]]:
+        """Measured footprint for one hardware+launch key, or None when unknown.
+
+        Only a profile that carries the per-GPU split is trusted: the sum alone cannot
+        catch a ``-ts 100,80`` split that does not fit either device.
+        """
+        if not key:
+            return None
+        entry = (cfg.occupancy_profiles or {}).get(key)
+        if not isinstance(entry, dict):
+            return None
+        gpus_mb = entry.get("gpus_mb")
+        if not isinstance(gpus_mb, dict):
+            return None
+        return {
+            "gpus_mb": {str(k): max(0, int(v)) for k, v in gpus_mb.items()},
+            "ram_mb": _profile_ram_mb(entry),
+            "profile": entry,
+        }
+
+    def _memory_capacity(self, gpus_list: List[GPUInfo]) -> Tuple[Dict[str, int], int]:
+        """Per-GPU free MB and available system RAM MB, minus headroom and reservations."""
+        reserved_gpus, reserved_ram = self._reservation_totals_locked()
+        avail_gpu: Dict[str, int] = {}
+        for g in gpus_list:
+            gkey = _gpu_key(g)
+            avail_gpu[gkey] = max(
+                0, int(g.free_mb) - self.vram_headroom_mb - reserved_gpus.get(gkey, 0))
+        ram = self.system_ram()
+        ram_avail = max(
+            0, int(ram.get("free_mb", 0)) - self.ram_admission_headroom_mb - reserved_ram)
+        return avail_gpu, ram_avail
+
+    def _memory_fits(self, need: Dict[str, Any], gpus_list: List[GPUInfo]
+                     ) -> Tuple[bool, Dict[str, int], int]:
+        """Count cap + per-GPU + RAM fit test for one measured need."""
+        avail_gpu, ram_avail = self._memory_capacity(gpus_list)
+        if len(self.loaded) >= self.max_loaded_models:
+            return False, avail_gpu, ram_avail
+        for gkey, mb in (need.get("gpus_mb") or {}).items():
+            if int(mb) > avail_gpu.get(gkey, 0):
+                return False, avail_gpu, ram_avail
+        if int(need.get("ram_mb", 0)) > ram_avail:
+            return False, avail_gpu, ram_avail
+        return True, avail_gpu, ram_avail
+
+    @staticmethod
+    def _format_memory_map(values: Dict[str, int],
+                           gpus: Optional[List[GPUInfo]] = None) -> str:
+        """Render a per-card map; keys are GPU UUIDs, labels use the live index if known."""
+        if not values:
+            return "{}"
+        index_by_key = {_gpu_key(g): g.index for g in (gpus or [])}
+        parts = []
+        for key, mb in values.items():
+            label = f"GPU{index_by_key[key]}" if key in index_by_key else str(key)
+            parts.append(f"{label}: {mb}MB")
+        return "{" + ", ".join(parts) + "}"
+
+    async def _make_room_for(self, model_id: str, cfg: ModelConfig,
+                             artifact: Optional[Path], argv: Optional[List[str]]) -> None:
+        """Decide co-load / evict / refuse for a pending load (caller holds ``_lock``).
+
+        LRU remains the only eviction policy. If the incoming model's measured footprint
+        fits in the memory that is free right now (minus headroom and in-flight
+        reservations), every resident stays loaded and we co-load. Otherwise evict in LRU
+        order, one at a time, stopping as soon as it fits; if no evictable candidate can
+        make room, raise (the same refusal contract as before — never a soft cap).
+
+        A model with no profile for this hardware+launch is *new*: by default evacuate
+        every evictable resident so it runs solo and the profiler can measure it.
+        """
+        if not self.vram_admission_enabled:
+            # Legacy path: evict LRU only when the hard count cap is reached. The cap
+            # check after the eviction is what refuses a "soft cap" (the 2026-10-31
+            # double-load that died at the Windows commit limit).
+            result = await self._evict_lru_if_needed(model_id)
+            self._require_engine_gone(
+                result,
+                f"Cannot load {model_id}: LRU eviction of "
+                f"{result.model_id if result else model_id} failed")
+            if result is None and len(self.loaded) >= self.max_loaded_models:
+                raise RuntimeError(
+                    f"Cannot load {model_id}: max_loaded_models "
+                    f"({self.max_loaded_models}) reached and no evictable model "
+                    f"is available (pinned, busy, or mid-load)")
+            return
+
+        # The memory-aware path is only reachable with the launch details in hand.
+        assert artifact is not None and argv is not None
+        gpus_list = await asyncio.to_thread(self.gpus)
+        context = self._occupancy_load_context(cfg, artifact, argv, gpus_list)
+        need = self._memory_need_for(cfg, context.get("key", ""))
+        if need is None:
+            await self._make_room_unknown(model_id, context)
+            return
+
+        evicted: List[str] = []
+        while True:
+            fits, avail_gpu, ram_avail = self._memory_fits(need, gpus_list)
+            if fits:
+                self._occupancy_reservations[model_id] = {
+                    "gpus_mb": dict(need["gpus_mb"]),
+                    "ram_mb": int(need["ram_mb"]),
+                }
+                log.info(
+                    f"Admit {model_id} by measured occupancy: need VRAM "
+                    f"{self._format_memory_map(need['gpus_mb'], gpus_list)} / "
+                    f"RAM {need['ram_mb']}MB; "
+                    f"available VRAM {self._format_memory_map(avail_gpu, gpus_list)} / RAM "
+                    f"{ram_avail}MB"
+                    + (f"; evicted {', '.join(evicted)}" if evicted else " (co-load)"))
+                return
+            candidate = self._pick_lru_eviction_candidate(model_id)
+            if candidate is None:
+                raise RuntimeError(
+                    f"Cannot load {model_id}: measured need VRAM "
+                    f"{self._format_memory_map(need['gpus_mb'], gpus_list)} / "
+                    f"RAM {need['ram_mb']}MB "
+                    f"exceeds available VRAM "
+                    f"{self._format_memory_map(avail_gpu, gpus_list)} / RAM "
+                    f"{ram_avail}MB and no evictable model is available "
+                    f"(pinned, busy, or mid-load)")
+            victim_id, victim_lm = candidate
+            log.info(
+                f"Evicting LRU model {victim_id} "
+                f"(last used {round(time.time() - victim_lm.last_used, 1)}s ago) to make "
+                f"room for {model_id}")
+            result = await self._unload_unlocked(victim_id)
+            self._require_engine_gone(
+                result,
+                f"Cannot load {model_id}: memory eviction of {victim_id} failed",
+            )
+            evicted.append(victim_id)
+            # The process is verifiably gone; give the driver/OS a moment to return the
+            # pages, then re-sample (VRAM reclaim is not synchronous on WDDM).
+            if self.reclaim_wait_s:
+                await asyncio.sleep(self.reclaim_wait_s)
+            gpus_list = await asyncio.to_thread(self.gpus)
+
+    async def _make_room_unknown(self, model_id: str, context: Dict[str, Any]) -> None:
+        """No measured profile for the incoming model: apply ``models.vram.unknown``."""
+        policy = self.admission_unknown
+        if policy == "refuse":
+            raise RuntimeError(
+                f"Cannot load {model_id}: no measured occupancy profile for this "
+                f"hardware/launch configuration and models.vram.unknown is 'refuse'")
+        if policy == "allow":
+            result = await self._evict_lru_if_needed(model_id)
+            self._require_engine_gone(
+                result,
+                f"Cannot load {model_id}: LRU eviction of "
+                f"{result.model_id if result else model_id} failed")
+            if result is None and len(self.loaded) >= self.max_loaded_models:
+                raise RuntimeError(
+                    f"Cannot load {model_id}: max_loaded_models "
+                    f"({self.max_loaded_models}) reached and no evictable model "
+                    f"is available (pinned, busy, or mid-load)")
+            return
+
+        # evict_all (default): clear the deck so the new model is the only resident and
+        # the profiler can take a clean solo baseline/measurement.
+        evicted: List[str] = []
+        while True:
+            candidate = self._pick_lru_eviction_candidate(model_id)
+            if candidate is None:
+                break
+            victim_id, _ = candidate
+            log.info(f"Evicting LRU model {victim_id} so new model {model_id} can be "
+                     f"measured solo")
+            result = await self._unload_unlocked(victim_id)
+            self._require_engine_gone(
+                result,
+                f"Cannot load {model_id}: eviction of {victim_id} failed",
+            )
+            evicted.append(victim_id)
+        if evicted and self.reclaim_wait_s:
+            await asyncio.sleep(self.reclaim_wait_s)
+        if len(self.loaded) >= self.max_loaded_models:
+            raise RuntimeError(
+                f"Cannot load {model_id}: no measured occupancy profile and "
+                f"max_loaded_models ({self.max_loaded_models}) is reached with only "
+                f"pinned, busy, or mid-load residents; refusing rather than co-loading "
+                f"an unmeasured model")
+        log.info(
+            f"Admit new model {model_id}: no occupancy profile for "
+            f"{(context.get('key') or 'this hardware')[:25]}; "
+            + (f"evicted {len(evicted)} model(s) to measure it solo" if evicted
+               else "no residents to evict"))
 
     # ---- active-request tracking (called from forwarder worker threads) ----
     def _gen_matches(self, recorded: int, expected_generation: int) -> bool:
@@ -2466,6 +2869,13 @@ class ModelManager:
                 continue
             lm.active_requests += 1
             lm.touch()
+            # One-shot profiling: arm a sample on the first streaming request, but only
+            # while this hardware+launch key has no stored profile yet. After the single
+            # sample the profiler stays off until the card changes (which changes
+            # occupancy_key), so the stored/displayed number cannot drift per request.
+            lm.occupancy_streamed = True
+            if not lm.occupancy_best and not self._occupancy_has_profile(lm):
+                lm.occupancy_wanted = True
             return lm
         return None
 
@@ -2484,6 +2894,9 @@ class ModelManager:
             return
         engine.active_requests = max(0, engine.active_requests - 1)
         engine.touch()
+        # Deliberately does NOT re-arm occupancy sampling: the profile is measured once,
+        # on the first streaming request, and frozen until the card's launch config
+        # changes. Re-arming here made the number drift request to request.
 
     def _model_lock(self, model_id: str) -> asyncio.Lock:
         """Per-model lock serializing loads against recovery teardown.
@@ -3013,23 +3426,12 @@ class ModelManager:
                     self._require_engine_gone(
                         result, f"Cannot reload {model_id} after unloading "
                         f"the previous engine")
-                evict_result = await self._evict_lru_if_needed(model_id)
-                self._require_engine_gone(
-                    evict_result,
-                    f"Cannot load {model_id}: LRU eviction of "
-                    f"{evict_result.model_id if evict_result else model_id} failed")
-                if evict_result is None and len(self.loaded) >= self.max_loaded_models:
-                    # _evict_lru_if_needed returns None both under the cap and when
-                    # every candidate is pinned/busy/mid-load. The latter used to
-                    # proceed over the cap ("soft cap"), which is exactly how two
-                    # engines ended up loading at once with max_loaded_models: 1
-                    # (2026-10-31 04:33: two strata loads, both died at the Windows
-                    # commit limit). Refuse instead; the docs already promise this.
-                    raise RuntimeError(
-                        f"Cannot load {model_id}: max_loaded_models "
-                        f"({self.max_loaded_models}) reached and no evictable model "
-                        f"is available (pinned, busy, or mid-load)")
                 cfg = self.models[model_id]
+                # Legacy count-only admission runs before any launch work (unchanged
+                # ordering). The memory-aware path must wait for argv (see below) because
+                # the occupancy profile key includes it.
+                if not self.vram_admission_enabled:
+                    await self._make_room_for(model_id, cfg, None, None)
                 port = self._allocate_port(model_id)
                 # Engine dispatch: bridge cards build their own argv/cwd/env from the engine
                 # registry; the llama path is byte-identical to before (env/cwd are None →
@@ -3052,8 +3454,21 @@ class ModelManager:
                     artifact = self.gguf_paths[model_id]
                     argv, cwd, env = _launch_llama(self, cfg, model_id, artifact, port)
 
+                # Memory-aware admission runs AFTER argv is built: the occupancy profile key
+                # includes the normalized argv (ctx, -ts, ...), so the stored footprint for
+                # exactly this launch config can be looked up. It either co-loads (fits),
+                # evicts LRU until it fits, evacuates residents for a new model, or refuses.
+                # The disabled case already ran the legacy count-only check above.
+                if self.vram_admission_enabled:
+                    await self._make_room_for(model_id, cfg, artifact, argv)
+
                 log.info(f"Launching {cfg.engine or 'llama'} for {model_id} on port {port}")
                 log.info("argv: " + " ".join(argv))
+
+                # Occupancy profiling (§ docs): snapshot the box immediately before this
+                # engine allocates anything. Best-effort — a failed probe never fails a load.
+                occupancy = await self._capture_occupancy_baseline(
+                    model_id, cfg, artifact, argv)
 
                 # Spawn process (env/cwd are None for llama → inherit, byte-identical).
                 if platform.system() == "Windows":
@@ -3085,6 +3500,8 @@ class ModelManager:
                     pid=proc.pid,
                     starting_at=time.time(),
                     generation=self._engine_generation,
+                    occupancy_key=occupancy.get("key", ""),
+                    occupancy_baseline=occupancy,
                 )
                 self.loaded[model_id] = lm
                 self._start_log_thread(model_id, proc)
@@ -3118,6 +3535,13 @@ class ModelManager:
                 timeout=self.ready_timeout_for(model_id),
                 abort_probe=lambda: model_id in self._load_aborts)
             lm.ready = ready
+            if ready:
+                lm.ready_at = time.time()
+                # No sampling here: the single profile sample is armed by the first
+                # streaming request (see note_request_start), so it reflects the engine
+                # at its working set rather than a mid-load snapshot. A model loaded
+                # without any request keeps its previously stored profile (or stays
+                # unmeasured until it is actually used).
             if not ready:
                 if model_id in self._load_aborts:
                     # BUG_0013: an explicit unload killed this engine on purpose and owns
@@ -3182,6 +3606,10 @@ class ModelManager:
                 await self._unload_unlocked(model_id)
             raise
         finally:
+            # Drop this load's admission reservation on every path. A plain pop is safe:
+            # this whole call runs on the event loop, and readers iterate the dict under
+            # self._lock (no await can interleave with this statement).
+            self._occupancy_reservations.pop(model_id, None)
             # Release the pre-load ticket on every path (success, CancelledError, a
             # not-ready load, or an auto-restore failure) so a failed load never wedges
             # the queue behind a holder that will never return. Safe on a stopped queue
@@ -3793,7 +4221,7 @@ class ModelManager:
         try:
             r = subprocess.run(
                 ["nvidia-smi",
-                 "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu",
+                 "--query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,uuid,driver_version",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=5,
             )
@@ -3808,6 +4236,9 @@ class ModelManager:
                     used_mb=_safe_int(parts[3], 0),
                     free_mb=_safe_int(parts[4], 0),
                     utilization_pct=_safe_float(parts[5], 0.0),
+                    # Older/odd drivers may omit trailing columns; keep the defaults.
+                    uuid=parts[6] if len(parts) > 6 and parts[6] != "[N/A]" else "",
+                    driver_version=parts[7] if len(parts) > 7 and parts[7] != "[N/A]" else "",
                 ))
         except Exception as e:
             log.warning(f"nvidia-smi failed: {e}")
@@ -3849,6 +4280,255 @@ class ModelManager:
         except Exception as e:
             log.warning(f"per_model_ram_vram failed: {e}")
         return out
+
+    # ---------------- occupancy profiling ----------------
+    def _occupancy_load_context(self, cfg: "ModelConfig", artifact: Path,
+                                argv: List[str], gpus: List[GPUInfo]) -> Dict[str, Any]:
+        """Identity of one launch: hardware + launch-config fingerprint (pure).
+
+        Shared by :meth:`_capture_occupancy_baseline` (which adds the before-spawn
+        samples) and :meth:`_make_room_for` (which needs the key to look up the stored
+        profile BEFORE spawning).
+        """
+        backend = cfg.backend or self.selected_backend
+        model_file: Dict[str, int] = {}
+        try:
+            st = Path(artifact).stat()
+            model_file = {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+        except OSError:
+            pass
+        argv_flavor = _occupancy_argv_flavor(argv)
+        # Two keys in one: what the model runs on (stable per box) and how it is being
+        # run (ctx, -ts, quantized KV, backend, model file). Any launch-config edit
+        # produces a new cfg_fp, so a stale profile is ignored rather than trusted.
+        hw_fp = _occupancy_hash(_gpu_identity(gpus))
+        cfg_fp = _occupancy_hash({
+            "engine": cfg.engine or "llama",
+            "backend": backend,
+            "argv": argv_flavor,
+            "model_file": model_file,
+        })
+        return {
+            "key": f"{hw_fp}:{cfg_fp}",
+            "hw": _hardware_label(gpus),
+            "engine": cfg.engine or "llama",
+            "backend": backend,
+            "argv_flavor": argv_flavor,
+            "model_file": model_file,
+        }
+
+    async def _capture_occupancy_baseline(
+            self, model_id: str, cfg: "ModelConfig", artifact: Path,
+            argv: List[str]) -> Dict[str, Any]:
+        """Snapshot GPU/RAM usage immediately before an engine is spawned.
+
+        Returns the per-load context stored on :class:`LoadedModel` and used by
+        :meth:`_capture_occupancy`. Best-effort by design: no nvidia-smi, a bind failure or
+        any probe error simply yields ``{}`` (this model gets no profile; nothing else
+        changes and the load is never failed by profiling).
+        """
+        if not self.occupancy_profiles_enabled:
+            return {}
+        try:
+            gpus = await asyncio.to_thread(self.gpus)
+            ram = self.system_ram()
+            return {
+                **self._occupancy_load_context(cfg, artifact, argv, gpus),
+                "gpus_used_mb": {_gpu_key(g): int(g.used_mb) for g in gpus},
+                "ram_used_mb": int(ram.get("used_mb", 0)),
+                # A clean before/after delta needs this model to be the ONLY resident at
+                # baseline time as well. A co-loaded or force-reloaded engine gets no
+                # profile from this launch; the next solo load measures it.
+                "solo": len(self.loaded) == 0,
+                "taken_at": time.time(),
+            }
+        except Exception as e:  # noqa: BLE001 - profiling must never fail a load
+            log.debug(f"Occupancy baseline for {model_id} unavailable: {e}")
+            return {}
+
+    def _occupancy_has_profile(self, lm: "LoadedModel") -> bool:
+        """True when a usable, current-schema profile exists for this engine's key.
+
+        "Usable" uses the same rule as :meth:`_memory_need_for`: the entry must carry
+        the per-GPU split. Entries written before the RSS fix (no ``ram_rss_mb``) are
+        treated as unmeasured so they get upgraded exactly once with the RSS-based
+        value; until then admission/display already read their system delta (see
+        :func:`_profile_ram_mb`). Once a current profile exists the model is not
+        measured again until its launch configuration changes (new ``occupancy_key``).
+        """
+        if not lm.occupancy_key:
+            return False
+        cfg = self.models.get(lm.model_id) or lm.config
+        entry = (cfg.occupancy_profiles or {}).get(lm.occupancy_key)
+        return (isinstance(entry, dict)
+                and isinstance(entry.get("gpus_mb"), dict)
+                and "ram_rss_mb" in entry)
+
+    async def _capture_occupancy(
+            self, loaded_snap: List[tuple], gpus_list: List[GPUInfo]) -> None:
+        """Record the single VRAM/RAM occupancy profile for the solo-loaded model.
+
+        Reuses the GPU sample ``_build_status`` already collected (no extra nvidia-smi).
+        Deliberately coarse: occupancy = during − pre-spawn baseline, per GPU, plus
+        ``max(system RAM delta, process RSS)``. Commit charge is recorded for diagnostics
+        but excluded from ``ram_mb``: GPU-backed engines can commit tens of GB that are
+        never resident RAM. It only runs while exactly one model is
+        resident so no other engine's allocation pollutes the delta. Overcounting (other
+        apps growing during the window) is accepted; it is the safe direction for a future
+        admission check.
+
+        One-shot: the sample is armed by the engine's first streaming request (see
+        :meth:`note_request_start`) and captured here on the next status tick. After
+        that ``occupancy_best`` holds the measurement, ``occupancy_wanted`` stays clear
+        and later requests/polls never resample it, so the number cannot drift. A new
+        hardware/launch key (card/args change) arms a fresh measurement; an existing
+        stored profile means the model is not measured again. The sidecar is written
+        once per key.
+        """
+        if not self.occupancy_profiles_enabled or len(loaded_snap) != 1:
+            return
+        mid, lm = loaded_snap[0]
+        if not lm.ready or not lm.occupancy_key:
+            return
+        if not lm.occupancy_best and not lm.occupancy_wanted:
+            return
+        if lm.occupancy_best:
+            # Already measured in this process; a stale armed flag must not resample.
+            lm.occupancy_wanted = False
+        base = lm.occupancy_baseline
+        if not base:
+            return
+        # A co-loaded/force-reloaded engine has a baseline polluted by the other resident's
+        # presence (and its later release), so its delta would be wrong. Only trust a
+        # baseline captured while this engine was the sole resident. Missing (legacy/test)
+        # contexts default to True.
+        if base.get("solo", True) is False:
+            return
+        try:
+            if not lm.occupancy_best:
+                now = time.time()
+                gpus_now = {_gpu_key(g): int(g.used_mb) for g in gpus_list}
+                base_used = base.get("gpus_used_mb") or {}
+                gpus_mb: Dict[str, int] = {}
+                for gkey, used_before in base_used.items():
+                    # A missing device means it disappeared between baseline and sample; its
+                    # delta is zero rather than a negative number.
+                    used_now = gpus_now.get(gkey, used_before)
+                    gpus_mb[gkey] = max(0, int(used_now - used_before))
+                ram = self.system_ram()
+                ram_delta = max(0, int(ram.get("used_mb", 0) - base.get("ram_used_mb", 0)))
+                rss_mb = 0
+                private_mb = 0
+                try:
+                    mem = psutil.Process(lm.pid).memory_info()
+                    # RSS / working set = pages actually resident in RAM. That is what the
+                    # "available RAM" admission check is about, and what a fully GPU-resident
+                    # model really costs (e.g. ninfer's WDDM evictable budget commits ~40 GB
+                    # but only ~8 GB is resident).
+                    rss_mb = int(mem.rss / (1024 * 1024))
+                    # Windows: ``private`` is the commit charge (VirtualAlloc/commit limit);
+                    # other platforms/older psutil lack it. Stored for diagnostics only: a
+                    # big GPU-backed commit reservation is NOT resident RAM and must not
+                    # inflate the RAM estimate (see occupancy_profiles schema note).
+                    private_mb = int(getattr(mem, "private", mem.rss) / (1024 * 1024))
+                except Exception:
+                    pass
+                lm.occupancy_best = {
+                    "measured_at": int(now),
+                    "hw": base.get("hw", ""),
+                    "engine": base.get("engine", ""),
+                    "backend": base.get("backend", ""),
+                    "argv_flavor": base.get("argv_flavor", ""),
+                    "model_file": base.get("model_file", {}),
+                    "load_s": round(max(0.0, (lm.ready_at or now) - lm.starting_at), 2),
+                    "vram_mb": int(sum(gpus_mb.values())),
+                    "gpus_mb": gpus_mb,
+                    "ram_mb": max(ram_delta, rss_mb),
+                    "ram_delta_mb": ram_delta,
+                    "ram_rss_mb": rss_mb,
+                    "ram_private_mb": private_mb,
+                    "source": "stream" if lm.occupancy_streamed else "load",
+                }
+                lm.occupancy_wanted = False
+
+            best = lm.occupancy_best
+            # Exactly one sidecar write per key. A failed write is retried on the next
+            # poll without resampling.
+            if lm.occupancy_saved:
+                return
+
+            # Publish in memory first (a concurrent config save then carries the profile),
+            # then merge-write the sidecar/card on a worker thread.
+            async with self._lock:
+                cfg_live = self.models.get(mid)
+                if cfg_live is not None:
+                    cfg_live.occupancy_profiles[lm.occupancy_key] = copy.deepcopy(best)
+                if lm.config is not cfg_live:
+                    lm.config.occupancy_profiles[lm.occupancy_key] = copy.deepcopy(best)
+            ok = await asyncio.to_thread(
+                self._write_occupancy_profile,
+                mid, lm.occupancy_key, copy.deepcopy(best), lm.config)
+            if ok:
+                lm.occupancy_saved = True
+        except Exception as e:  # noqa: BLE001 - status building must never fail on profiling
+            log.warning(f"Occupancy sample for {mid} failed (non-critical): {e}")
+
+    def _occupancy_sidecar_path(self, mid: str, cfg: "ModelConfig") -> Optional[Path]:
+        """Where this model's occupancy profiles are stored, or None when there is nowhere.
+
+        llama cards: the GGUF sidecar (created on demand — same shape as a normal save).
+        bridge cards: the EXISTING overlay card only. The profiler must not create
+        user-visible card files as a side effect, so a discovered card that was never edited
+        simply stores no profile until it gets an overlay.
+        """
+        if cfg.is_bridge:
+            stem = self._bridge_card_overlay_stem(cfg, mid)
+            path = self._cards_dir_for(cfg.engine) / f"{stem}.json"
+            return path if path.is_file() else None
+        gguf = self.gguf_paths.get(mid)
+        if gguf is None:
+            return None
+        return gguf.with_suffix(gguf.suffix + ".json")
+
+    def _write_occupancy_profile(self, mid: str, key: str,
+                                 entry: Dict[str, Any], cfg: "ModelConfig") -> bool:
+        """Merge one profile into the sidecar/card, preserving every other key.
+
+        Deliberately NOT ``ModelConfig.save()``: that rewrites the whole file from an
+        in-memory config and could clobber a concurrent WebUI edit. This path re-reads the
+        on-disk JSON, replaces exactly ``occupancy_profiles[key]`` and atomically writes it.
+        """
+        path = self._occupancy_sidecar_path(mid, cfg)
+        if path is None:
+            log.debug(f"Occupancy profile for {mid} not stored: no sidecar/card file")
+            return False
+        try:
+            data: Dict[str, Any] = {}
+            if path.exists():
+                raw = path.read_text(encoding="utf-8-sig")
+                loaded = json.loads(raw) if raw.strip() else {}
+                if not isinstance(loaded, dict):
+                    log.warning(f"Occupancy profile for {mid} not stored: {path} is not a JSON object")
+                    return False
+                data = loaded
+            profiles = data.get("occupancy_profiles")
+            if not isinstance(profiles, dict):
+                profiles = {}
+            profiles[key] = entry
+            data["occupancy_profiles"] = profiles
+            _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
+            log.info(f"Stored occupancy profile for {mid} ({path.name}): "
+                     f"{entry.get('vram_mb', 0)} MiB VRAM, {entry.get('ram_mb', 0)} MiB RAM "
+                     f"[{entry.get('source', '?')}]")
+            return True
+        except Exception as e:  # noqa: BLE001 - profiling is best-effort
+            log.warning(f"Failed to store occupancy profile for {mid} in {path}: {e}")
+            return False
+
+    def _hardware_summary(self, gpus: List[GPUInfo]) -> Dict[str, Any]:
+        """Current hardware fingerprint for status/UI (matches the sidecar key prefix)."""
+        identity = _gpu_identity(gpus)
+        return {"fingerprint": _occupancy_hash(identity), "label": _hardware_label(gpus)}
 
     # ---------------- state save/load ----------------
     def _begin_slot_action(self, port: int) -> None:
@@ -4535,6 +5215,20 @@ class ModelManager:
             asyncio.to_thread(self.per_model_ram_vram, loaded_items=loaded_snap),
         )
         gpus = [asdict(g) for g in gpus_list]
+        hardware = self._hardware_summary(gpus_list)
+        # Occupancy profiling: capture the one-shot sample for a solo-loaded model using
+        # the GPU numbers we just collected (no extra nvidia-smi), if it was armed by the
+        # engine's first streaming request. If this call stores a profile, the per_model
+        # enrichment below picks it up immediately.
+        await self._capture_occupancy(loaded_snap, gpus_list)
+        # Surface the measured profile (best of this process, else the stored one for the
+        # current hardware+launch key) so the UI can show real occupancy instead of the
+        # always-zero per-PID VRAM number on WDDM.
+        for mid, lm in loaded_snap:
+            slot = per.setdefault(mid, {"ram_mb": 0, "vram_mb": 0})
+            profile = lm.occupancy_best or lm.config.occupancy_profiles.get(lm.occupancy_key)
+            if profile:
+                slot["occupancy"] = profile
         recovery_failures = self.recovery_failures_snapshot()
         return {
             "launcher": {
@@ -4545,11 +5239,13 @@ class ModelManager:
                 "backends": backends,
             },
             "gpus": gpus,
+            "hardware": hardware,
             "ram": self.system_ram(),
             "models_loaded": len(loaded_snap),
             "models_total": total,
             "idle_timeout": self.idle_timeout,
             "max_loaded_models": self.max_loaded_models,
+            "occupancy_profiles": self.occupancy_profiles_enabled,
             "recovery_failures": recovery_failures,
             "per_model": per,
             "uptime_models": [
@@ -4964,6 +5660,8 @@ async def get_settings():
     return {
         "idle_timeout_seconds": manager.idle_timeout,
         "max_loaded_models": manager.max_loaded_models,
+        "vram_headroom_mb": manager.vram_headroom_mb,
+        "ram_headroom_mb": manager.ram_admission_headroom_mb,
         "save_state_max_keep": manager.save_state_max_keep,
         "save_state_max_bytes": manager.save_state_max_bytes,
         "auto_save_state": manager.default_auto_save_state,
@@ -4988,6 +5686,11 @@ async def update_settings(request: Request):
         v = body["max_loaded_models"]
         if isinstance(v, bool) or not isinstance(v, int) or v < 1:
             errors.append("'max_loaded_models' must be >= 1")
+    for key in ("vram_headroom_mb", "ram_headroom_mb"):
+        if key in body:
+            v = body[key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                errors.append(f"'{key}' must be an integer >= 0 (MiB)")
     if "save_state_max_keep" in body:
         v = body["save_state_max_keep"]
         if isinstance(v, bool) or not isinstance(v, int) or v < 1:
@@ -5039,6 +5742,12 @@ async def update_settings(request: Request):
     if "max_loaded_models" in body:
         manager.max_loaded_models = body["max_loaded_models"]
         changed.append("max_loaded_models")
+    if "vram_headroom_mb" in body:
+        manager.vram_headroom_mb = body["vram_headroom_mb"]
+        changed.append("vram_headroom_mb")
+    if "ram_headroom_mb" in body:
+        manager.ram_admission_headroom_mb = body["ram_headroom_mb"]
+        changed.append("ram_headroom_mb")
     if "save_state_max_keep" in body:
         manager.save_state_max_keep = body["save_state_max_keep"]
         changed.append("save_state_max_keep")
@@ -5072,6 +5781,11 @@ async def update_settings(request: Request):
             cfg["models"]["idle_timeout_seconds"] = body["idle_timeout_seconds"]
         if "max_loaded_models" in body:
             cfg["models"]["max_loaded_models"] = body["max_loaded_models"]
+        vram_keys = [k for k in ("vram_headroom_mb", "ram_headroom_mb") if k in body]
+        if vram_keys:
+            vram = cfg["models"].setdefault("vram", {})
+            for key in vram_keys:
+                vram["headroom_mb" if key == "vram_headroom_mb" else "ram_headroom_mb"] = body[key]
         if "save_state_max_keep" in body:
             cfg["models"]["save_state_max_keep"] = body["save_state_max_keep"]
         if "save_state_max_bytes" in body:
@@ -5142,6 +5856,7 @@ async def list_models():
             "max_ctx_size": m["max_ctx_size"],
             "n_gpu_layers": m["n_gpu_layers"],
             "estimated_vram_mb": m["estimated_vram_mb"],
+            "occupancy_profiles": m["occupancy_profiles"],
             "args": m["args"],
             "gguf_name": m["gguf_name"],
             # Classification (see _classify_model_type). Required by the WebUI field
@@ -5937,4 +6652,34 @@ if __name__ == "__main__":
     # The MAIN client-facing port (args.port) is owned by the RawTCPForwarder (started in
     # _startup). uvicorn/FastAPI runs on an INTERNAL port for management + non-streaming
     # requests only. This removes the ASGI layer from the streaming data path entirely.
-    uvicorn.run(app, host=_internal_bind_host, port=INTERNAL_API_PORT, reload=False, use_colors=False, http=_http_backend)
+    #
+    # Shutdown (Ctrl+C): uvicorn closes its internal listener first, then waits for
+    # in-flight ASGI tasks before running the lifespan shutdown. The WebUI keeps a
+    # persistent /ws task, so that drain can take a long time; meanwhile the raw
+    # forwarder is still accepting browser polls and logs
+    # "Failed to connect to internal API on port <internal>" until the drain ends.
+    # Stop the forwarder as soon as a shutdown signal arrives and bound the drain with
+    # timeout_graceful_shutdown so Ctrl+C is prompt. AUTOLOADER_GRACEFUL_SHUTDOWN_S=0
+    # restores the old wait-forever behaviour.
+    try:
+        _shutdown_grace_s = max(0.0, float(os.environ.get("AUTOLOADER_GRACEFUL_SHUTDOWN_S", "5")))
+    except ValueError:
+        _shutdown_grace_s = 5.0
+    _uvicorn_config = uvicorn.Config(
+        app, host=_internal_bind_host, port=INTERNAL_API_PORT, reload=False,
+        use_colors=False, http=_http_backend,
+        timeout_graceful_shutdown=_shutdown_grace_s or None)
+    _uvicorn_server = uvicorn.Server(_uvicorn_config)
+    _orig_handle_exit = _uvicorn_server.handle_exit
+
+    def _handle_exit(sig, frame):
+        global _forwarder
+        if _forwarder is not None:
+            try:
+                _forwarder.stop()
+            except Exception:  # noqa: BLE001 - shutdown must never be blocked
+                pass
+        _orig_handle_exit(sig, frame)
+
+    _uvicorn_server.handle_exit = _handle_exit
+    _uvicorn_server.run()

@@ -45,6 +45,8 @@ def _make_cfg(overrides: dict | None = None) -> dict:
             "idle_timeout_seconds": 300,
             "max_loaded_models": 2,
             "auto_save_state": False,
+            # Hermetic: profiling never shells out to nvidia-smi in these tests.
+            "occupancy_profiles": False,
         },
         "llama_server": {
             "binary": "llama-server",
@@ -424,6 +426,9 @@ def test_save_engine_card_only_editable_fields(tmp_path):
         # rescan can re-register a user-added card without configs_dir.
         "engine": "strata",
         "engine_config": "C:\\strata\\my-card.json",
+        # Auto-measured occupancy profiles live in the card too; a card edit must
+        # never drop them.
+        "occupancy_profiles": {},
     }
 
 
@@ -596,6 +601,8 @@ async def test_list_models_llama_payload_gains_only_defaulted_fields(tmp_path):
         # Classification block (model-type grouping/badging). Added as its own group,
         # after the pre-existing keys, and defaulted like the engine fields above.
         "model_type", "model_type_override", "model_type_label", "arch", "auxiliary",
+        # Auto-measured VRAM/RAM occupancy profiles (observational; defaulted to {}).
+        "occupancy_profiles",
     }
     assert payload["engine"] == "llama"
     assert payload["engine_config"] == ""
